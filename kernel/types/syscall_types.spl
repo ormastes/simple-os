@@ -1,0 +1,199 @@
+# Syscall Types — Entity Dimension
+#
+# System call interface types.
+
+enum SyscallId:
+    """System call identifiers."""
+    # Process
+    Exit = 0
+    Yield = 1
+    Spawn = 2
+    Wait = 3
+    GetPid = 4
+
+    # Memory
+    Mmap = 10
+    Munmap = 11
+    Mprotect = 12
+
+    # IPC
+    IpcSend = 20
+    IpcRecv = 21
+    IpcCreatePort = 22
+    IpcConnect = 23
+
+    # File (routed to VFS service via IPC)
+    Open = 30
+    Read = 31
+    Write = 32
+    Close = 33
+    Stat = 34
+    Mkdir = 35
+    Readdir = 36
+
+    # Security
+    Pledge = 40
+    Unveil = 41
+    CapGrant = 42
+
+    # Process (extended)
+    ListTasks = 5       # List all tasks → [TaskInfoBuf]
+    GetTaskInfo = 6     # Single task info by PID
+    Signal = 7          # Send signal to task
+    SetPriority = 8     # Change task priority
+    GetParentPid = 9    # Get parent task ID
+
+    # Memory
+    Mmap = 10
+    Munmap = 11
+    Mprotect = 12
+
+    # IPC
+    IpcSend = 20
+    IpcRecv = 21
+    IpcCreatePort = 22
+    IpcConnect = 23
+
+    # File (routed to VFS service via IPC)
+    Open = 30
+    Read = 31
+    Write = 32
+    Close = 33
+    Stat = 34
+    Mkdir = 35
+    Readdir = 36
+    Mount = 37          # Mount filesystem
+    Unmount = 38        # Unmount filesystem
+
+    # Security
+    Pledge = 40
+    Unveil = 41
+    CapGrant = 42
+
+    # Time
+    ClockGetTime = 50
+    Sleep = 51
+
+    # Debug
+    DebugWrite = 60     # Serial output
+
+    # Network
+    NetSocket = 70
+    NetBind = 71
+    NetListen = 72
+    NetConnect = 73
+    NetAccept = 74
+    NetSendTo = 75
+    NetRecvFrom = 76
+    NetIfConfig = 77    # Interface config get/set
+
+    # Device
+    DevEnumerate = 80   # List PCI/USB devices
+    DevGetInfo = 81     # Single device info
+
+    # Logging
+    LogWrite = 90       # Write structured log entry
+    LogRead = 91        # Read log entries (journal)
+
+    # System info
+    SysInfo = 95        # Query system info (mem/cpu/uptime)
+    GetHostname = 96
+    SetHostname = 97
+
+# ============================================================================
+# Signal Types
+# ============================================================================
+
+enum SignalKind:
+    """Signal types for inter-process signaling."""
+    Term = 0        # Terminate (default, catchable)
+    Kill = 1        # Force kill (uncatchable)
+    Stop = 2        # Suspend task
+    Cont = 3        # Resume suspended task
+    Int = 4         # Interrupt (Ctrl+C)
+    Hup = 5         # Hangup
+
+# ============================================================================
+# System Info Types
+# ============================================================================
+
+enum SysInfoKind:
+    """Types of system information queries."""
+    Memory = 0      # Returns total/free/used pages
+    CpuCount = 1
+    Uptime = 2      # Nanoseconds since boot
+    TickCount = 3
+
+# ============================================================================
+# Userspace-Visible Structs
+# ============================================================================
+
+@repr("C")
+struct TaskInfoBuf:
+    """Task info returned by ListTasks/GetTaskInfo syscalls."""
+    pid: u64
+    parent_pid: u64
+    state: u8           # 0=Ready, 1=Running, 2=Blocked, 3=Zombie
+    priority: u8         # 0=RT, 1=High, 2=Normal, 3=Low, 4=Idle
+    memory_pages: u64
+    cpu_ticks: u64
+    name_len: u32
+    name: [u8]           # Variable-length name bytes
+
+@repr("C")
+struct DeviceInfoBuf:
+    """PCI device info returned by DevEnumerate/DevGetInfo."""
+    bus: u8
+    device: u8
+    func: u8
+    vendor_id: u16
+    device_id: u16
+    class_code: u8
+    subclass: u8
+    prog_if: u8
+    irq_line: u8
+
+@repr("C")
+struct NetIfInfo:
+    """Network interface info returned by NetIfConfig."""
+    index: u32
+    name: text
+    mac: [u8]
+    ipv4_addr: u32
+    ipv4_mask: u32
+    ipv4_gateway: u32
+    flags: u32          # UP, BROADCAST, LOOPBACK, etc.
+    mtu: u32
+
+@repr("C")
+struct KLogEntry:
+    """Kernel log entry for the journal."""
+    timestamp_ns: u64
+    level: u8           # 0=Emergency..7=Debug
+    facility: u16
+    pid: u64
+    message: text
+
+@repr("C")
+struct MemInfoBuf:
+    """Memory info returned by SysInfo(Memory)."""
+    total_pages: u64
+    free_pages: u64
+    used_pages: u64
+    page_size: u32
+
+@repr("C")
+struct SyscallArgs:
+    """Arguments passed via registers on syscall entry."""
+    id: u64         # rax: syscall number
+    arg0: u64       # rdi
+    arg1: u64       # rsi
+    arg2: u64       # rdx
+    arg3: u64       # r10
+    arg4: u64       # r8
+    arg5: u64       # r9
+
+@repr("C")
+struct SyscallResult:
+    """Return value in rax after syscall."""
+    value: i64      # >= 0 success, < 0 error code

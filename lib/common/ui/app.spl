@@ -1,0 +1,47 @@
+# UI Application
+#
+# UnifiedApp and AppConfig for the UI framework.
+# Platform-independent app configuration and lifecycle.
+
+use common.ui.widget.{UIState}
+
+# =========================================================================
+# AppConfig
+# =========================================================================
+
+class AppConfig:
+    poll_timeout_ms: i64
+    hot_reload: bool
+    event_timeout_ms: i64
+
+impl AppConfig:
+    static fn default_config() -> AppConfig:
+        AppConfig(poll_timeout_ms: 100, hot_reload: true, event_timeout_ms: 100)
+
+    static fn headless() -> AppConfig:
+        AppConfig(poll_timeout_ms: 0, hot_reload: false, event_timeout_ms: 0)
+
+    static fn web_config() -> AppConfig:
+        AppConfig(poll_timeout_ms: 0, hot_reload: true, event_timeout_ms: 0)
+
+# =========================================================================
+# UnifiedApp
+# =========================================================================
+
+class UnifiedApp:
+    _state: UIState
+    _backend: any
+    _running: bool
+
+impl UnifiedApp:
+    static fn from_state(state: UIState, backend: any) -> UnifiedApp:
+        UnifiedApp(_state: state, _backend: backend, _running: true)
+
+    fn is_running() -> bool:
+        self._running
+
+    fn current_state() -> UIState:
+        self._state
+
+    me stop():
+        self._running = false

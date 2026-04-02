@@ -1,0 +1,161 @@
+# HAL Trait Definitions — Architecture Abstraction Layer
+#
+# Each architecture (x86_64, riscv64, riscv32, arm64) implements these traits.
+# Compile-time arch selection in arch/mod.spl chooses the active implementation.
+
+use os.kernel.boot.ports.{BootOutputPort}
+use os.kernel.types.memory_types.{PhysAddr, VirtAddr, VmFlags}
+use os.kernel.arch.arch_context.{ArchContext}
+
+trait HalConsole:
+    """Early serial console output — first thing initialized at boot."""
+
+    fn console_init():
+        """Initialize the serial/UART console for early debug output."""
+        pass_todo("HalConsole.console_init")
+
+    fn console_write_byte(b: u8):
+        """Write a single byte to the serial console."""
+        pass_todo("HalConsole.console_write_byte")
+
+    fn console_write(msg: text):
+        """Write a string to the serial console."""
+        pass_todo("HalConsole.console_write")
+
+    fn console_writeln(msg: text):
+        """Write a string followed by a newline to the serial console."""
+        pass_todo("HalConsole.console_writeln")
+
+trait HalBoot:
+    """Boot protocol parsing — extracts memory map, framebuffer, etc."""
+
+    fn parse_boot_info() -> BootOutputPort:
+        """Parse bootloader-provided info into a BootOutputPort."""
+        pass_todo("HalBoot.parse_boot_info")
+
+trait HalCpu:
+    """CPU control primitives — interrupt toggling, halt, TLB flush."""
+
+    fn cpu_disable_interrupts():
+        """Disable all maskable interrupts on the current CPU."""
+        pass_todo("HalCpu.cpu_disable_interrupts")
+
+    fn cpu_enable_interrupts():
+        """Enable maskable interrupts on the current CPU."""
+        pass_todo("HalCpu.cpu_enable_interrupts")
+
+    fn cpu_halt():
+        """Halt the CPU until the next interrupt fires."""
+        pass_todo("HalCpu.cpu_halt")
+
+    fn cpu_halt_loop():
+        """Halt the CPU in an infinite loop (used for fatal errors)."""
+        pass_todo("HalCpu.cpu_halt_loop")
+
+    fn cpu_flush_tlb(vaddr: u64):
+        """Flush the TLB entry for a single virtual address."""
+        pass_todo("HalCpu.cpu_flush_tlb")
+
+    fn cpu_flush_tlb_all():
+        """Flush the entire TLB on the current CPU."""
+        pass_todo("HalCpu.cpu_flush_tlb_all")
+
+    fn cpu_id() -> u64:
+        """Return the current CPU / hart / core ID."""
+        pass_todo("HalCpu.cpu_id")
+
+    fn cpu_address_width() -> u32:
+        """Return the physical address width in bits (e.g. 48, 52)."""
+        pass_todo("HalCpu.cpu_address_width")
+
+trait HalPaging:
+    """Page table management — map, unmap, translate virtual addresses."""
+
+    fn paging_init(boot_info: BootOutputPort):
+        """Initialize the page table system from boot info."""
+        pass_todo("HalPaging.paging_init")
+
+    fn paging_map(virt: VirtAddr, phys: PhysAddr, flags: VmFlags) -> bool:
+        """Map a virtual address to a physical address with the given flags."""
+        pass_todo("HalPaging.paging_map")
+
+    fn paging_unmap(virt: VirtAddr) -> bool:
+        """Unmap a virtual address. Returns true if a mapping existed."""
+        pass_todo("HalPaging.paging_unmap")
+
+    fn paging_translate(virt: VirtAddr) -> PhysAddr?:
+        """Translate a virtual address to its physical address, or nil."""
+        pass_todo("HalPaging.paging_translate")
+
+    fn paging_create_address_space() -> u64:
+        """Allocate a new root page table and return its physical address."""
+        pass_todo("HalPaging.paging_create_address_space")
+
+    fn paging_switch_address_space(root_phys: u64):
+        """Switch to a different address space by loading its root page table."""
+        pass_todo("HalPaging.paging_switch_address_space")
+
+    fn paging_levels() -> u32:
+        """Return the number of page table levels (e.g. 4 for x86_64, 3-5 for SvXX)."""
+        pass_todo("HalPaging.paging_levels")
+
+trait HalInterrupt:
+    """Interrupt controller — IRQ enable/disable, acknowledge, handler registration."""
+
+    fn interrupt_init():
+        """Initialize the interrupt controller (APIC, PLIC, GIC, etc.)."""
+        pass_todo("HalInterrupt.interrupt_init")
+
+    fn interrupt_enable_irq(irq: u32):
+        """Enable a specific IRQ line."""
+        pass_todo("HalInterrupt.interrupt_enable_irq")
+
+    fn interrupt_disable_irq(irq: u32):
+        """Disable a specific IRQ line."""
+        pass_todo("HalInterrupt.interrupt_disable_irq")
+
+    fn interrupt_acknowledge(irq: u32):
+        """Acknowledge / end-of-interrupt for the given IRQ."""
+        pass_todo("HalInterrupt.interrupt_acknowledge")
+
+    fn interrupt_set_handler(irq: u32, handler: u64):
+        """Set the handler function address for the given IRQ."""
+        pass_todo("HalInterrupt.interrupt_set_handler")
+
+    fn interrupt_set_priority(irq: u32, priority: u32):
+        """Set the priority level for the given IRQ."""
+        pass_todo("HalInterrupt.interrupt_set_priority")
+
+trait HalTimer:
+    """Preemption timer — periodic tick or one-shot deadline for scheduling."""
+
+    fn timer_init(frequency_hz: u64):
+        """Initialize the timer at the given frequency in Hz."""
+        pass_todo("HalTimer.timer_init")
+
+    fn timer_set_deadline(ticks: u64):
+        """Set a one-shot deadline at the given tick count."""
+        pass_todo("HalTimer.timer_set_deadline")
+
+    fn timer_current_ticks() -> u64:
+        """Read the current tick counter value."""
+        pass_todo("HalTimer.timer_current_ticks")
+
+    fn timer_ticks_per_second() -> u64:
+        """Return the timer frequency in ticks per second."""
+        pass_todo("HalTimer.timer_ticks_per_second")
+
+trait HalContext:
+    """Context switching — save/restore/initialize CPU register state."""
+
+    fn context_save() -> ArchContext:
+        """Save the current CPU register state and return it."""
+        pass_todo("HalContext.context_save")
+
+    fn context_restore(ctx: ArchContext):
+        """Restore a previously saved CPU register state."""
+        pass_todo("HalContext.context_restore")
+
+    fn context_init(entry: u64, stack: u64, arg: u64) -> ArchContext:
+        """Create a new context for a task with the given entry point, stack, and argument."""
+        pass_todo("HalContext.context_init")

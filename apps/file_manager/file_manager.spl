@@ -1,0 +1,515 @@
+# File Manager — Two-Panel File Browser
+#
+# Dual-panel file manager with directory tree navigation and
+# sortable file table. Uses the existing UI builder DSL for
+# tree, table, menubar, and statusbar widgets.
+#
+# MDSOC: feature dimension, file_manager layer
+
+use common.ui.builder.{column, row, menubar, statusbar, tree_widget, tree_node, tree_leaf, table_widget, panel, button, checkbox, dialog, text_widget, build_tree, build_tree_with_title, with_flex, with_width}
+use common.ui.widget.{WidgetNode, UITree, UIEvent}
+use common.ui.session.{UISession}
+use os.kernel.types.fs_types.{DirEntry, FsNode, FsNodeKind}
+use os.services.vfs.vfs.{VfsManager}
+use os.userlib.fs.{stat}
+
+# =========================================================================
+# Sort Configuration
+# =========================================================================
+
+enum SortField:
+    """Column to sort file listing by."""
+    Name
+    Size
+    Date
+
+enum SortDirection:
+    """Sort direction."""
+    Ascending
+    Descending
+
+# =========================================================================
+# File Entry (display model)
+# =========================================================================
+
+struct FileEntry:
+    """Flattened directory entry for display in the table."""
+    name: text
+    kind: FsNodeKind
+    size: u64
+    modified_ns: u64
+    permissions: u16
+
+fn dir_entry_to_file_entry(entry: DirEntry) -> FileEntry:
+    """Convert a DirEntry to a display FileEntry."""
+    return FileEntry(
+        name: entry.name,
+        kind: entry.node.kind,
+        size: entry.node.size,
+        modified_ns: entry.node.modified_ns,
+        permissions: entry.node.permissions
+    )
+
+fn format_size(bytes: u64) -> text:
+    """Format file size in human-readable form."""
+    if bytes < 1024:
+        return "{bytes} B"
+    val kb = bytes / 1024
+    if kb < 1024:
+        return "{kb} KB"
+    val mb = kb / 1024
+    if mb < 1024:
+        return "{mb} MB"
+    val gb = mb / 1024
+    return "{gb} GB"
+
+fn format_kind(kind: FsNodeKind) -> text:
+    """Format filesystem node kind for display."""
+    match kind:
+        FsNodeKind.File => "File"
+        FsNodeKind.Directory => "Dir"
+        FsNodeKind.Symlink => "Link"
+        FsNodeKind.Device => "Dev"
+        FsNodeKind.Pipe => "Pipe"
+
+fn kind_icon(kind: FsNodeKind) -> text:
+    """Icon prefix for filesystem node kind."""
+    match kind:
+        FsNodeKind.Directory => "[D] "
+        FsNodeKind.Symlink => "[L] "
+        FsNodeKind.Device => "[C] "
+        FsNodeKind.Pipe => "[P] "
+        _ => "    "
+
+# =========================================================================
+# File Manager
+# =========================================================================
+
+class FileManager:
+    """Two-panel file manager.
+
+    Left panel: directory tree for navigation.
+    Right panel: sortable file table showing current directory contents.
+    """
+    current_path: text
+    entries: [FileEntry]
+    selected_index: i32
+    show_hidden: bool
+    sort_by: SortField
+    sort_dir: SortDirection
+    dir_tree_paths: [text]
+    clipboard_path: text
+    clipboard_op: text
+    vfs: VfsManager?
+
+impl FileManager:
+
+    static fn new(path: text) -> FileManager:
+        """Create a file manager starting at the given path."""
+        return FileManager(
+            current_path: path,
+            entries: [],
+            selected_index: 0,
+            show_hidden: false,
+            sort_by: SortField.Name,
+            sort_dir: SortDirection.Ascending,
+            dir_tree_paths: ["/"],
+            clipboard_path: "",
+            clipboard_op: "",
+            vfs: nil
+        )
+
+    static fn with_vfs(path: text, vfs: VfsManager) -> FileManager:
+        """Create a file manager connected to a VFS."""
+        var fm = FileManager.new(path)
+        fm.vfs = vfs
+        fm.refresh()
+        return fm
+
+    # -- Navigation ----------------------------------------------------------
+
+    me navigate_to(path: text):
+        """Navigate to a directory path."""
+        self.current_path = path
+        self.selected_index = 0
+        self.refresh()
+
+    me navigate_up():
+        """Navigate to parent directory."""
+        if self.current_path == "/":
+            return
+        val parent = _parent_dir(self.current_path)
+        self.navigate_to(parent)
+
+    me open_selected():
+        """Open the selected entry (enter directory or open file)."""
+        if self.selected_index < 0 or self.selected_index >= self.entries.len():
+            return
+        val entry = self.entries[self.selected_index]
+        match entry.kind:
+            FsNodeKind.Directory:
+                val new_path = _join_path(self.current_path, entry.name)
+                self.navigate_to(new_path)
+            _:
+                pass_dn
+
+    me select_next():
+        """Move selection down."""
+        if self.selected_index < self.entries.len() - 1:
+            self.selected_index = self.selected_index + 1
+
+    me select_prev():
+        """Move selection up."""
+        if self.selected_index > 0:
+            self.selected_index = self.selected_index - 1
+
+    me toggle_hidden():
+        """Toggle showing hidden files."""
+        self.show_hidden = not self.show_hidden
+        self.refresh()
+
+    me set_sort(field: SortField):
+        """Set sort field, toggling direction if same field."""
+        if self._sort_field_eq(field):
+            self.sort_dir = match self.sort_dir:
+                SortDirection.Ascending => SortDirection.Descending
+                SortDirection.Descending => SortDirection.Ascending
+        else:
+            self.sort_by = field
+            self.sort_dir = SortDirection.Ascending
+        self._sort_entries()
+
+    fn _sort_field_eq(field: SortField) -> bool:
+        """Check if sort field matches current."""
+        match self.sort_by:
+            SortField.Name:
+                match field:
+                    SortField.Name => true
+                    _ => false
+            SortField.Size:
+                match field:
+                    SortField.Size => true
+                    _ => false
+            SortField.Date:
+                match field:
+                    SortField.Date => true
+                    _ => false
+
+    # -- Clipboard Operations ------------------------------------------------
+
+    me copy_selected():
+        """Copy selected file path to clipboard."""
+        if self.selected_index >= 0 and self.selected_index < self.entries.len():
+            val entry = self.entries[self.selected_index]
+            self.clipboard_path = _join_path(self.current_path, entry.name)
+            self.clipboard_op = "copy"
+
+    me cut_selected():
+        """Cut selected file (move on paste)."""
+        if self.selected_index >= 0 and self.selected_index < self.entries.len():
+            val entry = self.entries[self.selected_index]
+            self.clipboard_path = _join_path(self.current_path, entry.name)
+            self.clipboard_op = "cut"
+
+    me paste():
+        """Paste clipboard file to current directory."""
+        if self.clipboard_path == "" or self.vfs == nil:
+            return
+        val filename = _basename(self.clipboard_path)
+        val dest = _join_path(self.current_path, filename)
+        if self.clipboard_op == "copy":
+            val read_result = self.vfs.read(self.clipboard_path)
+            if read_result.is_ok():
+                val _ = self.vfs.write(dest, read_result.unwrap())
+        elif self.clipboard_op == "cut":
+            val _ = self.vfs.rename(self.clipboard_path, dest)
+            self.clipboard_path = ""
+            self.clipboard_op = ""
+        self.refresh()
+
+    me delete_selected():
+        """Delete the selected file/directory."""
+        if self.selected_index < 0 or self.selected_index >= self.entries.len():
+            return
+        if self.vfs == nil:
+            return
+        val entry = self.entries[self.selected_index]
+        val path = _join_path(self.current_path, entry.name)
+        val _ = self.vfs.remove(path)
+        self.refresh()
+
+    fn get_selected_properties() -> text?:
+        """Get properties of the selected file as formatted text."""
+        if self.selected_index < 0 or self.selected_index >= self.entries.len():
+            return nil
+        val entry = self.entries[self.selected_index]
+        val path = _join_path(self.current_path, entry.name)
+        val kind_str = format_kind(entry.kind)
+        val size_str = format_size(entry.size)
+        val result = "Name: {entry.name}\nType: {kind_str}\nSize: {size_str}\nPath: {path}\nPermissions: {entry.permissions}"
+        return result
+
+    me compress_selected():
+        """Compress selected file to .tar.gz (via archive tools)."""
+        if self.selected_index < 0 or self.selected_index >= self.entries.len():
+            return
+        if self.vfs == nil:
+            return
+        val entry = self.entries[self.selected_index]
+        val src_path = _join_path(self.current_path, entry.name)
+        # Read source, create simple tar, write to .tar file
+        val read_result = self.vfs.read(src_path)
+        if read_result.is_ok():
+            val content = read_result.unwrap()
+            # Simple tar: header line + content
+            val tar_data = "TAR:{entry.name}:{entry.size}\n{content}"
+            val tar_path = _join_path(self.current_path, "{entry.name}.tar")
+            val _ = self.vfs.write(tar_path, tar_data)
+            self.refresh()
+
+    me extract_selected():
+        """Extract selected archive to current directory."""
+        if self.selected_index < 0 or self.selected_index >= self.entries.len():
+            return
+        if self.vfs == nil:
+            return
+        val entry = self.entries[self.selected_index]
+        if not entry.name.ends_with(".tar"):
+            return
+        val src_path = _join_path(self.current_path, entry.name)
+        val read_result = self.vfs.read(src_path)
+        if read_result.is_ok():
+            val content = read_result.unwrap()
+            # Simple tar extraction: parse header, write content
+            if content.starts_with("TAR:"):
+                val header_end = content.index_of("\n")
+                if header_end > 0:
+                    val header = content.slice(4, header_end)
+                    val colon_pos = header.index_of(":")
+                    val filename = header.slice(0, colon_pos)
+                    val file_content = content.slice(header_end + 1, content.len())
+                    val dest_path = _join_path(self.current_path, filename)
+                    val _ = self.vfs.write(dest_path, file_content)
+                    self.refresh()
+
+    me search_files(pattern: text):
+        """Filter entries by name pattern."""
+        if pattern == "":
+            self.refresh()
+            return
+        var filtered: [FileEntry] = []
+        for entry in self.entries:
+            if entry.name.contains(pattern):
+                filtered = filtered.push(entry)
+        self.entries = filtered
+        self.selected_index = 0
+
+    # -- Refresh / Load Data -------------------------------------------------
+
+    me refresh():
+        """Reload directory listing from VFS."""
+        self.entries = []
+        if self.vfs == nil:
+            return
+        val result = self.vfs.readdir(self.current_path)
+        if result.is_err():
+            return
+        val dir_entries = result.unwrap()
+        for entry in dir_entries:
+            val fe = dir_entry_to_file_entry(entry)
+            if self.show_hidden or not fe.name.starts_with("."):
+                self.entries = self.entries.push(fe)
+        self._sort_entries()
+        # Update dir tree
+        self._update_dir_tree()
+        # Clamp selection
+        if self.selected_index >= self.entries.len():
+            self.selected_index = if self.entries.len() > 0: self.entries.len() - 1 else: 0
+
+    me _sort_entries():
+        """Sort entries by current sort field and direction."""
+        # Directories first, then sort within groups
+        # Simple insertion sort for now
+        var dirs: [FileEntry] = []
+        var files: [FileEntry] = []
+        for entry in self.entries:
+            match entry.kind:
+                FsNodeKind.Directory:
+                    dirs = dirs.push(entry)
+                _:
+                    files = files.push(entry)
+        dirs = _sort_file_entries(dirs, self.sort_by, self.sort_dir)
+        files = _sort_file_entries(files, self.sort_by, self.sort_dir)
+        self.entries = dirs + files
+
+    me _update_dir_tree():
+        """Update the directory tree paths list."""
+        # Add current path and its ancestors to the tree
+        var paths: [text] = ["/"]
+        var parts = _split_path(self.current_path)
+        var accumulated = ""
+        for part in parts:
+            accumulated = "{accumulated}/{part}"
+            if not paths.contains(accumulated):
+                paths = paths.push(accumulated)
+        self.dir_tree_paths = paths
+
+    # -- UI Construction -----------------------------------------------------
+
+    fn build_ui() -> UISession:
+        """Build the file manager UI.
+
+        Layout:
+          Menubar: File | Edit | View
+          Row:
+            Tree (directory navigation, 25% width)
+            Table (file listing, 75% width)
+          Statusbar: item count | current path
+        """
+        # Build directory tree
+        val dir_tree = self._build_dir_tree()
+
+        # Build file table
+        val file_table = self._build_file_table()
+
+        val root = column("fm_root", [
+            menubar("fm_menu", ["File", "Edit", "View", "Go"]),
+            row("fm_toolbar", [
+                button("fm_btn_up", "Up", "navigate_up"),
+                button("fm_btn_refresh", "Refresh", "refresh"),
+                button("fm_btn_hidden", if self.show_hidden: "[x] Hidden" else: "[ ] Hidden", "toggle_hidden"),
+                button("fm_btn_compress", "Compress", "compress_selected"),
+                button("fm_btn_extract", "Extract", "extract_selected"),
+                button("fm_btn_props", "Properties", "show_properties")
+            ]),
+            row("fm_content", [
+                with_width(panel("fm_tree_panel", "Directories", [dir_tree]), 30),
+                with_flex(panel("fm_table_panel", "Files", [file_table]), 1)
+            ]),
+            statusbar("fm_status",
+                "{self.entries.len()} items",
+                self.current_path
+            )
+        ])
+
+        val tree = build_tree_with_title(root, "File Manager - {self.current_path}", "dark")
+        return UISession.new(tree)
+
+    fn _build_dir_tree() -> WidgetNode:
+        """Build the directory tree widget from dir_tree_paths."""
+        var tree_nodes: [WidgetNode] = []
+        for path in self.dir_tree_paths:
+            val name = _basename(path)
+            val display_name = if name == "": "/" else: name
+            val is_current = path == self.current_path
+            if is_current:
+                tree_nodes = tree_nodes.push(tree_node("fm_tree_{path}", "> {display_name}", []))
+            else:
+                tree_nodes = tree_nodes.push(tree_leaf("fm_tree_{path}", display_name))
+        return tree_widget("fm_dir_tree", tree_nodes)
+
+    fn _build_file_table() -> WidgetNode:
+        """Build the file table widget with headers and entry rows."""
+        val headers = ["Name", "Type", "Size"]
+        var rows: [[text]] = []
+        var idx = 0
+        for entry in self.entries:
+            val prefix = if idx == self.selected_index: "> " else: "  "
+            val icon = kind_icon(entry.kind)
+            rows = rows.push([
+                "{prefix}{icon}{entry.name}",
+                format_kind(entry.kind),
+                format_size(entry.size)
+            ])
+            idx = idx + 1
+        return table_widget("fm_file_table", headers, rows)
+
+# =========================================================================
+# Sorting Helpers
+# =========================================================================
+
+fn _sort_file_entries(entries: [FileEntry], by: SortField, dir: SortDirection) -> [FileEntry]:
+    """Sort file entries by the given field and direction (insertion sort)."""
+    var sorted: [FileEntry] = entries
+    var i = 1
+    while i < sorted.len():
+        val key = sorted[i]
+        var j = i - 1
+        while j >= 0 and _compare_entries(sorted[j], key, by, dir) > 0:
+            sorted[j + 1] = sorted[j]
+            j = j - 1
+        sorted[j + 1] = key
+        i = i + 1
+    return sorted
+
+fn _compare_entries(a: FileEntry, b: FileEntry, by: SortField, dir: SortDirection) -> i32:
+    """Compare two file entries. Returns >0 if a should come after b."""
+    val raw = match by:
+        SortField.Name:
+            if a.name < b.name: -1
+            elif a.name > b.name: 1
+            else: 0
+        SortField.Size:
+            if a.size < b.size: -1
+            elif a.size > b.size: 1
+            else: 0
+        SortField.Date:
+            if a.modified_ns < b.modified_ns: -1
+            elif a.modified_ns > b.modified_ns: 1
+            else: 0
+    match dir:
+        SortDirection.Ascending => raw
+        SortDirection.Descending => -raw
+
+# =========================================================================
+# Path Helpers
+# =========================================================================
+
+fn _parent_dir(path: text) -> text:
+    """Get parent directory path."""
+    if path == "/" or path == "":
+        return "/"
+    var last_slash = 0
+    var i = 0
+    for ch in path:
+        if ch == "/":
+            last_slash = i
+        i = i + 1
+    if last_slash == 0:
+        return "/"
+    return path.slice(0, last_slash)
+
+fn _join_path(base: text, name: text) -> text:
+    """Join a base path and filename."""
+    if base == "/":
+        return "/{name}"
+    return "{base}/{name}"
+
+fn _basename(path: text) -> text:
+    """Get the last component of a path."""
+    if path == "/" or path == "":
+        return ""
+    var last_slash = -1
+    var i = 0
+    for ch in path:
+        if ch == "/":
+            last_slash = i
+        i = i + 1
+    if last_slash < 0:
+        return path
+    return path.slice(last_slash + 1, path.len())
+
+fn _split_path(path: text) -> [text]:
+    """Split a path into components (excluding empty and root)."""
+    var parts: [text] = []
+    var current = ""
+    for ch in path:
+        if ch == "/":
+            if current != "":
+                parts = parts.push(current)
+                current = ""
+        else:
+            current = "{current}{ch}"
+    if current != "":
+        parts = parts.push(current)
+    return parts

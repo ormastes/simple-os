@@ -1,0 +1,245 @@
+# ARM Cortex-M Startup Code
+#
+# Reset handler and initialization for bare-metal ARM Cortex-M systems.
+# Tested on:
+#   - STM32F4xx (Cortex-M4F)
+#   - LM3S6965 (Cortex-M3, QEMU)
+#
+# Memory Layout (typical STM32F4):
+#   0x08000000 - Flash (512KB-2MB)
+#   0x20000000 - SRAM (64KB-256KB)
+#   0xE000E000 - System Control Block + NVIC
+
+
+use std.baremetal.arm.nvic (VectorTable, ExceptionVector)
+
+# Memory configuration (STM32F407 Discovery)
+val FLASH_BASE: u32 = 0x08000000
+val SRAM_BASE: u32 = 0x20000000
+val SRAM_SIZE: u32 = 128 * 1024  # 128KB SRAM
+val STACK_TOP: u32 = SRAM_BASE + SRAM_SIZE  # Stack at top of RAM
+
+# External symbols from linker script
+# extern var _sidata: u32  # Start of data in flash
+# extern var _sdata: u32   # Start of data in RAM
+# extern var _edata: u32   # End of data in RAM
+# extern var _sbss: u32    # Start of BSS
+# extern var _ebss: u32    # End of BSS
+
+# Vector table - placed at 0x08000000 by linker
+# @section(".vector_table")
+# @align(256)
+val vector_table: VectorTable = VectorTable(
+    initial_sp: STACK_TOP,
+    reset: reset_handler as u32,
+    nmi: nmi_handler as u32,
+    hard_fault: hard_fault_handler as u32,
+    mem_manage: mem_manage_handler as u32,
+    bus_fault: bus_fault_handler as u32,
+    usage_fault: usage_fault_handler as u32,
+    reserved1: 0,
+    reserved2: 0,
+    reserved3: 0,
+    reserved4: 0,
+    svcall: svcall_handler as u32,
+    debug_mon: debug_mon_handler as u32,
+    reserved5: 0,
+    pendsv: pendsv_handler as u32,
+    systick: systick_handler as u32
+)
+
+# Reset handler - entry point after power-on/reset
+# @naked
+# @noreturn
+fn reset_handler():
+    """Reset handler - initializes CPU and calls main."""
+    unsafe:
+        asm volatile:
+            # Copy data section from flash to RAM
+            # "ldr r0, =_sidata"
+            # "ldr r1, =_sdata"
+            # "ldr r2, =_edata"
+            # "bl copy_data"
+
+            # Zero BSS section
+            # "ldr r0, =_sbss"
+            # "ldr r1, =_ebss"
+            # "bl zero_bss"
+
+            # Set up stack pointer (should already be set by vector table)
+            "ldr r0, ={stack_top}"
+            "mov sp, r0"
+
+            # Enable FPU (Cortex-M4F only)
+            # CPACR at 0xE000ED88
+            "ldr r0, =0xE000ED88"
+            "ldr r1, [r0]"
+            "orr r1, r1, #(0xF << 20)"  # Enable CP10 and CP11
+            "str r1, [r0]"
+            "dsb"
+            "isb"
+
+            # Call main
+            "bl {main}"
+
+            # If main returns, loop forever
+            ".Lreset_loop:"
+            "b .Lreset_loop"
+
+            in(reg) STACK_TOP
+            in(reg) main as u32
+
+# Copy data section from flash to RAM
+fn copy_data(src: u32, dst: u32, end: u32):
+    """Copy initialized data from flash to RAM."""
+    var src_ptr = src
+    var dst_ptr = dst
+
+    while dst_ptr < end:
+        unsafe:
+            val src_addr = @address(src_ptr as u64) @volatile val: u32
+            val dst_addr = @address(dst_ptr as u64) @volatile var: u32
+            dst_addr = src_addr
+
+        src_ptr = src_ptr + 4
+        dst_ptr = dst_ptr + 4
+
+# Zero BSS section
+fn zero_bss(start: u32, end: u32):
+    """Zero-initialize BSS section."""
+    var ptr = start
+
+    while ptr < end:
+        unsafe:
+            val addr = @address(ptr as u64) @volatile var: u32
+            addr = 0
+
+        ptr = ptr + 4
+
+# Main entry point - override this in your application
+fn main():
+    """Default main function - override this."""
+    # Initialize hardware
+    system_init()
+
+    # Enable interrupts
+    enable_interrupts()
+
+    # Application code here
+    loop:
+        # Blink LED or run application
+        pass
+
+# System initialization
+fn system_init():
+    """Initialize clocks, peripherals, etc."""
+    # Configure system clock (HSI, HSE, PLL)
+    clock_init()
+
+    # Initialize peripherals
+    gpio_init()
+
+# Clock initialization (placeholder)
+fn clock_init():
+    """Configure system clock to maximum frequency."""
+    # STM32F4: Enable HSE, configure PLL, switch to PLL
+    # This is board-specific
+    pass
+
+# GPIO initialization (placeholder)
+fn gpio_init():
+    """Initialize GPIO for LEDs, buttons, etc."""
+    # Enable GPIO clocks in RCC
+    # Configure pins as outputs/inputs
+    pass
+
+# Enable interrupts globally
+fn enable_interrupts():
+    """Enable interrupts (clear PRIMASK)."""
+    unsafe:
+        asm volatile:
+            "cpsie i"  # Clear PRIMASK (enable interrupts)
+
+# Disable interrupts globally
+fn disable_interrupts():
+    """Disable interrupts (set PRIMASK)."""
+    unsafe:
+        asm volatile:
+            "cpsid i"  # Set PRIMASK (disable interrupts)
+
+# Exception Handlers
+
+# @interrupt
+fn nmi_handler():
+    """Non-Maskable Interrupt handler."""
+    loop:
+        pass  # Hang on NMI
+
+# @interrupt
+fn hard_fault_handler():
+    """Hard Fault handler - critical error."""
+    unsafe:
+        # Read fault status registers for debugging
+        val cfsr = @address(0xE000ED28) @volatile val: u32
+        val hfsr = @address(0xE000ED2C) @volatile val: u32
+        val dfsr = @address(0xE000ED30) @volatile val: u32
+        val mmfar = @address(0xE000ED34) @volatile val: u32
+        val bfar = @address(0xE000ED38) @volatile val: u32
+
+        # Hang - would log fault info in real system
+        loop:
+            asm volatile: "bkpt #0"
+
+# @interrupt
+fn mem_manage_handler():
+    """Memory Management Fault handler."""
+    loop:
+        pass
+
+# @interrupt
+fn bus_fault_handler():
+    """Bus Fault handler."""
+    loop:
+        pass
+
+# @interrupt
+fn usage_fault_handler():
+    """Usage Fault handler (undefined instruction, etc)."""
+    loop:
+        pass
+
+# @interrupt
+fn svcall_handler():
+    """Supervisor Call handler (for RTOS)."""
+    # Extract SVC number from instruction
+    # Dispatch to handler
+    pass
+
+# @interrupt
+fn debug_mon_handler():
+    """Debug Monitor handler."""
+    pass
+
+# @interrupt
+fn pendsv_handler():
+    """PendSV handler (for RTOS context switching)."""
+    pass
+
+# @interrupt
+fn systick_handler():
+    """SysTick timer interrupt (1ms tick)."""
+    # Increment system tick count
+    # Wake up sleeping tasks
+    pass
+
+# Default handler for unused interrupts
+# @interrupt
+fn default_handler():
+    """Default handler for unimplemented interrupts."""
+    loop:
+        pass  # Hang on unexpected interrupt
+
+# Weak symbol exports (can be overridden by application)
+# @weak fn nmi_handler() = default_handler
+# @weak fn hard_fault_handler() = fault_handler
+# ... etc for all handlers

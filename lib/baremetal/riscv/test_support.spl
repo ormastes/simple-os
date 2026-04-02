@@ -1,0 +1,86 @@
+@allow(unnamed_duplicate_typed_args)
+# RISC-V Test Support Functions
+#
+# Helper functions for testing bare-metal RISC-V boot code (RV32/RV64).
+
+use startup.{STACK_SIZE, RAM_BASE, UART_BASE}
+
+
+# MSTATUS register bits
+val MSTATUS_MIE: u64 = 0x08          # Machine Interrupt Enable
+val MSTATUS_MPIE: u64 = 0x80         # Machine Previous Interrupt Enable
+val MSTATUS_MPP_MASK: u64 = 0x1800   # Machine Previous Privilege
+val MSTATUS_MPP_MACHINE: u64 = 0x1800  # MPP = Machine mode (11)
+
+# MIE register bits
+val MIE_MSIE: u64 = 0x08   # Machine Software Interrupt Enable
+val MIE_MTIE: u64 = 0x80   # Machine Timer Interrupt Enable
+val MIE_MEIE: u64 = 0x800  # Machine External Interrupt Enable
+
+# MTVEC modes
+val MTVEC_MODE_DIRECT: u64 = 0    # Direct mode (all traps to single handler)
+val MTVEC_MODE_VECTORED: u64 = 1  # Vectored mode (interrupts to offset table)
+
+# Check if CPU is in machine mode
+fn check_machine_mode(mstatus: u64) -> bool:
+    # After reset, CPU starts in machine mode
+    # Check MPP field (bits 11-12)
+    val mpp = (mstatus & MSTATUS_MPP_MASK) >> 11
+    mpp == 3  # Machine mode = 11b
+
+# Check mtvec alignment
+fn check_mtvec_alignment(mtvec: u64, mode: u64) -> bool:
+    match mode:
+        case 0:  # Direct mode - 4-byte aligned
+            (mtvec % 4) == 0
+        case 1:  # Vectored mode - must be aligned to 4 * (number of exceptions)
+            (mtvec % 256) == 0  # Conservative: 64 vectors * 4 bytes
+        case _:
+            false
+
+# Check mstatus initialization
+fn check_mstatus_init(mstatus: u64) -> bool:
+    # After reset:
+    # - MIE should be 0 (interrupts disabled)
+    # - MPP should be 11 (machine mode)
+    val mie_bit = (mstatus & MSTATUS_MIE) != 0
+    val mpp_machine = check_machine_mode(mstatus)
+
+    not mie_bit and mpp_machine
+
+# Check if specific interrupt is enabled in MIE
+fn check_interrupt_enabled(mie: u64, interrupt_bit: u64) -> bool:
+    (mie & interrupt_bit) != 0
+
+# Get simulated stack pointer
+fn get_stack_pointer() -> u64:
+    # Stack grows downward from top of RAM
+    RAM_BASE + STACK_SIZE
+
+# Check stack alignment (RISC-V requires 16-byte for RV64, 8-byte for RV32)
+fn check_stack_alignment_rv64(sp: u64) -> bool:
+    (sp % 16) == 0
+
+fn check_stack_alignment_rv32(sp: u32) -> bool:
+    (sp % 8) == 0
+
+# Extract mtvec base and mode
+fn parse_mtvec(mtvec: u64) -> (u64, u64):
+    val base = mtvec & (!0x3)  # Clear low 2 bits
+    val mode = mtvec & 0x3     # Low 2 bits
+    (base, mode)
+
+# Validate trap vector configuration
+fn validate_trap_vector(mtvec: u64) -> bool:
+    val (base, mode) = parse_mtvec(mtvec)
+
+    # Base must be non-zero
+    if base == 0:
+        return false
+
+    # Mode must be 0 (Direct) or 1 (Vectored)
+    if mode > 1:
+        return false
+
+    # Check alignment
+    check_mtvec_alignment(base, mode)

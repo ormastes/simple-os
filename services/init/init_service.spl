@@ -1,0 +1,239 @@
+# Init Service — First Userspace Process
+#
+# MDSOC: feature dimension, services layer (above drivers)
+# The init service is the first process spawned by the kernel.
+# It reads service manifests (SDN format) and starts system services
+# in dependency order.
+#
+# Services started by init:
+#   1. VFS service (filesystem)
+#   2. Network service
+#   3. Compositor (display/input)
+#   4. Desktop shell
+#   5. LLM MCP server
+
+# Service manifest (SDN format):
+#
+#   [service]
+#   name = "vfs"
+#   binary = "/sys/services/vfs"
+#   dependencies = []
+#   capabilities = ["FileRead(/)", "FileWrite(/)", "PortIO(0x1F0, 8)"]
+#   restart = "always"
+#   priority = "high"
+
+use os.userlib.process.{spawn, signal}
+use os.userlib.security.{cap_grant}
+use os.kernel.types.syscall_types.{SignalKind}
+
+enum ServiceState:
+    Stopped
+    Starting
+    Running(pid: u64)
+    Failed(reason: text)
+    Restarting
+
+enum RestartPolicy:
+    Always          # Restart on any exit
+    OnFailure       # Restart only on non-zero exit
+    Never           # Do not restart
+
+struct ServiceDef:
+    """Service definition from manifest."""
+    name: text
+    binary: text
+    dependencies: [text]
+    capabilities: [text]
+    restart: RestartPolicy
+    priority: text          # "realtime", "high", "normal", "low"
+
+struct ServiceInstance:
+    """Running service instance."""
+    def_: ServiceDef
+    state: ServiceState
+    restart_count: i32
+    max_restarts: i32
+
+class InitService:
+    """Init service manager.
+
+    Manages system service lifecycle.
+    Reads SDN manifests, resolves dependencies, starts/restarts services.
+    """
+    services: [ServiceInstance]
+    boot_complete: bool
+
+impl InitService:
+    static fn new() -> InitService:
+        InitService(services: [], boot_complete: false)
+
+    me register(def_: ServiceDef):
+        """Register a service definition."""
+        val stopped = ServiceState.Stopped
+        val instance = ServiceInstance(
+            def_: def_,
+            state: stopped,
+            restart_count: 0,
+            max_restarts: 10
+        )
+        self.services.push(instance)
+
+    me start_all():
+        """Start all services in dependency order."""
+        # Topological sort by dependencies
+        val order = me resolve_start_order()
+        for name in order:
+            me start_service(name)
+        self.boot_complete = true
+
+    me start_service(name: text):
+        """Start a single service by name."""
+        var i = 0
+        while i < self.services.len():
+            if self.services[i].def_.name == name:
+                if self.services[i].state == ServiceState.Stopped:
+                    # Check dependencies are running
+                    val svc_deps = self.services[i].def_.dependencies
+                    val deps_ready = me check_deps(svc_deps)
+                    if deps_ready:
+                        self.services[i].state = ServiceState.Starting
+                        # Spawn process via userlib syscall
+                        val priority_val: u8 = match self.services[i].def_.priority:
+                            "realtime": 0
+                            "high": 1
+                            "normal": 2
+                            "low": 3
+                            _: 2
+                        val spawn_result = spawn(0, priority_val)  # entry=0 placeholder until ELF loading
+                        if spawn_result.is_ok():
+                            val pid = spawn_result.unwrap()
+                            # Grant capabilities to the spawned process
+                            for cap in self.services[i].def_.capabilities:
+                                val _ = cap_grant(pid, cap)
+                            self.services[i].state = ServiceState.Running(pid: pid)
+                        else:
+                            self.services[i].state = ServiceState.Failed(reason: "spawn failed")
+                return
+            i = i + 1
+
+    fn check_deps(deps: [text]) -> bool:
+        """Check all dependencies are running."""
+        for dep_name in deps:
+            var found = false
+            for svc in self.services:
+                if svc.def_.name == dep_name:
+                    match svc.state:
+                        case ServiceState.Running(_): found = true
+                        case _: pass_dn
+            if not found:
+                return false
+        true
+
+    fn resolve_start_order() -> [text]:
+        """Topological sort of services by dependencies."""
+        var order: [text] = []
+        var visited: [text] = []
+
+        for svc in self.services:
+            val svc_name = svc.def_.name
+            me topo_visit(svc_name, visited, order)
+        order
+
+    me topo_visit(name: text, visited: [text], order: [text]):
+        """DFS visit for topological sort."""
+        if visited.contains(name):
+            return
+        visited.push(name)
+
+        # Visit dependencies first
+        for svc in self.services:
+            if svc.def_.name == name:
+                for dep in svc.def_.dependencies:
+                    me topo_visit(dep, visited, order)
+
+        order.push(name)
+
+    fn query_services() -> [(text, ServiceState)]:
+        """Query all service states for IPC responses."""
+        var result: [(text, ServiceState)] = []
+        for svc in self.services:
+            result = result.push((svc.def_.name, svc.state))
+        result
+
+    me handle_exit(pid: u64, exit_code: i32):
+        """Handle service exit. Restart if policy allows."""
+        var i = 0
+        while i < self.services.len():
+            match self.services[i].state:
+                case ServiceState.Running(running_pid):
+                    if running_pid == pid:
+                        if exit_code != 0:
+                            self.services[i].state = ServiceState.Failed(reason: "exit code {exit_code}")
+                        else:
+                            self.services[i].state = ServiceState.Stopped
+
+                        # Check restart policy
+                        val should_restart = match self.services[i].def_.restart:
+                            case RestartPolicy.Always: true
+                            case RestartPolicy.OnFailure: exit_code != 0
+                            case RestartPolicy.Never: false
+
+                        if should_restart and self.services[i].restart_count < self.services[i].max_restarts:
+                            self.services[i].restart_count = self.services[i].restart_count + 1
+                            self.services[i].state = ServiceState.Restarting
+                            val svc_name = self.services[i].def_.name
+                            me start_service(svc_name)
+                        return
+                case _: pass_dn
+            i = i + 1
+
+# ============================================================================
+# Default Service Definitions (built-in)
+# ============================================================================
+
+fn default_services() -> [ServiceDef]:
+    """Built-in service definitions for minimal OS boot."""
+    val always = RestartPolicy.Always
+    val on_failure = RestartPolicy.OnFailure
+    [
+        ServiceDef(
+            name: "vfs",
+            binary: "/sys/services/vfs",
+            dependencies: [],
+            capabilities: ["FileRead(/)", "FileWrite(/)"],
+            restart: always,
+            priority: "high"
+        ),
+        ServiceDef(
+            name: "net",
+            binary: "/sys/services/net",
+            dependencies: [],
+            capabilities: ["NetRaw"],
+            restart: always,
+            priority: "high"
+        ),
+        ServiceDef(
+            name: "compositor",
+            binary: "/sys/services/compositor",
+            dependencies: ["vfs"],
+            capabilities: ["FileRead(/sys/fonts)"],
+            restart: always,
+            priority: "high"
+        ),
+        ServiceDef(
+            name: "desktop",
+            binary: "/sys/apps/desktop",
+            dependencies: ["compositor", "vfs"],
+            capabilities: ["FileRead(/)", "FileWrite(/home)"],
+            restart: on_failure,
+            priority: "normal"
+        ),
+        ServiceDef(
+            name: "llm_mcp",
+            binary: "/sys/services/llm_mcp",
+            dependencies: ["compositor", "vfs", "net"],
+            capabilities: ["FileRead(/)", "FileWrite(/home)", "NetConnect(443)"],
+            restart: on_failure,
+            priority: "normal"
+        )
+    ]

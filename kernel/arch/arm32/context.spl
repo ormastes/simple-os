@@ -1,0 +1,170 @@
+# ARM32 Context Switch — Register Save/Restore
+#
+# Implements context switching for ARMv7-A. Context saving/restoring
+# involves the following register groups:
+#
+#   General purpose: r0-r12 (13 registers, 32-bit each)
+#   Stack pointer:   sp (r13)
+#   Link register:   lr (r14, return address)
+#   Program counter: pc (r15)
+#   Status register: cpsr (Current Program Status Register)
+#
+# ARM32 (AAPCS) calling convention:
+#   r0-r3:   Arguments / return values (caller-saved)
+#   r4-r11:  Callee-saved
+#   r12:     Intra-procedure call scratch (IP, caller-saved)
+#   r13:     Stack pointer (SP, 8-byte aligned at public interfaces)
+#   r14:     Link register (LR, return address)
+#   r15:     Program counter (PC)
+#
+# For context switch we save ALL registers (r0-r12) plus sp, lr, pc,
+# and cpsr because we need to fully restore interrupt contexts,
+# not just voluntary switches.
+#
+# CPSR initial values for new tasks:
+#   Kernel (SVC mode):  0x000001D3 = SVC mode (0x13), IRQ disabled (I=1), FIQ disabled (F=1)
+#   User mode:          0x00000010 = USR mode (0x10), all interrupts enabled
+
+use os.kernel.arch.arch_context.{Arm32Context, ArchContext}
+use os.kernel.arch.arm32.console.{uart_writeln}
+
+# ============================================================================
+# CPSR Constants
+# ============================================================================
+
+# CPSR mode bits [4:0]
+val CPSR_MODE_USR: u32 = 0x10     # User mode
+val CPSR_MODE_FIQ: u32 = 0x11     # FIQ mode
+val CPSR_MODE_IRQ: u32 = 0x12     # IRQ mode
+val CPSR_MODE_SVC: u32 = 0x13     # Supervisor (SVC) mode
+val CPSR_MODE_ABT: u32 = 0x17     # Abort mode
+val CPSR_MODE_UND: u32 = 0x1B     # Undefined mode
+val CPSR_MODE_SYS: u32 = 0x1F     # System mode
+
+# CPSR interrupt mask bits
+val CPSR_I: u32 = 1 << 7          # IRQ disable
+val CPSR_F: u32 = 1 << 6          # FIQ disable
+val CPSR_T: u32 = 1 << 5          # Thumb state
+
+# CPSR value for new kernel tasks:
+# SVC mode + IRQ disabled + FIQ disabled
+val CPSR_SVC_MASKED: u32 = CPSR_MODE_SVC | CPSR_I | CPSR_F
+
+# CPSR value for new user tasks:
+# USR mode, no interrupts masked
+val CPSR_USR: u32 = CPSR_MODE_USR
+
+# ============================================================================
+# Context Save/Restore (extern — implemented in assembly)
+# ============================================================================
+
+extern fn rt_arm32_context_save(ctx_ptr: u32)
+extern fn rt_arm32_context_restore(ctx_ptr: u32)
+extern fn rt_arm32_context_switch(from_ptr: u32, to_ptr: u32)
+
+# ============================================================================
+# Arm32ContextSwitch
+# ============================================================================
+
+struct Arm32ContextSwitch:
+    """ARM32 context switching implementation.
+
+    Provides save/restore/init operations for ARMv7-A register state.
+    The actual register manipulation is done in assembly via extern
+    functions — this struct provides the Simple-level interface.
+
+    Named Arm32ContextSwitch (not Arm32Context) to avoid collision
+    with the Arm32Context register state struct in arch_context.spl.
+    """
+    pass_dn
+
+impl Arm32ContextSwitch:
+    fn init():
+        """Initialize context switching subsystem."""
+        uart_writeln("[CTX] ARM32 context switch initialized")
+
+    fn create_kernel(entry_point: u32, stack_top: u32) -> Arm32Context:
+        """Create a new kernel-mode context.
+
+        Sets up register state so that when restored:
+        - Execution begins at entry_point (via pc)
+        - Stack is at stack_top (sp)
+        - Running in SVC mode with IRQ and FIQ disabled
+        - r0 = 0 (no argument)
+        """
+        _create_context(entry_point, stack_top, 0, CPSR_SVC_MASKED)
+
+    fn create_kernel_with_arg(entry_point: u32, stack_top: u32, arg: u32) -> Arm32Context:
+        """Create a new kernel-mode context with an argument in r0."""
+        _create_context(entry_point, stack_top, arg, CPSR_SVC_MASKED)
+
+    fn create_user(entry_point: u32, stack_top: u32) -> Arm32Context:
+        """Create a new user-mode context.
+
+        Sets up register state for USR mode execution.
+        """
+        _create_context(entry_point, stack_top, 0, CPSR_USR)
+
+    fn create(entry_point: u32, stack_top: u32, user_mode: bool) -> Arm32Context:
+        """Create a new context (kernel or user mode)."""
+        if user_mode:
+            self.create_user(entry_point, stack_top)
+        else:
+            self.create_kernel(entry_point, stack_top)
+
+    fn switch(from_ctx: Arm32Context, to_ctx: Arm32Context):
+        """Switch from one context to another.
+
+        Saves current register state into from_ctx, loads to_ctx.
+        Implemented in assembly — performs STM/LDM of all registers
+        and restores CPSR + jumps to saved pc.
+        """
+        pass_todo("assembly: save r0-r12,sp,lr,pc,cpsr to from_ctx; load from to_ctx; MOVS pc,lr")
+
+    fn save_current() -> Arm32Context:
+        """Save the current CPU register state and return it."""
+        pass_todo("assembly: read all registers into Arm32Context")
+
+    fn restore(ctx: Arm32Context):
+        """Restore a previously saved CPU register state.
+
+        Loads all registers from ctx and restores CPSR, then jumps
+        to the saved pc. Uses MOVS pc, lr or RFE for exception return.
+        """
+        pass_todo("assembly: load all registers from ctx, restore CPSR, jump to pc")
+
+# ============================================================================
+# Context Creation Helper
+# ============================================================================
+
+fn _create_context(entry: u32, stack: u32, arg: u32, cpsr: u32) -> Arm32Context:
+    """Create an Arm32Context with specified entry point, stack, argument, and CPSR.
+
+    All general-purpose registers are zeroed except:
+    - r0 = arg (first function argument)
+    - r11 = 0 (frame pointer, NULL for initial frame)
+    - lr = entry (link register, for the initial 'ret' path)
+    - sp = stack (stack pointer, must be 8-byte aligned)
+    - pc = entry (program counter)
+    - cpsr = cpsr (program status register)
+    """
+    Arm32Context(
+        r0: arg,
+        r1: 0,
+        r2: 0,
+        r3: 0,
+        r4: 0,
+        r5: 0,
+        r6: 0,
+        r7: 0,
+        r8: 0,
+        r9: 0,
+        r10: 0,
+        r11: 0,              # Frame pointer (NULL for initial frame)
+        r12: 0,              # Intra-procedure scratch
+        sp: stack,            # Stack pointer (8-byte aligned)
+        lr: entry,            # Link register (return address)
+        pc: entry,            # Program counter (entry point)
+        cpsr: cpsr,           # Program status register
+        fpu_state: 0          # No FPU/VFP state initially
+    )

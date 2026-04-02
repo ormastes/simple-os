@@ -1,0 +1,24 @@
+# SimpleOS Core Applications
+#
+# Built using existing UI widget system:
+#   - Terminal emulator (VT100/ANSI)
+#   - Shell (port existing shell/)
+#   - File manager (tree + list views)
+#   - Text editor (modal, syntax highlighting)
+#   - System monitor (process list, CPU/memory)
+#   - Package manager
+
+use os.apps.terminal.terminal
+use os.apps.shell.shell_app
+use os.apps.file_manager.file_manager
+use os.apps.editor.editor
+use os.apps.system_monitor.system_monitor
+use os.apps.calculator.calculator
+use os.apps.memo.memo
+use os.apps.file_explorer.file_explorer
+use os.apps.paint.paint
+use os.apps.clock.clock
+use os.apps.calendar.calendar
+use os.apps.screenshot.screenshot
+use os.apps.image_viewer.image_viewer
+use os.apps.disk_manager.disk_manager

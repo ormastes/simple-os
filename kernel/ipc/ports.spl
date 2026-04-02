@@ -1,0 +1,37 @@
+# IPC Layer — Input/Output Ports
+#
+# Input: SchedulerOutputPort (task blocking/unblocking), MemoryOutputPort
+# Output: message passing and capability management for all services.
+
+use os.kernel.types.ipc_types.{IpcPort, IpcMessage, IpcEndpoint}
+use os.kernel.types.capability_types.{CapabilityToken, CapabilityKind, CapabilitySet}
+use os.kernel.types.task_types.{TaskId}
+use os.kernel.scheduler.ports.{SchedulerOutputPort}
+use os.kernel.memory.ports.{MemoryOutputPort}
+
+struct IpcInputPort:
+    """What IPC needs from lower layers."""
+    scheduler: SchedulerOutputPort
+    memory: MemoryOutputPort
+
+struct IpcOutputPort:
+    """What IPC provides to all services and applications.
+
+    This is the primary interface for userspace.
+    All higher layers (drivers, VFS, net, compositor, apps)
+    communicate exclusively through IPC.
+    """
+    # Message passing
+    send_fn: fn(IpcMessage) -> i64
+    recv_fn: fn(IpcPort, i64) -> IpcMessage?
+    create_port_fn: fn(text) -> IpcPort
+    connect_fn: fn(text) -> IpcPort?
+
+    # Capability management
+    cap_grant_fn: fn(TaskId, CapabilityToken) -> bool
+    cap_revoke_fn: fn(CapabilityToken) -> bool
+    cap_check_fn: fn(TaskId, CapabilityKind) -> bool
+
+    # Security restriction (monotonic)
+    pledge_fn: fn([CapabilityKind])
+    unveil_fn: fn(text, text)

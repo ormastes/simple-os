@@ -1,0 +1,20 @@
+# @platform: baremetal(arm32)
+# @requires: arm-none-eabi-gcc, qemu-system-arm
+#
+# ARM Bare-Metal Module
+#
+# Hardware abstraction for ARM Cortex-M bare-metal programming.
+# Supports QEMU LM3S6965 (Cortex-M3) and STM32F4xx (Cortex-M4F).
+#
+# Components:
+# - nvic: Nested Vectored Interrupt Controller
+# - startup: Reset handler and initialization
+# - semihost: Semihosting support
+# - test_support: Testing utilities
+
+
+# Modules
+mod nvic
+mod startup
+mod semihost
+mod test_support

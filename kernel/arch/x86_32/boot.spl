@@ -1,0 +1,325 @@
+# x86_32 Multiboot 1 Boot Protocol — Boot Layer
+#
+# Parses Multiboot 1 boot info (memory map, framebuffer) and produces
+# a BootOutputPort for the memory layer.
+#
+# Multiboot 1 specification reference:
+#   https://www.gnu.org/software/grub/manual/multiboot/multiboot.html
+#
+# This is x86_32-specific because Multiboot 1 structures and the boot
+# handoff (magic in EAX, info pointer in EBX) are tied to the i386 ABI.
+
+use os.kernel.types.memory_types.{PhysAddr, VirtAddr}
+use os.kernel.boot.ports.{BootOutputPort, BootMemoryRegion, FramebufferInfo, MemoryRegionKind}
+use os.kernel.boot.mmio.{mmio_read32, mmio_read16, mmio_read8}
+use os.kernel.arch.arch_context.{Architecture}
+use os.kernel.arch.x86_32.console.{serial_writeln}
+
+# ============================================================================
+# Multiboot 1 Magic Numbers
+# ============================================================================
+
+val MULTIBOOT_HEADER_MAGIC: u32 = 0x1BADB002
+val MULTIBOOT_BOOTLOADER_MAGIC: u32 = 0x2BADB002
+
+# Multiboot header flags
+val MULTIBOOT_FLAG_ALIGN: u32 = 1 << 0       # Align modules on page boundaries
+val MULTIBOOT_FLAG_MEMINFO: u32 = 1 << 1     # Request memory info
+val MULTIBOOT_FLAG_VIDEO: u32 = 1 << 2       # Request video mode info
+
+# Combined flags for our header
+val MULTIBOOT_HEADER_FLAGS: u32 = MULTIBOOT_FLAG_ALIGN | MULTIBOOT_FLAG_MEMINFO
+
+# Multiboot info struct flags (bits set by bootloader)
+val MULTIBOOT_INFO_MEMORY: u32 = 1 << 0      # mem_lower/mem_upper valid
+val MULTIBOOT_INFO_MMAP: u32 = 1 << 6        # mmap_* fields valid
+val MULTIBOOT_INFO_FRAMEBUFFER: u32 = 1 << 12 # framebuffer info valid
+
+# ============================================================================
+# Multiboot Memory Map Entry Types
+# ============================================================================
+
+val MULTIBOOT_MMAP_AVAILABLE: u32 = 1
+val MULTIBOOT_MMAP_RESERVED: u32 = 2
+val MULTIBOOT_MMAP_ACPI_RECLAIMABLE: u32 = 3
+val MULTIBOOT_MMAP_ACPI_NVS: u32 = 4
+val MULTIBOOT_MMAP_BAD_MEMORY: u32 = 5
+
+# ============================================================================
+# Multiboot C-Compatible Structures
+# ============================================================================
+
+@repr("C")
+struct MultibootMmapEntry:
+    """Single memory map entry from Multiboot bootloader.
+
+    The 'size' field (first 4 bytes) gives the size of the remaining
+    fields, NOT including itself. Typically 20 bytes (size=20).
+    """
+    size: u32           # Size of this entry (excluding this field)
+    base_low: u32       # Physical base address (low 32 bits)
+    base_high: u32      # Physical base address (high 32 bits)
+    length_low: u32     # Region length (low 32 bits)
+    length_high: u32    # Region length (high 32 bits)
+    type_: u32          # Memory type (1=available, 2=reserved, etc.)
+
+@repr("C")
+struct MultibootInfo:
+    """Multiboot 1 info structure passed by bootloader.
+
+    Pointer to this struct is in EBX at kernel entry.
+    Only fields guarded by the corresponding flags bit are valid.
+    """
+    flags: u32
+    mem_lower: u32          # KB of lower memory (below 1MB)
+    mem_upper: u32          # KB of upper memory (above 1MB)
+    boot_device: u32
+    cmdline: u32            # Pointer to command line string
+    mods_count: u32
+    mods_addr: u32
+    # ... syms fields (unused) ...
+    syms_0: u32
+    syms_1: u32
+    syms_2: u32
+    syms_3: u32
+    mmap_length: u32        # Total size of memory map buffer
+    mmap_addr: u32          # Physical address of memory map
+
+# ============================================================================
+# X86_32Boot
+# ============================================================================
+
+struct X86_32Boot:
+    """x86_32 Multiboot 1 boot protocol handler.
+
+    Parses Multiboot info structure passed by GRUB or compatible
+    bootloader and assembles a BootOutputPort for the kernel's
+    portable memory layer.
+    """
+    pass_dn
+
+# ============================================================================
+# Global Multiboot State
+# ============================================================================
+
+var g_multiboot_info_addr: u32 = 0
+var g_multiboot_magic: u32 = 0
+
+fn _store_multiboot_info(magic: u32, info_addr: u32):
+    """Store multiboot info from boot entry (EAX=magic, EBX=info_addr)."""
+    g_multiboot_magic = magic
+    g_multiboot_info_addr = info_addr
+
+# ============================================================================
+# Memory Map Parsing
+# ============================================================================
+
+fn _multiboot_type_to_kind(type_: u32) -> MemoryRegionKind:
+    """Convert Multiboot memory type to MemoryRegionKind enum."""
+    if type_ == MULTIBOOT_MMAP_AVAILABLE:
+        return MemoryRegionKind.Usable
+    if type_ == MULTIBOOT_MMAP_RESERVED:
+        return MemoryRegionKind.Reserved
+    if type_ == MULTIBOOT_MMAP_ACPI_RECLAIMABLE:
+        return MemoryRegionKind.AcpiReclaimable
+    if type_ == MULTIBOOT_MMAP_ACPI_NVS:
+        return MemoryRegionKind.AcpiNvs
+    if type_ == MULTIBOOT_MMAP_BAD_MEMORY:
+        return MemoryRegionKind.BadMemory
+    # Default: treat unknown as reserved
+    MemoryRegionKind.Reserved
+
+fn _parse_memory_map() -> [BootMemoryRegion]:
+    """Parse Multiboot 1 memory map into BootMemoryRegion list."""
+    var regions: [BootMemoryRegion] = []
+
+    if g_multiboot_info_addr == 0:
+        serial_writeln("[BOOT] WARNING: No Multiboot info structure")
+        return regions
+
+    # Read flags to check if mmap is available
+    val flags = mmio_read32(g_multiboot_info_addr as u64)
+
+    if (flags & MULTIBOOT_INFO_MMAP) == 0:
+        # No memory map — fall back to mem_lower/mem_upper
+        serial_writeln("[BOOT] WARNING: No memory map in Multiboot info, using basic memory info")
+
+        if (flags & MULTIBOOT_INFO_MEMORY) != 0:
+            val mem_lower = mmio_read32((g_multiboot_info_addr + 4) as u64)
+            val mem_upper = mmio_read32((g_multiboot_info_addr + 8) as u64)
+
+            # Lower memory: 0 to mem_lower KB
+            regions.push(BootMemoryRegion(
+                base: PhysAddr(addr: 0),
+                size: (mem_lower as u64) * 1024,
+                kind: MemoryRegionKind.Usable
+            ))
+
+            # Upper memory: 1MB to mem_upper KB
+            regions.push(BootMemoryRegion(
+                base: PhysAddr(addr: 0x100000),
+                size: (mem_upper as u64) * 1024,
+                kind: MemoryRegionKind.Usable
+            ))
+
+            serial_writeln("[BOOT] Basic memory: lower={mem_lower}KB upper={mem_upper}KB")
+
+        return regions
+
+    # Read mmap_length and mmap_addr from MultibootInfo
+    # mmap_length is at offset 44, mmap_addr at offset 48
+    val mmap_length = mmio_read32((g_multiboot_info_addr + 44) as u64)
+    val mmap_addr = mmio_read32((g_multiboot_info_addr + 48) as u64)
+
+    serial_writeln("[BOOT] Memory map at 0x{mmap_addr}, length={mmap_length}")
+
+    var offset: u32 = 0
+    var entry_idx: u32 = 0
+    while offset < mmap_length:
+        val entry_addr = (mmap_addr + offset) as u64
+
+        # Read entry fields
+        val entry_size = mmio_read32(entry_addr)
+        val base_low = mmio_read32(entry_addr + 4)
+        val base_high = mmio_read32(entry_addr + 8)
+        val length_low = mmio_read32(entry_addr + 12)
+        val length_high = mmio_read32(entry_addr + 16)
+        val type_ = mmio_read32(entry_addr + 20)
+
+        val base = ((base_high as u64) << 32) | (base_low as u64)
+        val length = ((length_high as u64) << 32) | (length_low as u64)
+
+        val kind = _multiboot_type_to_kind(type_)
+
+        val region = BootMemoryRegion(
+            base: PhysAddr(addr: base),
+            size: length,
+            kind: kind
+        )
+        regions.push(region)
+
+        serial_writeln("[BOOT]   region {entry_idx}: base=0x{base} size=0x{length} type={type_}")
+
+        # Advance by entry_size + 4 (the size field itself)
+        offset = offset + entry_size + 4
+        entry_idx = entry_idx + 1
+
+    serial_writeln("[BOOT] Parsed {entry_idx} memory map entries")
+
+    regions
+
+# ============================================================================
+# Framebuffer Parsing
+# ============================================================================
+
+fn _parse_framebuffer() -> FramebufferInfo:
+    """Parse Multiboot 1 framebuffer info (if available)."""
+    if g_multiboot_info_addr == 0:
+        return FramebufferInfo(
+            addr: PhysAddr(addr: 0),
+            width: 0,
+            height: 0,
+            pitch: 0,
+            bpp: 0
+        )
+
+    val flags = mmio_read32(g_multiboot_info_addr as u64)
+
+    if (flags & MULTIBOOT_INFO_FRAMEBUFFER) == 0:
+        serial_writeln("[BOOT] No framebuffer info in Multiboot")
+        return FramebufferInfo(
+            addr: PhysAddr(addr: 0),
+            width: 0,
+            height: 0,
+            pitch: 0,
+            bpp: 0
+        )
+
+    # Framebuffer fields in Multiboot info (offsets from base):
+    # offset 88: framebuffer_addr (u64)
+    # offset 96: framebuffer_pitch (u32)
+    # offset 100: framebuffer_width (u32)
+    # offset 104: framebuffer_height (u32)
+    # offset 108: framebuffer_bpp (u8)
+    val fb_addr_low = mmio_read32((g_multiboot_info_addr + 88) as u64)
+    val fb_addr_high = mmio_read32((g_multiboot_info_addr + 92) as u64)
+    val fb_pitch = mmio_read32((g_multiboot_info_addr + 96) as u64)
+    val fb_width = mmio_read32((g_multiboot_info_addr + 100) as u64)
+    val fb_height = mmio_read32((g_multiboot_info_addr + 104) as u64)
+    val fb_bpp = mmio_read8((g_multiboot_info_addr + 108) as u64)
+
+    val fb_addr = ((fb_addr_high as u64) << 32) | (fb_addr_low as u64)
+
+    serial_writeln("[BOOT] Framebuffer: {fb_width}x{fb_height} bpp={fb_bpp} pitch={fb_pitch}")
+
+    FramebufferInfo(
+        addr: PhysAddr(addr: fb_addr),
+        width: fb_width,
+        height: fb_height,
+        pitch: fb_pitch,
+        bpp: fb_bpp as u32
+    )
+
+# ============================================================================
+# Boot Output Assembly
+# ============================================================================
+
+# Linker-provided symbols for kernel size calculation
+extern fn _get_kernel_end() -> u32
+extern fn _get_kernel_start() -> u32
+
+fn _build_boot_output() -> BootOutputPort:
+    """Assemble BootOutputPort from parsed Multiboot 1 info.
+
+    Uses the generalized BootOutputPort fields:
+    - serial_base (u64) = 0x3F8 for COM1
+    - serial_is_mmio = false (x86 uses port I/O)
+    - arch = Architecture.X86
+    - hhdm_offset = 0 (no higher-half direct map in 32-bit mode)
+    """
+    val memory_map = _parse_memory_map()
+    val framebuffer = _parse_framebuffer()
+
+    # Kernel physical addresses from linker symbols
+    val kernel_start = _get_kernel_start() as u64
+    val kernel_end = _get_kernel_end() as u64
+    val kernel_size = kernel_end - kernel_start
+
+    BootOutputPort(
+        memory_map: memory_map,
+        framebuffer: framebuffer,
+        rsdp_addr: nil,
+        kernel_phys_base: PhysAddr(addr: kernel_start),
+        kernel_virt_base: VirtAddr(addr: kernel_start),
+        kernel_size: kernel_size,
+        serial_base: 0x3F8,
+        serial_is_mmio: false,
+        arch: Architecture.X86,
+        hhdm_offset: 0
+    )
+
+# ============================================================================
+# Boot Entry Helpers
+# ============================================================================
+
+impl X86_32Boot:
+    fn store_multiboot_info(magic: u32, info_addr: u32):
+        """Store multiboot info from boot entry (call early in _start)."""
+        _store_multiboot_info(magic, info_addr)
+
+    fn validate_magic() -> bool:
+        """Check that the bootloader passed valid Multiboot magic."""
+        if g_multiboot_magic != MULTIBOOT_BOOTLOADER_MAGIC:
+            serial_writeln("[BOOT] ERROR: Invalid Multiboot magic: 0x{g_multiboot_magic}")
+            serial_writeln("[BOOT] Expected: 0x{MULTIBOOT_BOOTLOADER_MAGIC}")
+            return false
+        serial_writeln("[BOOT] Multiboot magic valid: 0x{g_multiboot_magic}")
+        true
+
+    fn build_boot_output() -> BootOutputPort:
+        """Assemble BootOutputPort from parsed Multiboot 1 info."""
+        _build_boot_output()
+
+    fn multiboot_info_addr() -> u32:
+        """Return the physical address of the Multiboot info struct."""
+        g_multiboot_info_addr

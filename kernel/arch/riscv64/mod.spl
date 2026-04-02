@@ -1,0 +1,42 @@
+# RISC-V 64 HAL Implementation — Module Root
+#
+# Aggregates all RISC-V 64-bit HAL implementations for S-mode
+# operation via OpenSBI on QEMU virt machine.
+# Each submodule wraps architecture-specific primitives behind
+# a HAL-compatible interface for the kernel's portable layers.
+
+use os.kernel.arch.riscv64.console.{Rv64Console}
+use os.kernel.arch.riscv64.boot.{Rv64Boot}
+use os.kernel.arch.riscv64.cpu.{Rv64Cpu}
+use os.kernel.arch.riscv64.paging.{Rv64Paging}
+use os.kernel.arch.riscv64.interrupt.{Rv64Interrupt}
+use os.kernel.arch.riscv64.timer.{Rv64Timer}
+use os.kernel.arch.riscv64.context.{Rv64ContextSwitch}
+
+struct Riscv64Hal:
+    """RISC-V 64-bit Hardware Abstraction Layer.
+
+    Composes all RISC-V 64-bit HAL subsystems into a single aggregate.
+    Targets S-mode operation via OpenSBI on QEMU virt machine.
+    The kernel portable layer dispatches through this struct to access
+    architecture-specific functionality.
+    """
+    console: Rv64Console
+    boot: Rv64Boot
+    cpu: Rv64Cpu
+    paging: Rv64Paging
+    interrupt: Rv64Interrupt
+    timer: Rv64Timer
+    context: Rv64ContextSwitch
+
+fn create_riscv64_hal() -> Riscv64Hal:
+    """Create RISC-V 64 HAL with default configuration."""
+    Riscv64Hal(
+        console: Rv64Console(),
+        boot: Rv64Boot(),
+        cpu: Rv64Cpu(),
+        paging: Rv64Paging(),
+        interrupt: Rv64Interrupt(),
+        timer: Rv64Timer(),
+        context: Rv64ContextSwitch()
+    )

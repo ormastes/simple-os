@@ -1,0 +1,167 @@
+# Capability policy engine — default-deny permission enforcement per window.
+#
+# Each window/surface has a policy declaring which Capabilities are
+# granted and which are explicitly denied. The policy is loaded from
+# SDN config via capability_config.spl.
+
+use common.ui.capability.{Capability, NotSupported}
+use std.security.types.{SecurityEvent, AuditEntry, AuditConfig}
+use std.security.audit_log.{log_security_event}
+
+## Per-window capability policy with default-deny semantics.
+class CapabilityPolicy:
+    window_id: text
+    granted: List<Capability>
+    denied: List<Capability>
+    default_deny: bool
+    audit_config: AuditConfig
+
+    static fn new(window_id: text) -> CapabilityPolicy:
+        """Create a default-deny policy with no granted capabilities."""
+        CapabilityPolicy(
+            window_id: window_id,
+            granted: [],
+            denied: [],
+            default_deny: true,
+            audit_config: AuditConfig.default()
+        )
+
+    static fn allow_all(window_id: text) -> CapabilityPolicy:
+        """Create an allow-all policy (for trusted windows)."""
+        CapabilityPolicy(
+            window_id: window_id,
+            granted: [],
+            denied: [],
+            default_deny: false,
+            audit_config: AuditConfig.default()
+        )
+
+## Check whether a capability is allowed by the policy.
+fn check_capability(policy: CapabilityPolicy, cap: Capability) -> Result<bool, text>:
+    """
+    Returns Ok(true) if allowed, Err(reason) if denied.
+
+    sdoctest:
+        val policy = CapabilityPolicy.new("test")
+        expect(check_capability(policy, Capability.ShellAccess).is_err()).to_equal(true)
+    """
+    val cap_name = capability_name(cap)
+
+    # Explicit deny always wins
+    if contains_cap(policy.denied, cap):
+        log_denial(policy, cap_name)
+        return Err("Capability {cap_name} denied for window {policy.window_id}")
+
+    # Explicit grant
+    if contains_cap(policy.granted, cap):
+        return Ok(true)
+
+    # Default policy
+    if policy.default_deny:
+        log_denial(policy, cap_name)
+        return Err("Capability {cap_name} not granted for window {policy.window_id}")
+
+    Ok(true)
+
+## Require a capability — return NotSupported on denial.
+fn require_capability(policy: CapabilityPolicy, cap: Capability) -> Result<bool, NotSupported>:
+    val result = check_capability(policy, cap)
+    match result:
+        Ok(v): Ok(v)
+        Err(msg): Err(NotSupported.new(msg))
+
+## Add a granted capability to a policy.
+fn grant(policy: CapabilityPolicy, cap: Capability) -> CapabilityPolicy:
+    var new_granted = policy.granted
+    if not contains_cap(new_granted, cap):
+        new_granted = new_granted.push(cap)
+    CapabilityPolicy(
+        window_id: policy.window_id,
+        granted: new_granted,
+        denied: policy.denied,
+        default_deny: policy.default_deny,
+        audit_config: policy.audit_config
+    )
+
+## Add a denied capability to a policy.
+fn deny(policy: CapabilityPolicy, cap: Capability) -> CapabilityPolicy:
+    var new_denied = policy.denied
+    if not contains_cap(new_denied, cap):
+        new_denied = new_denied.push(cap)
+    CapabilityPolicy(
+        window_id: policy.window_id,
+        granted: policy.granted,
+        denied: new_denied,
+        default_deny: policy.default_deny,
+        audit_config: policy.audit_config
+    )
+
+## Check if a capability list contains a given capability.
+fn contains_cap(caps: List<Capability>, target: Capability) -> bool:
+    val target_name = capability_name(target)
+    for cap in caps:
+        if capability_name(cap) == target_name:
+            return true
+    false
+
+## Get string name of a capability for logging and config parsing.
+fn capability_name(cap: Capability) -> text:
+    match cap:
+        Capability.Mouse: "Mouse"
+        Capability.Touch: "Touch"
+        Capability.Color: "Color"
+        Capability.Images: "Images"
+        Capability.FullScreen: "FullScreen"
+        Capability.NativeDialogs: "NativeDialogs"
+        Capability.Notification: "Notification"
+        Capability.SystemTray: "SystemTray"
+        Capability.FileSystemRead: "FileSystemRead"
+        Capability.FileSystemWrite: "FileSystemWrite"
+        Capability.NetworkAccess: "NetworkAccess"
+        Capability.ClipboardRead: "ClipboardRead"
+        Capability.ClipboardWrite: "ClipboardWrite"
+        Capability.Camera: "Camera"
+        Capability.Microphone: "Microphone"
+        Capability.Geolocation: "Geolocation"
+        Capability.DevTools: "DevTools"
+        Capability.ExternalUrls: "ExternalUrls"
+        Capability.ShellAccess: "ShellAccess"
+        Capability.ProcessSpawn: "ProcessSpawn"
+
+## Parse a capability name string to the enum variant.
+fn parse_capability(name: text) -> Result<Capability, text>:
+    match name:
+        "Mouse": Ok(Capability.Mouse)
+        "Touch": Ok(Capability.Touch)
+        "Color": Ok(Capability.Color)
+        "Images": Ok(Capability.Images)
+        "FullScreen": Ok(Capability.FullScreen)
+        "NativeDialogs": Ok(Capability.NativeDialogs)
+        "Notification": Ok(Capability.Notification)
+        "SystemTray": Ok(Capability.SystemTray)
+        "FileSystemRead": Ok(Capability.FileSystemRead)
+        "FileSystemWrite": Ok(Capability.FileSystemWrite)
+        "NetworkAccess": Ok(Capability.NetworkAccess)
+        "ClipboardRead": Ok(Capability.ClipboardRead)
+        "ClipboardWrite": Ok(Capability.ClipboardWrite)
+        "Camera": Ok(Capability.Camera)
+        "Microphone": Ok(Capability.Microphone)
+        "Geolocation": Ok(Capability.Geolocation)
+        "DevTools": Ok(Capability.DevTools)
+        "ExternalUrls": Ok(Capability.ExternalUrls)
+        "ShellAccess": Ok(Capability.ShellAccess)
+        "ProcessSpawn": Ok(Capability.ProcessSpawn)
+        _: Err("unknown capability: {name}")
+
+## Log a capability denial via audit system.
+fn log_denial(policy: CapabilityPolicy, cap_name: text):
+    val event = SecurityEvent.CapabilityDenied(
+        capability: cap_name,
+        window_id: policy.window_id
+    )
+    val entry = AuditEntry.new(
+        event: event,
+        correlation_id: "",
+        module_path: "ui.capability_policy"
+    )
+    log_security_event(entry, policy.audit_config)

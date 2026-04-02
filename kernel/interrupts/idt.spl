@@ -1,0 +1,428 @@
+# Interrupt Descriptor Table (IDT) — Interrupts Layer
+#
+# x86_64 IDT with 256 entries for exceptions, hardware IRQs, and software interrupts.
+# Exception handlers print diagnostic info via serial and halt.
+#
+# Key vectors:
+#   0-31:   CPU exceptions (divide error, page fault, GPF, etc.)
+#   32-47:  Hardware IRQs (timer, keyboard, etc.)
+#   48-255: Software interrupts / available
+
+use os.kernel.types.task_types.{TaskContext}
+use os.kernel.interrupts.gdt.{GDT_KERNEL_CS}
+use std.baremetal.x86.io.{outb}
+
+# --- Exception Vectors ---
+
+val VEC_DIVIDE_ERROR: u32       = 0
+val VEC_DEBUG: u32              = 1
+val VEC_NMI: u32                = 2
+val VEC_BREAKPOINT: u32         = 3
+val VEC_OVERFLOW: u32           = 4
+val VEC_BOUND_RANGE: u32        = 5
+val VEC_INVALID_OPCODE: u32     = 6
+val VEC_DEVICE_NA: u32          = 7
+val VEC_DOUBLE_FAULT: u32       = 8
+val VEC_COPROC_SEG: u32         = 9
+val VEC_INVALID_TSS: u32       = 10
+val VEC_SEG_NOT_PRESENT: u32   = 11
+val VEC_STACK_FAULT: u32       = 12
+val VEC_GPF: u32               = 13
+val VEC_PAGE_FAULT: u32        = 14
+val VEC_X87_FP: u32            = 16
+val VEC_ALIGNMENT_CHECK: u32   = 17
+val VEC_MACHINE_CHECK: u32     = 18
+val VEC_SIMD_FP: u32           = 19
+val VEC_VIRT: u32              = 20
+
+# --- IRQ Vectors (APIC-mapped) ---
+
+val VEC_IRQ_BASE: u32          = 32
+val VEC_TIMER: u32             = 32
+val VEC_KEYBOARD: u32          = 33
+val VEC_CASCADE: u32           = 34
+val VEC_COM2: u32              = 35
+val VEC_COM1: u32              = 36
+val VEC_LPT2: u32              = 37
+val VEC_FLOPPY: u32            = 38
+val VEC_LPT1: u32              = 39
+val VEC_RTC: u32               = 40
+val VEC_FREE9: u32             = 41
+val VEC_FREE10: u32            = 42
+val VEC_FREE11: u32            = 43
+val VEC_MOUSE: u32             = 44
+val VEC_FPU: u32               = 45
+val VEC_ATA_PRIMARY: u32       = 46
+val VEC_ATA_SECONDARY: u32     = 47
+
+# --- Spurious Vector ---
+
+val VEC_SPURIOUS: u32          = 0xFF
+
+# --- IDT Gate Types ---
+
+val GATE_INTERRUPT: u8 = 0x8E    # Interrupt gate, ring 0, present
+val GATE_TRAP: u8      = 0x8F    # Trap gate, ring 0, present
+val GATE_USER_INT: u8  = 0xEE    # Interrupt gate, ring 3, present (for syscalls)
+
+# --- Structs ---
+
+@repr("C")
+struct IdtEntry:
+    """Single 16-byte IDT descriptor for x86_64 interrupt gate."""
+    offset_low: u16      # Handler address bits 0-15
+    selector: u16        # Code segment selector (GDT_KERNEL_CS = 0x08)
+    ist: u8              # Interrupt Stack Table index (0 = no IST, 1-7 = IST entry)
+    type_attr: u8        # Gate type and attributes
+    offset_mid: u16      # Handler address bits 16-31
+    offset_high: u32     # Handler address bits 32-63
+    reserved: u32        # Must be zero
+
+@repr("C")
+struct IdtPtr:
+    """IDTR register value: limit (size - 1) and base address."""
+    limit: u16
+    base: u64
+
+# --- Module State ---
+
+var idt_entries: [IdtEntry; 256]
+var idt_pointer: IdtPtr
+
+# Handler table: function pointers indexed by vector number.
+# Upper layers register handlers here via idt_register_handler().
+var handler_table: [fn(TaskContext); 256]
+
+# --- Public API ---
+
+fn idt_init():
+    """Initialize IDT with 256 entries, install default exception handlers, load IDTR.
+
+    After this call, interrupts are NOT yet enabled (caller must sti).
+    Exception handlers halt the CPU with diagnostic output on serial."""
+
+    # Zero all entries
+    var i: u32 = 0
+    while i < 256:
+        idt_entries[i] = _make_empty_entry()
+        handler_table[i] = _default_handler
+        i = i + 1
+
+    # Install CPU exception handlers (vectors 0-20)
+    idt_set_handler(VEC_DIVIDE_ERROR, &_isr_divide_error as u64, 0)
+    idt_set_handler(VEC_DEBUG, &_isr_debug as u64, 0)
+    idt_set_handler(VEC_NMI, &_isr_nmi as u64, 2)              # NMI uses IST2
+    idt_set_handler(VEC_BREAKPOINT, &_isr_breakpoint as u64, 0)
+    idt_set_handler(VEC_OVERFLOW, &_isr_overflow as u64, 0)
+    idt_set_handler(VEC_BOUND_RANGE, &_isr_bound_range as u64, 0)
+    idt_set_handler(VEC_INVALID_OPCODE, &_isr_invalid_opcode as u64, 0)
+    idt_set_handler(VEC_DEVICE_NA, &_isr_device_na as u64, 0)
+    idt_set_handler(VEC_DOUBLE_FAULT, &_isr_double_fault as u64, 1)   # Double fault uses IST1
+    idt_set_handler(VEC_INVALID_TSS, &_isr_invalid_tss as u64, 0)
+    idt_set_handler(VEC_SEG_NOT_PRESENT, &_isr_seg_not_present as u64, 0)
+    idt_set_handler(VEC_STACK_FAULT, &_isr_stack_fault as u64, 0)
+    idt_set_handler(VEC_GPF, &_isr_gpf as u64, 0)
+    idt_set_handler(VEC_PAGE_FAULT, &_isr_page_fault as u64, 0)
+    idt_set_handler(VEC_X87_FP, &_isr_x87_fp as u64, 0)
+    idt_set_handler(VEC_ALIGNMENT_CHECK, &_isr_alignment_check as u64, 0)
+    idt_set_handler(VEC_MACHINE_CHECK, &_isr_machine_check as u64, 1)  # MCE uses IST1
+    idt_set_handler(VEC_SIMD_FP, &_isr_simd_fp as u64, 0)
+
+    # Spurious interrupt handler
+    idt_set_handler(VEC_SPURIOUS, &_isr_spurious as u64, 0)
+
+    # Set up IDTR pointer
+    idt_pointer = IdtPtr(
+        limit: 4095,    # 256 * 16 - 1
+        base: &idt_entries as u64
+    )
+
+    # Load IDT register
+    _idt_load()
+
+fn idt_set_handler(vector: u32, handler_addr: u64, ist: u8):
+    """Set handler for a specific interrupt vector.
+    vector: 0-255
+    handler_addr: address of the ISR entry point
+    ist: Interrupt Stack Table index (0 = default stack, 1-7 = IST entry)"""
+    val entry = _make_gate_entry(handler_addr, GDT_KERNEL_CS, ist, GATE_INTERRUPT)
+    idt_entries[vector] = entry
+
+fn idt_set_user_handler(vector: u32, handler_addr: u64):
+    """Set handler callable from ring 3 (e.g., syscall interrupt)."""
+    val entry = _make_gate_entry(handler_addr, GDT_KERNEL_CS, 0, GATE_USER_INT)
+    idt_entries[vector] = entry
+
+fn idt_register_handler(vector: u32, handler: fn(TaskContext)):
+    """Register a high-level handler for an interrupt vector.
+    Called from the common ISR dispatch after saving context."""
+    handler_table[vector] = handler
+
+fn idt_dispatch(vector: u32, ctx: TaskContext):
+    """Dispatch interrupt to registered handler.
+    Called from the common ISR stub after saving CPU state."""
+    val handler = handler_table[vector]
+    handler(ctx)
+
+# --- Internal: Gate Entry Construction ---
+
+fn _make_empty_entry() -> IdtEntry:
+    """Create a not-present IDT entry."""
+    IdtEntry(offset_low: 0, selector: 0, ist: 0,
+             type_attr: 0, offset_mid: 0, offset_high: 0, reserved: 0)
+
+fn _make_gate_entry(addr: u64, selector: u16, ist: u8, gate_type: u8) -> IdtEntry:
+    """Create an IDT gate entry from handler address."""
+    val low = (addr & 0xFFFF) as u16
+    val mid = ((addr >> 16) & 0xFFFF) as u16
+    val high = ((addr >> 32) & 0xFFFFFFFF) as u32
+    IdtEntry(
+        offset_low: low,
+        selector: selector,
+        ist: ist,
+        type_attr: gate_type,
+        offset_mid: mid,
+        offset_high: high,
+        reserved: 0
+    )
+
+fn _idt_load():
+    """Execute lidt instruction to load the IDT register."""
+    asm """
+        lidt [{idt_pointer}]
+    """
+
+# --- Serial Output Helpers (COM1 = 0x3F8) ---
+
+fn _serial_putchar(ch: u8):
+    """Write a single character to COM1 serial port."""
+    # Wait for transmit buffer empty (bit 5 of LSR at port+5)
+    var lsr: u8 = 0
+    while (lsr & 0x20) == 0:
+        asm """
+            mov dx, 0x3FD
+            in al, dx
+            movzx eax, al
+            mov {lsr}, eax
+        """
+    outb(0x3F8, ch as i32)
+
+fn _serial_puts(msg: text):
+    """Write a string to COM1 serial port."""
+    var i = 0
+    while i < msg.len():
+        _serial_putchar(msg[i] as u8)
+        i = i + 1
+
+fn _serial_print_hex(value: u64):
+    """Print a 64-bit value in hex to serial."""
+    _serial_puts("0x")
+    var shift = 60
+    while shift >= 0:
+        val nibble = ((value >> shift) & 0x0F) as u8
+        val ch = if nibble < 10: (0x30 + nibble) as u8 else: (0x57 + nibble) as u8
+        _serial_putchar(ch)
+        shift = shift - 4
+
+fn _halt():
+    """Disable interrupts and halt CPU forever."""
+    asm """
+        cli
+        .Lhalt_loop:
+        hlt
+        jmp .Lhalt_loop
+    """
+
+# --- Default Handler ---
+
+fn _default_handler(ctx: TaskContext):
+    """Default handler for unregistered vectors. Prints warning."""
+    _serial_puts("[IDT] Unhandled interrupt\n")
+
+# --- Exception Handlers ---
+# Each prints diagnostic info via serial and halts.
+
+fn _isr_divide_error(ctx: TaskContext):
+    """Vector 0: Divide by zero."""
+    _serial_puts("\n!!! EXCEPTION: Divide by zero (#DE)\n")
+    _serial_puts("  RIP: ")
+    _serial_print_hex(ctx.rip)
+    _serial_puts("\n  CS:  ")
+    _serial_print_hex(ctx.cs)
+    _serial_puts("\n")
+    _halt()
+
+fn _isr_debug(ctx: TaskContext):
+    """Vector 1: Debug exception."""
+    _serial_puts("\n!!! EXCEPTION: Debug (#DB)\n")
+    _serial_puts("  RIP: ")
+    _serial_print_hex(ctx.rip)
+    _serial_puts("\n")
+    _halt()
+
+fn _isr_nmi(ctx: TaskContext):
+    """Vector 2: Non-Maskable Interrupt."""
+    _serial_puts("\n!!! NMI: Non-Maskable Interrupt\n")
+    _serial_puts("  RIP: ")
+    _serial_print_hex(ctx.rip)
+    _serial_puts("\n")
+    _halt()
+
+fn _isr_breakpoint(ctx: TaskContext):
+    """Vector 3: Breakpoint (INT3)."""
+    _serial_puts("\n!!! EXCEPTION: Breakpoint (#BP)\n")
+    _serial_puts("  RIP: ")
+    _serial_print_hex(ctx.rip)
+    _serial_puts("\n")
+    # Breakpoint is a trap — return to next instruction (don't halt)
+
+fn _isr_overflow(ctx: TaskContext):
+    """Vector 4: Overflow (INTO)."""
+    _serial_puts("\n!!! EXCEPTION: Overflow (#OF)\n")
+    _serial_puts("  RIP: ")
+    _serial_print_hex(ctx.rip)
+    _serial_puts("\n")
+    _halt()
+
+fn _isr_bound_range(ctx: TaskContext):
+    """Vector 5: BOUND range exceeded."""
+    _serial_puts("\n!!! EXCEPTION: Bound Range (#BR)\n")
+    _serial_puts("  RIP: ")
+    _serial_print_hex(ctx.rip)
+    _serial_puts("\n")
+    _halt()
+
+fn _isr_invalid_opcode(ctx: TaskContext):
+    """Vector 6: Invalid opcode."""
+    _serial_puts("\n!!! EXCEPTION: Invalid Opcode (#UD)\n")
+    _serial_puts("  RIP: ")
+    _serial_print_hex(ctx.rip)
+    _serial_puts("\n  RAX: ")
+    _serial_print_hex(ctx.rax)
+    _serial_puts("\n  RBX: ")
+    _serial_print_hex(ctx.rbx)
+    _serial_puts("\n")
+    _halt()
+
+fn _isr_device_na(ctx: TaskContext):
+    """Vector 7: Device not available (FPU)."""
+    _serial_puts("\n!!! EXCEPTION: Device Not Available (#NM)\n")
+    _serial_puts("  RIP: ")
+    _serial_print_hex(ctx.rip)
+    _serial_puts("\n")
+    _halt()
+
+fn _isr_double_fault(ctx: TaskContext):
+    """Vector 8: Double fault (always error code 0).
+    Uses IST1 to guarantee a known-good stack."""
+    _serial_puts("\n!!! EXCEPTION: Double Fault (#DF) — FATAL\n")
+    _serial_puts("  RIP: ")
+    _serial_print_hex(ctx.rip)
+    _serial_puts("\n  RSP: ")
+    _serial_print_hex(ctx.rsp)
+    _serial_puts("\n  RBP: ")
+    _serial_print_hex(ctx.rbp)
+    _serial_puts("\n")
+    _halt()
+
+fn _isr_invalid_tss(ctx: TaskContext):
+    """Vector 10: Invalid TSS."""
+    _serial_puts("\n!!! EXCEPTION: Invalid TSS (#TS)\n")
+    _serial_puts("  RIP: ")
+    _serial_print_hex(ctx.rip)
+    _serial_puts("\n")
+    _halt()
+
+fn _isr_seg_not_present(ctx: TaskContext):
+    """Vector 11: Segment not present."""
+    _serial_puts("\n!!! EXCEPTION: Segment Not Present (#NP)\n")
+    _serial_puts("  RIP: ")
+    _serial_print_hex(ctx.rip)
+    _serial_puts("\n")
+    _halt()
+
+fn _isr_stack_fault(ctx: TaskContext):
+    """Vector 12: Stack-segment fault."""
+    _serial_puts("\n!!! EXCEPTION: Stack Fault (#SS)\n")
+    _serial_puts("  RIP: ")
+    _serial_print_hex(ctx.rip)
+    _serial_puts("\n  RSP: ")
+    _serial_print_hex(ctx.rsp)
+    _serial_puts("\n")
+    _halt()
+
+fn _isr_gpf(ctx: TaskContext):
+    """Vector 13: General Protection Fault.
+    Error code pushed by CPU indicates the selector index that caused the fault."""
+    _serial_puts("\n!!! EXCEPTION: General Protection Fault (#GP)\n")
+    _serial_puts("  RIP:    ")
+    _serial_print_hex(ctx.rip)
+    _serial_puts("\n  CS:     ")
+    _serial_print_hex(ctx.cs)
+    _serial_puts("\n  RFLAGS: ")
+    _serial_print_hex(ctx.rflags)
+    _serial_puts("\n  RSP:    ")
+    _serial_print_hex(ctx.rsp)
+    _serial_puts("\n  SS:     ")
+    _serial_print_hex(ctx.ss)
+    _serial_puts("\n")
+    _halt()
+
+fn _isr_page_fault(ctx: TaskContext):
+    """Vector 14: Page Fault.
+    CR2 contains the faulting virtual address.
+    Error code bits: P=present, W=write, U=user, R=reserved, I=instruction fetch."""
+    _serial_puts("\n!!! EXCEPTION: Page Fault (#PF)\n")
+    _serial_puts("  RIP: ")
+    _serial_print_hex(ctx.rip)
+    # Read CR2 for faulting address
+    var cr2: u64 = 0
+    asm """
+        mov rax, cr2
+        mov {cr2}, rax
+    """
+    _serial_puts("\n  CR2: ")
+    _serial_print_hex(cr2)
+    _serial_puts("\n  RSP: ")
+    _serial_print_hex(ctx.rsp)
+    _serial_puts("\n")
+    _halt()
+
+fn _isr_x87_fp(ctx: TaskContext):
+    """Vector 16: x87 FPU floating-point error."""
+    _serial_puts("\n!!! EXCEPTION: x87 FP Error (#MF)\n")
+    _serial_puts("  RIP: ")
+    _serial_print_hex(ctx.rip)
+    _serial_puts("\n")
+    _halt()
+
+fn _isr_alignment_check(ctx: TaskContext):
+    """Vector 17: Alignment check."""
+    _serial_puts("\n!!! EXCEPTION: Alignment Check (#AC)\n")
+    _serial_puts("  RIP: ")
+    _serial_print_hex(ctx.rip)
+    _serial_puts("\n")
+    _halt()
+
+fn _isr_machine_check(ctx: TaskContext):
+    """Vector 18: Machine check (fatal hardware error).
+    Uses IST1 for guaranteed stack."""
+    _serial_puts("\n!!! EXCEPTION: Machine Check (#MC) — FATAL\n")
+    _serial_puts("  RIP: ")
+    _serial_print_hex(ctx.rip)
+    _serial_puts("\n")
+    _halt()
+
+fn _isr_simd_fp(ctx: TaskContext):
+    """Vector 19: SIMD floating-point exception."""
+    _serial_puts("\n!!! EXCEPTION: SIMD FP Error (#XM)\n")
+    _serial_puts("  RIP: ")
+    _serial_print_hex(ctx.rip)
+    _serial_puts("\n")
+    _halt()
+
+fn _isr_spurious(ctx: TaskContext):
+    """Vector 0xFF: Spurious interrupt from APIC.
+    Do NOT send EOI for spurious interrupts."""
+    # Spurious interrupts should be silently ignored
+    pass

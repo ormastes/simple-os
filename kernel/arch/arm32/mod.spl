@@ -1,0 +1,52 @@
+# ARM32 (ARMv7-A) HAL Implementation — Module Root
+#
+# Aggregates all ARM32-specific HAL implementations.
+# Each submodule wraps architecture-specific primitives behind
+# a HAL-compatible interface for the kernel's portable layers.
+#
+# Target: QEMU virt machine (arm, Cortex-A15)
+# - PL011 UART at 0x09000000
+# - GICv2 at 0x08000000 / 0x08010000
+# - RAM at 0x40000000
+# - ARM Generic Timer (cp15 interface)
+
+use os.kernel.arch.arm32.console.{Arm32Console}
+use os.kernel.arch.arm32.boot.{Arm32Boot}
+use os.kernel.arch.arm32.cpu.{Arm32Cpu}
+use os.kernel.arch.arm32.paging.{Arm32Paging}
+use os.kernel.arch.arm32.interrupt.{Arm32Interrupt}
+use os.kernel.arch.arm32.timer.{Arm32Timer}
+use os.kernel.arch.arm32.context.{Arm32ContextSwitch}
+
+struct Arm32Hal:
+    """ARM32 (ARMv7-A) Hardware Abstraction Layer.
+
+    Composes all ARM32-specific HAL subsystems into a single aggregate.
+    The kernel portable layer dispatches through this struct to access
+    architecture-specific functionality.
+
+    Targets QEMU virt machine with:
+    - PL011 UART serial console
+    - GICv2 interrupt controller
+    - 2-level short-descriptor page tables (1MB sections / 4KB pages)
+    - ARM Generic Timer (cp15 coprocessor interface)
+    """
+    console: Arm32Console
+    boot: Arm32Boot
+    cpu: Arm32Cpu
+    paging: Arm32Paging
+    interrupt: Arm32Interrupt
+    timer: Arm32Timer
+    context: Arm32ContextSwitch
+
+fn create_arm32_hal() -> Arm32Hal:
+    """Create ARM32 HAL with default configuration."""
+    Arm32Hal(
+        console: Arm32Console(),
+        boot: Arm32Boot(),
+        cpu: Arm32Cpu(),
+        paging: Arm32Paging(),
+        interrupt: Arm32Interrupt(),
+        timer: Arm32Timer(),
+        context: Arm32ContextSwitch()
+    )

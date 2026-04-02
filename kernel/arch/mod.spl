@@ -1,0 +1,206 @@
+# Architecture Dispatch — Compile-Time Arch Selection
+#
+# Provides get_hal() which returns the active architecture's HAL implementation.
+# Only one architecture is active per compilation target — the compiler eliminates
+# dead code for other architectures.
+#
+# Import this module to access the HAL:
+#   use os.kernel.arch.{get_hal, get_console, get_arch}
+#
+# The CURRENT_ARCH constant determines which architecture is active.
+# It is set here to match the compilation target. When cross-compiling,
+# this constant should be changed to match the target triple.
+
+use os.kernel.arch.arch_context.{Architecture, ArchContext}
+use os.kernel.arch.hal.{HalConsole, HalBoot, HalCpu, HalPaging, HalInterrupt, HalTimer, HalContext}
+
+# ============================================================================
+# Architecture Implementations
+# ============================================================================
+
+# x86_64
+use os.kernel.arch.x86_64.mod.{X86_64Hal, create_x86_64_hal}
+use os.kernel.arch.x86_64.console.{X86Console}
+use os.kernel.arch.x86_64.boot.{X86Boot}
+use os.kernel.arch.x86_64.cpu.{X86Cpu}
+
+# x86_32
+use os.kernel.arch.x86_32.mod.{X86_32Hal, create_x86_32_hal}
+use os.kernel.arch.x86_32.console.{X86_32Console}
+use os.kernel.arch.x86_32.boot.{X86_32Boot}
+use os.kernel.arch.x86_32.cpu.{X86_32Cpu}
+
+# RISC-V 64
+use os.kernel.arch.riscv64.mod.{Riscv64Hal, create_riscv64_hal}
+use os.kernel.arch.riscv64.console.{Rv64Console}
+use os.kernel.arch.riscv64.boot.{Rv64Boot}
+use os.kernel.arch.riscv64.cpu.{Rv64Cpu}
+
+# RISC-V 32
+use os.kernel.arch.riscv32.mod.{Riscv32Hal, create_riscv32_hal}
+use os.kernel.arch.riscv32.console.{Rv32Console}
+use os.kernel.arch.riscv32.boot.{Rv32Boot}
+use os.kernel.arch.riscv32.cpu.{Rv32Cpu}
+
+# ARM64
+use os.kernel.arch.arm64.mod.{Arm64Hal, create_arm64_hal}
+use os.kernel.arch.arm64.console.{Arm64Console}
+use os.kernel.arch.arm64.boot.{Arm64Boot}
+use os.kernel.arch.arm64.cpu.{Arm64Cpu}
+
+# ARM32
+use os.kernel.arch.arm32.mod.{Arm32Hal, create_arm32_hal}
+use os.kernel.arch.arm32.console.{Arm32Console}
+use os.kernel.arch.arm32.boot.{Arm32Boot}
+use os.kernel.arch.arm32.cpu.{Arm32Cpu}
+
+# ============================================================================
+# Current Target Architecture
+# ============================================================================
+
+# This constant selects the active architecture at compile time.
+# Change this when cross-compiling for a different target:
+#   X86_64   — x86_64-unknown-none (default)
+#   Riscv64  — riscv64-unknown-none
+#   Riscv32  — riscv32-unknown-none
+#   Arm64    — aarch64-unknown-none
+val CURRENT_ARCH: Architecture = Architecture.X86_64
+
+# ============================================================================
+# Architecture Dispatch Functions
+# ============================================================================
+
+fn get_arch() -> Architecture:
+    """Get the compile-time target architecture."""
+    CURRENT_ARCH
+
+# --- x86_64 dispatch (active when CURRENT_ARCH = X86_64) ---
+
+fn get_console_x86_64() -> X86Console:
+    """Get x86_64 console (COM1 serial via port I/O)."""
+    X86Console()
+
+fn get_boot_x86_64() -> X86Boot:
+    """Get x86_64 boot handler (Limine protocol)."""
+    X86Boot()
+
+fn get_cpu_x86_64() -> X86Cpu:
+    """Get x86_64 CPU primitives."""
+    X86Cpu()
+
+fn get_hal_x86_64() -> X86_64Hal:
+    """Get complete x86_64 HAL."""
+    create_x86_64_hal()
+
+# --- x86_32 dispatch ---
+
+fn get_console_x86_32() -> X86_32Console:
+    """Get x86_32 console (COM1 serial via port I/O)."""
+    X86_32Console()
+
+fn get_boot_x86_32() -> X86_32Boot:
+    """Get x86_32 boot handler (Multiboot 1 protocol)."""
+    X86_32Boot()
+
+fn get_cpu_x86_32() -> X86_32Cpu:
+    """Get x86_32 CPU primitives."""
+    X86_32Cpu()
+
+fn get_hal_x86_32() -> X86_32Hal:
+    """Get complete x86_32 HAL."""
+    create_x86_32_hal()
+
+# --- RISC-V 64 dispatch ---
+
+fn get_console_riscv64() -> Rv64Console:
+    """Get RISC-V 64 console (16550 UART via MMIO)."""
+    Rv64Console()
+
+fn get_boot_riscv64() -> Rv64Boot:
+    """Get RISC-V 64 boot handler (OpenSBI)."""
+    Rv64Boot()
+
+fn get_cpu_riscv64() -> Rv64Cpu:
+    """Get RISC-V 64 CPU primitives."""
+    Rv64Cpu()
+
+fn get_hal_riscv64() -> Riscv64Hal:
+    """Get complete RISC-V 64 HAL."""
+    create_riscv64_hal()
+
+# --- RISC-V 32 dispatch ---
+
+fn get_console_riscv32() -> Rv32Console:
+    """Get RISC-V 32 console (16550 UART via MMIO)."""
+    Rv32Console()
+
+fn get_boot_riscv32() -> Rv32Boot:
+    """Get RISC-V 32 boot handler (OpenSBI)."""
+    Rv32Boot()
+
+fn get_cpu_riscv32() -> Rv32Cpu:
+    """Get RISC-V 32 CPU primitives."""
+    Rv32Cpu()
+
+fn get_hal_riscv32() -> Riscv32Hal:
+    """Get complete RISC-V 32 HAL."""
+    create_riscv32_hal()
+
+# --- ARM64 dispatch ---
+
+fn get_console_arm64() -> Arm64Console:
+    """Get ARM64 console (PL011 UART via MMIO)."""
+    Arm64Console()
+
+fn get_boot_arm64() -> Arm64Boot:
+    """Get ARM64 boot handler (DTB)."""
+    Arm64Boot()
+
+fn get_cpu_arm64() -> Arm64Cpu:
+    """Get ARM64 CPU primitives."""
+    Arm64Cpu()
+
+fn get_hal_arm64() -> Arm64Hal:
+    """Get complete ARM64 HAL."""
+    create_arm64_hal()
+
+# --- ARM32 dispatch ---
+
+fn get_console_arm32() -> Arm32Console:
+    """Get ARM32 console (PL011 UART via MMIO)."""
+    Arm32Console()
+
+fn get_boot_arm32() -> Arm32Boot:
+    """Get ARM32 boot handler (DTB)."""
+    Arm32Boot()
+
+fn get_cpu_arm32() -> Arm32Cpu:
+    """Get ARM32 CPU primitives."""
+    Arm32Cpu()
+
+fn get_hal_arm32() -> Arm32Hal:
+    """Get complete ARM32 HAL."""
+    create_arm32_hal()
+
+# ============================================================================
+# Convenience Aliases (default to current architecture)
+# ============================================================================
+# These return the x86_64 implementations by default.
+# When cross-compiling, change CURRENT_ARCH above and update these
+# to point to the appropriate architecture's functions.
+
+fn get_console() -> X86Console:
+    """Get console for current architecture (default: x86_64)."""
+    get_console_x86_64()
+
+fn get_boot() -> X86Boot:
+    """Get boot handler for current architecture (default: x86_64)."""
+    get_boot_x86_64()
+
+fn get_cpu() -> X86Cpu:
+    """Get CPU primitives for current architecture (default: x86_64)."""
+    get_cpu_x86_64()
+
+fn get_hal() -> X86_64Hal:
+    """Get complete HAL for current architecture (default: x86_64)."""
+    get_hal_x86_64()

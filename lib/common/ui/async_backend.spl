@@ -1,0 +1,52 @@
+# Async Render Backend Trait
+#
+# Async version of RenderBackend. Instead of returning events from
+# poll_event(), async backends push events into a UIEventBus channel.
+# This decouples event production from consumption and enables
+# non-blocking event loops.
+#
+# Usage:
+#   impl AsyncRenderBackend for MyBackend:
+#       fn poll_event_async(bus: UIEventBus):
+#           val raw = platform_poll()
+#           if raw != nil:
+#               bus.events.send(translate(raw))
+
+use common.ui.widget.{UIState, UIEvent}
+use common.ui.async_loop.{UIEventBus}
+
+# =========================================================================
+# Async Render Backend Trait
+# =========================================================================
+
+trait AsyncRenderBackend:
+    """Platform rendering interface with async event delivery.
+
+    Backends implement this trait to participate in the async UI loop.
+    The key difference from RenderBackend is poll_event_async: instead
+    of returning a single event, it pushes zero or more events into the
+    UIEventBus channel. This allows backends to batch events and
+    decouple polling frequency from the main loop.
+    """
+
+    # --- Lifecycle ---
+    fn init() -> Result<bool, text>
+    fn shutdown()
+
+    # --- Rendering ---
+    fn render(state: UIState) -> Result<bool, text>
+    fn render_html(state: UIState) -> text
+
+    # --- Async Events ---
+    fn poll_event_async(bus: UIEventBus)
+
+    # --- Capabilities ---
+    fn supports_mouse() -> bool
+    fn supports_color() -> bool
+
+    # --- Viewport ---
+    fn viewport_width() -> i32
+    fn viewport_height() -> i32
+
+    # --- Backend Info ---
+    fn backend_name() -> text

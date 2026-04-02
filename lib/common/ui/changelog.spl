@@ -1,0 +1,75 @@
+# UI ChangeLog
+#
+# Bounded ring buffer of lifecycle events. Provides a "last N changes"
+# view for CLI observer mode and debugging.
+
+use common.ui.lifecycle.{LifecycleEvent, describe_lifecycle_event}
+
+class ChangeLog:
+    entries: [LifecycleEvent]
+    max_size: i32
+
+    static fn new(max_size: i32) -> ChangeLog:
+        """Create a changelog with given capacity."""
+        return ChangeLog(entries: [], max_size: max_size)
+
+    me push(event: LifecycleEvent):
+        """Add an event. Drops oldest if at capacity."""
+        self.entries = self.entries.push(event)
+        if self.entries.len() > self.max_size:
+            # Drop oldest entries to maintain max_size
+            var trimmed: [LifecycleEvent] = []
+            val start = self.entries.len() - self.max_size
+            var i = 0
+            for entry in self.entries:
+                if i >= start:
+                    trimmed = trimmed.push(entry)
+                i = i + 1
+            self.entries = trimmed
+
+    me push_all(events: [LifecycleEvent]):
+        """Push multiple events."""
+        for event in events:
+            self.push(event)
+
+    fn recent(count: i32) -> [LifecycleEvent]:
+        """Get the most recent N events."""
+        val total = self.entries.len()
+        if count >= total:
+            return self.entries
+        var result: [LifecycleEvent] = []
+        val start = total - count
+        var i = 0
+        for entry in self.entries:
+            if i >= start:
+                result = result.push(entry)
+            i = i + 1
+        return result
+
+    fn recent_descriptions(count: i32) -> [text]:
+        """Get human-readable descriptions of recent events."""
+        val events = self.recent(count)
+        var descs: [text] = []
+        for event in events:
+            descs = descs.push(describe_lifecycle_event(event))
+        return descs
+
+    fn size() -> i32:
+        return self.entries.len()
+
+    fn is_empty() -> bool:
+        return self.entries.len() == 0
+
+    me clear():
+        self.entries = []
+
+    fn all() -> [LifecycleEvent]:
+        return self.entries
+
+fn new_changelog(max_size: i32) -> ChangeLog:
+    """Create a new changelog with given capacity."""
+    return ChangeLog.new(max_size)
+
+fn default_changelog() -> ChangeLog:
+    """Create a changelog with default capacity (200)."""
+    return ChangeLog.new(200)

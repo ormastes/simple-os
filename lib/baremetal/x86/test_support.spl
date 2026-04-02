@@ -1,0 +1,44 @@
+# x86 Test Support Functions
+#
+# Helper functions for testing bare-metal x86 boot code.
+# This module provides test-friendly wrappers around boot implementation.
+
+use boot_impl.{MULTIBOOT_MAGIC, MULTIBOOT_FLAGS, MULTIBOOT_CHECKSUM, STACK_SIZE}
+
+
+# Multiboot header structure for testing
+struct MultibootHeader:
+    magic: u32
+    flags: u32
+    checksum: u32
+
+# Get multiboot header for testing
+fn multiboot_header() -> MultibootHeader:
+    MultibootHeader(
+        magic: MULTIBOOT_MAGIC,
+        flags: MULTIBOOT_FLAGS,
+        checksum: MULTIBOOT_CHECKSUM
+    )
+
+# Validate multiboot header
+fn validate_multiboot(header: MultibootHeader) -> bool:
+    # Check magic number
+    if header.magic != 0x1BADB002:
+        return false
+
+    # Check checksum: magic + flags + checksum should equal 0
+    val sum = header.magic as i64 + header.flags as i64 + header.checksum as i64
+    val sum_u32 = sum as u32
+
+    if sum_u32 != 0:
+        return false
+
+    true
+
+# Get simulated stack pointer (for testing)
+# In real code, this would read ESP register
+fn get_stack_pointer() -> u32:
+    # Simulate stack pointer at top of stack
+    # Stack grows downward, so SP should point to high address
+    val stack_top = 0x00110000  # Simulated stack top
+    stack_top

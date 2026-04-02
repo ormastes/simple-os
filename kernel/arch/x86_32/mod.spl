@@ -1,0 +1,40 @@
+# x86_32 HAL Implementation — Module Root
+#
+# Aggregates all x86_32-specific HAL implementations.
+# Each submodule wraps architecture-specific primitives behind
+# a HAL-compatible interface for the kernel's portable layers.
+
+use os.kernel.arch.x86_32.console.{X86_32Console}
+use os.kernel.arch.x86_32.boot.{X86_32Boot}
+use os.kernel.arch.x86_32.cpu.{X86_32Cpu}
+use os.kernel.arch.x86_32.paging.{X86_32Paging}
+use os.kernel.arch.x86_32.interrupt.{X86_32Interrupt}
+use os.kernel.arch.x86_32.timer.{X86_32Timer}
+use os.kernel.arch.x86_32.context.{X86_32ContextSwitch}
+
+struct X86_32Hal:
+    """x86_32 Hardware Abstraction Layer.
+
+    Composes all x86_32-specific HAL subsystems into a single aggregate.
+    The kernel portable layer dispatches through this struct to access
+    architecture-specific functionality.
+    """
+    console: X86_32Console
+    boot: X86_32Boot
+    cpu: X86_32Cpu
+    paging: X86_32Paging
+    interrupt: X86_32Interrupt
+    timer: X86_32Timer
+    context: X86_32ContextSwitch
+
+fn create_x86_32_hal() -> X86_32Hal:
+    """Create x86_32 HAL with default configuration."""
+    X86_32Hal(
+        console: X86_32Console(),
+        boot: X86_32Boot(),
+        cpu: X86_32Cpu(),
+        paging: X86_32Paging(),
+        interrupt: X86_32Interrupt(),
+        timer: X86_32Timer(),
+        context: X86_32ContextSwitch()
+    )

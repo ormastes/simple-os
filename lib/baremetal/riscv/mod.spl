@@ -1,0 +1,20 @@
+# @platform: baremetal(riscv)
+# @requires: riscv64-unknown-elf-gcc, qemu-system-riscv64
+#
+# RISC-V Bare-Metal Module
+#
+# Hardware abstraction for RISC-V bare-metal programming (RV32/RV64).
+# Supports QEMU virt machine and SiFive hardware.
+#
+# Components:
+# - plic: Platform-Level Interrupt Controller
+# - startup: Machine mode entry and trap handling
+# - semihost: Semihosting support
+# - test_support: Testing utilities
+
+
+# Modules
+mod plic
+mod startup
+mod semihost
+mod test_support

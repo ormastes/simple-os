@@ -1,0 +1,123 @@
+# Async Reactive System
+#
+# Extends ReactiveStore with channel-based change notifications.
+# Observers subscribe via a Channel and receive change records
+# whenever a reactive value is updated.
+#
+# Usage:
+#   val store = new_async_store()
+#   val changes = async_observe(store)
+#   async_set(store, "counter", "1")
+#   val notification = changes.try_recv()  # ReactiveChange
+
+use common.ui.reactive.{ReactiveStore, ReactiveValue}
+use nogc_async_mut.concurrent.channel.{Channel, channel_new}
+
+# =========================================================================
+# Change notification record
+# =========================================================================
+
+struct ReactiveChange:
+    """Describes a single reactive value change."""
+    name: text
+    old_value: text
+    new_value: text
+
+# =========================================================================
+# AsyncReactiveStore
+# =========================================================================
+
+struct AsyncReactiveStore:
+    """ReactiveStore wrapper that emits change notifications on a Channel.
+
+    The change_channel carries ReactiveChange records. Multiple
+    observers can call async_observe() to get independent channels.
+    """
+    store: ReactiveStore
+    change_channel: Channel
+    observer_channels: [Channel]
+
+fn new_async_store() -> AsyncReactiveStore:
+    """Create a new async reactive store."""
+    return AsyncReactiveStore(
+        store: ReactiveStore.new(),
+        change_channel: channel_new(),
+        observer_channels: []
+    )
+
+# =========================================================================
+# Define / Get (delegates to inner store)
+# =========================================================================
+
+fn async_define(astore: AsyncReactiveStore, name: text, initial: text):
+    """Define a new reactive value in the store."""
+    astore.store.define(name, initial)
+
+fn async_get(astore: AsyncReactiveStore, name: text) -> text:
+    """Read a reactive value without triggering notifications."""
+    return astore.store.get(name)
+
+# =========================================================================
+# Set with channel notification
+# =========================================================================
+
+fn async_set(astore: AsyncReactiveStore, name: text, value: text) -> bool:
+    """Set a reactive value and emit change notification on all channels.
+
+    Args:
+        astore: The async store
+        name:   Reactive value name
+        value:  New value
+
+    Returns:
+        true if the value actually changed, false if unchanged
+    """
+    val old_value = astore.store.get(name)
+    val changed = astore.store.set(name, value)
+    if changed:
+        val change = ReactiveChange(
+            name: name,
+            old_value: old_value,
+            new_value: value
+        )
+        # Notify the primary change channel
+        astore.change_channel.send(change)
+        # Notify all observer channels
+        for ch in astore.observer_channels:
+            ch.send(change)
+    return changed
+
+# =========================================================================
+# Observe — subscribe to changes
+# =========================================================================
+
+fn async_observe(astore: AsyncReactiveStore) -> Channel:
+    """Create a new observer channel that receives ReactiveChange records.
+
+    Each call returns an independent channel. The caller owns the
+    channel and should close it when done observing.
+
+    Returns:
+        Channel that will receive ReactiveChange on every set()
+    """
+    val ch = channel_new()
+    astore.observer_channels = astore.observer_channels.push(ch)
+    return ch
+
+# =========================================================================
+# Cleanup
+# =========================================================================
+
+fn async_store_close(astore: AsyncReactiveStore):
+    """Close all channels in the store."""
+    astore.change_channel.close()
+    for ch in astore.observer_channels:
+        ch.close()
+
+fn async_is_dirty(astore: AsyncReactiveStore) -> bool:
+    """Check if any values have changed since last clear."""
+    return astore.store.is_dirty()
+
+fn async_clear_dirty(astore: AsyncReactiveStore):
+    """Clear the dirty flag."""
+    astore.store.clear_dirty()

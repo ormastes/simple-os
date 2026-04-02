@@ -1,0 +1,61 @@
+# UI Backend Factory
+#
+# Factory function to create render backends by name.
+# Returns Result<NoneBackend, text> for safe error handling.
+
+use common.ui.widget.{UITree, UIState, UIEvent}
+
+# =========================================================================
+# NoneBackend — minimal no-op backend for headless/test use
+# =========================================================================
+
+class NoneBackend:
+    _name: text
+
+impl NoneBackend:
+    static fn create(name: text) -> NoneBackend:
+        NoneBackend(_name: name)
+
+    fn init() -> Result<bool, text>:
+        Ok(true)
+
+    fn shutdown():
+        pass_dn
+
+    fn render(state: UIState) -> Result<bool, text>:
+        Ok(true)
+
+    fn render_html(state: UIState) -> text:
+        ""
+
+    fn poll_event(timeout_ms: i32) -> UIEvent?:
+        nil
+
+    fn supports_mouse() -> bool: false
+    fn supports_color() -> bool: false
+    fn supports_images() -> bool: false
+    fn supports_touch() -> bool: false
+
+    fn viewport_width() -> i32: 80
+    fn viewport_height() -> i32: 24
+
+    fn backend_name() -> text:
+        self._name
+
+# =========================================================================
+# Factory
+# =========================================================================
+
+fn create_backend(mode: text, port: i64) -> Result<NoneBackend, text>:
+    """Create a render backend by mode name.
+
+    Supported modes: "none", "headless"
+    Returns Err for unknown modes.
+    """
+    if mode == "none" or mode == "headless":
+        return Ok(NoneBackend.create("none"))
+    Err("Unknown backend mode: {mode}")
+
+fn create_sync_backend(mode: text, port: i64) -> Result<NoneBackend, text>:
+    """Create a synchronous render backend (alias for create_backend)."""
+    create_backend(mode, port)

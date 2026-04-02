@@ -1,0 +1,740 @@
+# Paint App — Simple Bitmap Paint (Windows Paint-style)
+#
+# Character-based paint application with drawing tools, color palette,
+# undo support, and file save/load. Canvas is a 2D grid of characters
+# with per-pixel color tracking. Renders as text widgets using ANSI
+# color codes for the canvas display.
+#
+# MDSOC: feature dimension, apps layer
+
+use common.ui.builder.{
+    column, row, panel, button, text_widget, label,
+    statusbar, menubar, build_tree_with_title,
+    with_flex, with_width
+}
+use common.ui.widget.{WidgetNode, UITree, UIEvent}
+use common.ui.session.{UISession}
+use os.services.vfs.vfs.{VfsManager}
+
+# =========================================================================
+# Tool Enum
+# =========================================================================
+
+enum Tool:
+    """Drawing tool selection."""
+    Pencil
+    Line
+    Rectangle
+    Circle
+    Fill
+    Eraser
+    Text
+    Select
+
+fn tool_name(tool: Tool) -> text:
+    """Human-readable tool name."""
+    match tool:
+        Tool.Pencil => "Pencil"
+        Tool.Line => "Line"
+        Tool.Rectangle => "Rect"
+        Tool.Circle => "Circle"
+        Tool.Fill => "Fill"
+        Tool.Eraser => "Eraser"
+        Tool.Text => "Text"
+        Tool.Select => "Select"
+
+# =========================================================================
+# Paint Color Enum
+# =========================================================================
+
+enum PaintColor:
+    """Predefined color palette entries."""
+    Black
+    White
+    Red
+    Green
+    Blue
+    Yellow
+    Cyan
+    Magenta
+    Gray
+    Orange
+    Brown
+    Pink
+    DarkGreen
+    Navy
+    Purple
+    Custom
+
+fn color_to_ansi_fg(color: text) -> text:
+    """Map a color name to an ANSI foreground escape sequence."""
+    val esc = "\u{001b}"
+    match color:
+        "Black"     => "{esc}[30m"
+        "White"     => "{esc}[97m"
+        "Red"       => "{esc}[31m"
+        "Green"     => "{esc}[32m"
+        "Blue"      => "{esc}[34m"
+        "Yellow"    => "{esc}[33m"
+        "Cyan"      => "{esc}[36m"
+        "Magenta"   => "{esc}[35m"
+        "Gray"      => "{esc}[90m"
+        "Orange"    => "{esc}[38;5;208m"
+        "Brown"     => "{esc}[38;5;94m"
+        "Pink"      => "{esc}[38;5;213m"
+        "DarkGreen" => "{esc}[38;5;22m"
+        "Navy"      => "{esc}[38;5;17m"
+        "Purple"    => "{esc}[38;5;129m"
+        _           => "{esc}[37m"
+
+# =========================================================================
+# Point Struct
+# =========================================================================
+
+struct Point:
+    x: i32
+    y: i32
+
+# =========================================================================
+# Pixel Struct
+# =========================================================================
+
+struct Pixel:
+    x: i32
+    y: i32
+    color: text
+    ch: text
+
+# =========================================================================
+# Paint App
+# =========================================================================
+
+class PaintApp:
+    """Character-based paint application with tools and color palette.
+
+    Canvas is a 2D grid of single characters with associated color names.
+    Supports pencil, line, rectangle, circle, fill, and eraser tools
+    with undo history and VFS-based file I/O.
+    """
+    canvas: [[text]]
+    canvas_colors: [[text]]
+    width: i32
+    height: i32
+    cursor_x: i32
+    cursor_y: i32
+    current_tool: Tool
+    current_color: text
+    brush_size: i32
+    modified: bool
+    file_path: text?
+    status_message: text
+    undo_stack: [[[text]]]
+    drawing: bool
+    start_point: Point?
+    vfs: VfsManager?
+
+impl PaintApp:
+
+    static fn new() -> PaintApp:
+        """Create a new paint app with a 40x20 blank canvas."""
+        val w = 40
+        val h = 20
+        var canvas = _make_blank_canvas(w, h, " ")
+        var colors = _make_blank_canvas(w, h, "Black")
+        return PaintApp(
+            canvas: canvas,
+            canvas_colors: colors,
+            width: w, height: h,
+            cursor_x: 0, cursor_y: 0,
+            current_tool: Tool.Pencil,
+            current_color: "Black",
+            brush_size: 1,
+            modified: false,
+            file_path: nil,
+            status_message: "Ready",
+            undo_stack: [],
+            drawing: false,
+            start_point: nil,
+            vfs: nil
+        )
+
+    static fn with_vfs(vfs: VfsManager) -> PaintApp:
+        """Create a paint app connected to a VFS."""
+        var app = PaintApp.new()
+        app.vfs = vfs
+        return app
+
+    # -- Canvas Operations ---------------------------------------------------
+
+    me clear_canvas():
+        """Clear the entire canvas to spaces."""
+        self.push_undo()
+        self.canvas = _make_blank_canvas(self.width, self.height, " ")
+        self.canvas_colors = _make_blank_canvas(self.width, self.height, "Black")
+        self.modified = true
+        self.status_message = "Canvas cleared"
+
+    me resize_canvas(w: i32, h: i32):
+        """Resize canvas, preserving existing content where possible."""
+        self.push_undo()
+        var new_canvas = _make_blank_canvas(w, h, " ")
+        var new_colors = _make_blank_canvas(w, h, "Black")
+        var y = 0
+        while y < h and y < self.height:
+            var x = 0
+            while x < w and x < self.width:
+                new_canvas[y][x] = self.canvas[y][x]
+                new_colors[y][x] = self.canvas_colors[y][x]
+                x = x + 1
+            y = y + 1
+        self.canvas = new_canvas
+        self.canvas_colors = new_colors
+        self.width = w
+        self.height = h
+        if self.cursor_x >= w:
+            self.cursor_x = w - 1
+        if self.cursor_y >= h:
+            self.cursor_y = h - 1
+        self.modified = true
+        self.status_message = "Resized to {w}x{h}"
+
+    # -- Drawing Operations --------------------------------------------------
+
+    me draw_pixel(x: i32, y: i32):
+        """Draw a single pixel (or brush-sized area) at the given position."""
+        if self.brush_size <= 1:
+            self._set_pixel(x, y, "*", self.current_color)
+        else:
+            val half = self.brush_size / 2
+            var dy = 0 - half
+            while dy <= half:
+                var dx = 0 - half
+                while dx <= half:
+                    self._set_pixel(x + dx, y + dy, "*", self.current_color)
+                    dx = dx + 1
+                dy = dy + 1
+
+    me draw_line(x1: i32, y1: i32, x2: i32, y2: i32):
+        """Draw a line between two points using Bresenham's algorithm."""
+        var dx = _abs(x2 - x1)
+        var dy = _abs(y2 - y1)
+        var sx = if x1 < x2: 1 else: -1
+        var sy = if y1 < y2: 1 else: -1
+        var err = dx - dy
+        var cx = x1
+        var cy = y1
+        while true:
+            self.draw_pixel(cx, cy)
+            if cx == x2 and cy == y2:
+                return
+            val e2 = err * 2
+            if e2 > 0 - dy:
+                err = err - dy
+                cx = cx + sx
+            if e2 < dx:
+                err = err + dx
+                cy = cy + sy
+
+    me draw_rect(x1: i32, y1: i32, x2: i32, y2: i32):
+        """Draw a rectangle outline between two corners."""
+        val left = _min(x1, x2)
+        val right = _max(x1, x2)
+        val top = _min(y1, y2)
+        val bottom = _max(y1, y2)
+        # Top and bottom edges
+        var x = left
+        while x <= right:
+            self.draw_pixel(x, top)
+            self.draw_pixel(x, bottom)
+            x = x + 1
+        # Left and right edges
+        var y = top
+        while y <= bottom:
+            self.draw_pixel(left, y)
+            self.draw_pixel(right, y)
+            y = y + 1
+
+    me draw_circle(cx: i32, cy: i32, r: i32):
+        """Draw a circle outline using the midpoint algorithm."""
+        var x = r
+        var y = 0
+        var d = 1 - r
+        while x >= y:
+            self.draw_pixel(cx + x, cy + y)
+            self.draw_pixel(cx - x, cy + y)
+            self.draw_pixel(cx + x, cy - y)
+            self.draw_pixel(cx - x, cy - y)
+            self.draw_pixel(cx + y, cy + x)
+            self.draw_pixel(cx - y, cy + x)
+            self.draw_pixel(cx + y, cy - x)
+            self.draw_pixel(cx - y, cy - x)
+            y = y + 1
+            if d <= 0:
+                d = d + 2 * y + 1
+            else:
+                x = x - 1
+                d = d + 2 * y - 2 * x + 1
+
+    me fill_area(x: i32, y: i32, target_ch: text):
+        """Flood-fill from (x, y) replacing target_ch with current draw char."""
+        if x < 0 or x >= self.width or y < 0 or y >= self.height:
+            return
+        if self.canvas[y][x] != target_ch:
+            return
+        if self.canvas[y][x] == "*" and target_ch == "*":
+            return
+        self._set_pixel(x, y, "*", self.current_color)
+        self.fill_area(x + 1, y, target_ch)
+        self.fill_area(x - 1, y, target_ch)
+        self.fill_area(x, y + 1, target_ch)
+        self.fill_area(x, y - 1, target_ch)
+
+    # -- Eraser --------------------------------------------------------------
+
+    me erase_pixel(x: i32, y: i32):
+        """Erase a pixel (or brush-sized area), resetting to space."""
+        if self.brush_size <= 1:
+            self._set_pixel(x, y, " ", "Black")
+        else:
+            val half = self.brush_size / 2
+            var dy = 0 - half
+            while dy <= half:
+                var dx = 0 - half
+                while dx <= half:
+                    self._set_pixel(x + dx, y + dy, " ", "Black")
+                    dx = dx + 1
+                dy = dy + 1
+
+    me _set_pixel(x: i32, y: i32, ch: text, color: text):
+        """Set a single canvas cell if within bounds."""
+        if x >= 0 and x < self.width and y >= 0 and y < self.height:
+            self.canvas[y][x] = ch
+            self.canvas_colors[y][x] = color
+            self.modified = true
+
+    # -- Tool / Color / Brush ------------------------------------------------
+
+    me set_tool(tool: Tool):
+        """Select the active drawing tool."""
+        self.current_tool = tool
+        self.drawing = false
+        self.start_point = nil
+        self.status_message = "Tool: {tool_name(tool)}"
+
+    me set_color(color: text):
+        """Set the current drawing color."""
+        self.current_color = color
+        self.status_message = "Color: {color}"
+
+    me set_brush_size(size: i32):
+        """Set the brush size (1-3)."""
+        self.brush_size = size
+        self.status_message = "Brush size: {size}"
+
+    # -- Undo ----------------------------------------------------------------
+
+    me push_undo():
+        """Save current canvas state to the undo stack."""
+        var snapshot: [[text]] = []
+        var y = 0
+        while y < self.height:
+            var row_copy: [text] = []
+            var x = 0
+            while x < self.width:
+                row_copy = row_copy.push(self.canvas[y][x])
+                x = x + 1
+            snapshot = snapshot.push(row_copy)
+            y = y + 1
+        self.undo_stack = self.undo_stack.push(snapshot)
+        # Limit stack depth
+        if self.undo_stack.len() > 50:
+            var trimmed: [[[text]]] = []
+            var idx = 1
+            while idx < self.undo_stack.len():
+                trimmed = trimmed.push(self.undo_stack[idx])
+                idx = idx + 1
+            self.undo_stack = trimmed
+
+    me undo():
+        """Restore the most recent undo snapshot."""
+        if self.undo_stack.len() == 0:
+            self.status_message = "Nothing to undo"
+            return
+        val last_idx = self.undo_stack.len() - 1
+        self.canvas = self.undo_stack[last_idx]
+        var new_stack: [[[text]]] = []
+        var idx = 0
+        while idx < last_idx:
+            new_stack = new_stack.push(self.undo_stack[idx])
+            idx = idx + 1
+        self.undo_stack = new_stack
+        self.modified = true
+        self.status_message = "Undo"
+
+    # -- Cursor / Drawing Interaction ----------------------------------------
+
+    me handle_cursor_move(x: i32, y: i32):
+        """Move cursor, clamping to canvas bounds."""
+        self.cursor_x = _clamp(x, 0, self.width - 1)
+        self.cursor_y = _clamp(y, 0, self.height - 1)
+
+    me handle_draw_start():
+        """Begin a drawing stroke or shape at the current cursor."""
+        self.push_undo()
+        self.drawing = true
+        self.start_point = Point(x: self.cursor_x, y: self.cursor_y)
+        match self.current_tool:
+            Tool.Pencil:
+                self.draw_pixel(self.cursor_x, self.cursor_y)
+            Tool.Eraser:
+                self.erase_pixel(self.cursor_x, self.cursor_y)
+            Tool.Fill:
+                val target = self.canvas[self.cursor_y][self.cursor_x]
+                self.fill_area(self.cursor_x, self.cursor_y, target)
+                self.drawing = false
+            _ => pass_dn
+
+    me handle_draw_end():
+        """Finish a drawing stroke or commit a shape."""
+        if not self.drawing:
+            return
+        self.drawing = false
+        if self.start_point == nil:
+            return
+        val sp = self.start_point
+        match self.current_tool:
+            Tool.Line:
+                self.draw_line(sp.x, sp.y, self.cursor_x, self.cursor_y)
+            Tool.Rectangle:
+                self.draw_rect(sp.x, sp.y, self.cursor_x, self.cursor_y)
+            Tool.Circle:
+                val dx = self.cursor_x - sp.x
+                val dy = self.cursor_y - sp.y
+                val r = _isqrt(dx * dx + dy * dy)
+                self.draw_circle(sp.x, sp.y, r)
+            _ => pass_dn
+        self.start_point = nil
+
+    # -- File Operations -----------------------------------------------------
+
+    me new_file():
+        """Reset to a blank canvas."""
+        self.push_undo()
+        self.canvas = _make_blank_canvas(self.width, self.height, " ")
+        self.canvas_colors = _make_blank_canvas(self.width, self.height, "Black")
+        self.file_path = nil
+        self.modified = false
+        self.status_message = "New file"
+
+    me save_file() -> Result<bool, text>:
+        """Save the canvas as rows of characters to the VFS."""
+        if self.vfs == nil:
+            return Result.Err("no filesystem available")
+        if self.file_path == nil:
+            return Result.Err("no file name -- use Save As")
+        var lines: [text] = []
+        var y = 0
+        while y < self.height:
+            var line = ""
+            var x = 0
+            while x < self.width:
+                line = "{line}{self.canvas[y][x]}"
+                x = x + 1
+            lines = lines.push(line)
+            y = y + 1
+        val content = lines.join("\n")
+        val result = self.vfs.write(self.file_path, content)
+        if result.is_err():
+            return Result.Err("cannot save: {result.unwrap_err()}")
+        self.modified = false
+        self.status_message = "Saved {self.file_path}"
+        return Result.Ok(true)
+
+    me open_file(path: text) -> Result<bool, text>:
+        """Open a canvas file (rows of characters, one line per row)."""
+        if self.vfs == nil:
+            return Result.Err("no filesystem available")
+        val result = self.vfs.read(path)
+        if result.is_err():
+            return Result.Err("cannot open: {result.unwrap_err()}")
+        self.push_undo()
+        val lines = _split_lines(result.unwrap())
+        val h = lines.len()
+        if h == 0:
+            return Result.Err("empty file")
+        val w = lines[0].len()
+        if w == 0:
+            return Result.Err("empty first line")
+        self.width = w
+        self.height = h
+        self.canvas = _make_blank_canvas(w, h, " ")
+        self.canvas_colors = _make_blank_canvas(w, h, "Black")
+        var y = 0
+        while y < h:
+            var x = 0
+            while x < lines[y].len() and x < w:
+                val ch = lines[y].slice(x, x + 1)
+                self.canvas[y][x] = ch
+                if ch != " ":
+                    self.canvas_colors[y][x] = "Black"
+                x = x + 1
+            y = y + 1
+        self.file_path = path
+        self.cursor_x = 0
+        self.cursor_y = 0
+        self.modified = false
+        self.status_message = "Opened {path}"
+        return Result.Ok(true)
+
+    # -- Key Handling --------------------------------------------------------
+
+    me handle_key(key: text):
+        """Handle keyboard input for navigation, drawing, and shortcuts."""
+        match key:
+            # Arrow keys move cursor
+            "up":
+                self.handle_cursor_move(self.cursor_x, self.cursor_y - 1)
+            "down":
+                self.handle_cursor_move(self.cursor_x, self.cursor_y + 1)
+            "left":
+                self.handle_cursor_move(self.cursor_x - 1, self.cursor_y)
+            "right":
+                self.handle_cursor_move(self.cursor_x + 1, self.cursor_y)
+            # Space = draw at cursor
+            " ":
+                self.handle_draw_start()
+                self.handle_draw_end()
+            # Ctrl shortcuts
+            "ctrl_z": self.undo()
+            "ctrl_s":
+                val result = self.save_file()
+                if result.is_err():
+                    self.status_message = result.unwrap_err()
+            "ctrl_n": self.new_file()
+            # Tool selection 1-8
+            "1": self.set_tool(Tool.Pencil)
+            "2": self.set_tool(Tool.Line)
+            "3": self.set_tool(Tool.Rectangle)
+            "4": self.set_tool(Tool.Circle)
+            "5": self.set_tool(Tool.Fill)
+            "6": self.set_tool(Tool.Eraser)
+            "7": self.set_tool(Tool.Text)
+            "8": self.set_tool(Tool.Select)
+            # Color cycling
+            "c": self._cycle_color()
+            _ => pass_dn
+
+    me _cycle_color():
+        """Cycle through the predefined color palette."""
+        val colors = ["Black", "Red", "Green", "Blue", "Yellow", "Cyan",
+                      "Magenta", "White", "Gray", "Orange", "Brown", "Pink",
+                      "DarkGreen", "Navy", "Purple"]
+        var idx = 0
+        for c in colors:
+            if c == self.current_color:
+                val next_idx = (idx + 1) % colors.len()
+                self.current_color = colors[next_idx]
+                self.status_message = "Color: {self.current_color}"
+                return
+            idx = idx + 1
+        # Fallback to first
+        self.current_color = "Black"
+        self.status_message = "Color: Black"
+
+    # -- Action Dispatch -----------------------------------------------------
+
+    me handle_action(action: text):
+        """Dispatch button / menu action strings."""
+        match action:
+            # File
+            "New": self.new_file()
+            "Open": self.status_message = "Open: provide file path"
+            "Save":
+                val result = self.save_file()
+                if result.is_err():
+                    self.status_message = result.unwrap_err()
+            "Exit": self.status_message = "exit"
+            # Edit
+            "Undo": self.undo()
+            "Clear": self.clear_canvas()
+            # Tools
+            "Pencil":   self.set_tool(Tool.Pencil)
+            "Line":     self.set_tool(Tool.Line)
+            "Rect":     self.set_tool(Tool.Rectangle)
+            "Circle":   self.set_tool(Tool.Circle)
+            "Fill":     self.set_tool(Tool.Fill)
+            "Eraser":   self.set_tool(Tool.Eraser)
+            # Colors
+            "col_Black":     self.set_color("Black")
+            "col_White":     self.set_color("White")
+            "col_Red":       self.set_color("Red")
+            "col_Green":     self.set_color("Green")
+            "col_Blue":      self.set_color("Blue")
+            "col_Yellow":    self.set_color("Yellow")
+            "col_Cyan":      self.set_color("Cyan")
+            "col_Magenta":   self.set_color("Magenta")
+            "col_Gray":      self.set_color("Gray")
+            "col_Orange":    self.set_color("Orange")
+            "col_Brown":     self.set_color("Brown")
+            "col_Pink":      self.set_color("Pink")
+            "col_DarkGreen": self.set_color("DarkGreen")
+            "col_Navy":      self.set_color("Navy")
+            "col_Purple":    self.set_color("Purple")
+            # Brush size
+            "brush_1": self.set_brush_size(1)
+            "brush_2": self.set_brush_size(2)
+            "brush_3": self.set_brush_size(3)
+            _ => self.status_message = "Unknown action: {action}"
+
+    # -- UI Construction -----------------------------------------------------
+
+    fn build_ui() -> UISession:
+        """Build the paint app UI.
+
+        Layout:
+          Menubar: File | Edit | Tools
+          Toolbar row: tool buttons + color palette + brush size
+          Canvas panel: rendered as text widgets with ANSI colors
+          Statusbar: tool + brush + color | coords + size + modified
+        """
+        # -- Canvas rendering --
+        var canvas_lines: [WidgetNode] = []
+        val esc = "\u{001b}"
+        var y = 0
+        while y < self.height:
+            var line = ""
+            var x = 0
+            while x < self.width:
+                val ch = self.canvas[y][x]
+                val color = self.canvas_colors[y][x]
+                if x == self.cursor_x and y == self.cursor_y:
+                    # Reverse video for cursor
+                    val display_ch = if ch == " ": "+" else: ch
+                    line = "{line}{esc}[7m{display_ch}{esc}[0m"
+                elif ch != " ":
+                    val fg = color_to_ansi_fg(color)
+                    line = "{line}{fg}{ch}{esc}[0m"
+                else:
+                    line = "{line} "
+                x = x + 1
+            canvas_lines = canvas_lines.push(text_widget("paint_row_{y}", line))
+            y = y + 1
+
+        # -- Toolbar: tool buttons --
+        val tool_row = row("paint_tools", [
+            with_flex(button("btn_pencil", "Pencil", "Pencil"), 1),
+            with_flex(button("btn_line", "Line", "Line"), 1),
+            with_flex(button("btn_rect", "Rect", "Rect"), 1),
+            with_flex(button("btn_circle", "Circle", "Circle"), 1),
+            with_flex(button("btn_fill", "Fill", "Fill"), 1),
+            with_flex(button("btn_eraser", "Eraser", "Eraser"), 1)
+        ])
+
+        # -- Color palette row --
+        val palette_row = row("paint_palette", [
+            with_flex(button("btn_c_bk", "Bk", "col_Black"), 1),
+            with_flex(button("btn_c_wh", "Wh", "col_White"), 1),
+            with_flex(button("btn_c_rd", "Rd", "col_Red"), 1),
+            with_flex(button("btn_c_gn", "Gn", "col_Green"), 1),
+            with_flex(button("btn_c_bl", "Bl", "col_Blue"), 1),
+            with_flex(button("btn_c_yl", "Yl", "col_Yellow"), 1),
+            with_flex(button("btn_c_cy", "Cy", "col_Cyan"), 1),
+            with_flex(button("btn_c_mg", "Mg", "col_Magenta"), 1),
+            with_flex(button("btn_c_gy", "Gy", "col_Gray"), 1),
+            with_flex(button("btn_c_or", "Or", "col_Orange"), 1),
+            with_flex(button("btn_c_br", "Br", "col_Brown"), 1),
+            with_flex(button("btn_c_pk", "Pk", "col_Pink"), 1)
+        ])
+
+        # -- Brush size row --
+        val brush_row = row("paint_brush", [
+            label("paint_brush_label", "Brush:"),
+            with_flex(button("btn_b1", "1", "brush_1"), 1),
+            with_flex(button("btn_b2", "2", "brush_2"), 1),
+            with_flex(button("btn_b3", "3", "brush_3"), 1)
+        ])
+
+        val file_display = if self.file_path != nil: self.file_path else: "Untitled"
+        val mod_indicator = if self.modified: " *" else: ""
+
+        val root = column("paint_root", [
+            menubar("paint_menu", [
+                "File: New | Open | Save | Exit",
+                "Edit: Undo | Clear",
+                "Tools: Pencil | Line | Rect | Circle | Fill | Eraser"
+            ]),
+            tool_row,
+            row("paint_options", [
+                with_flex(palette_row, 3),
+                with_flex(brush_row, 1)
+            ]),
+            with_flex(panel("paint_canvas", "", canvas_lines), 1),
+            statusbar("paint_status",
+                "{tool_name(self.current_tool)} | Size: {self.brush_size} | Color: {self.current_color}",
+                "({self.cursor_x},{self.cursor_y}) {self.width}x{self.height}{mod_indicator}"
+            ),
+            text_widget("paint_msg", self.status_message)
+        ])
+
+        val tree = build_tree_with_title(root, "Paint - {file_display}", "dark")
+        return UISession.new(tree)
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn _make_blank_canvas(w: i32, h: i32, fill: text) -> [[text]]:
+    """Create a 2D grid filled with the given character."""
+    var canvas: [[text]] = []
+    var y = 0
+    while y < h:
+        var row_data: [text] = []
+        var x = 0
+        while x < w:
+            row_data = row_data.push(fill)
+            x = x + 1
+        canvas = canvas.push(row_data)
+        y = y + 1
+    return canvas
+
+fn _split_lines(content: text) -> [text]:
+    """Split content into lines on newline characters."""
+    var lines: [text] = []
+    var current = ""
+    for ch in content:
+        if ch == "\n":
+            lines = lines.push(current)
+            current = ""
+        else:
+            current = "{current}{ch}"
+    lines = lines.push(current)
+    return lines
+
+fn _abs(n: i32) -> i32:
+    """Absolute value."""
+    if n < 0:
+        return 0 - n
+    return n
+
+fn _min(a: i32, b: i32) -> i32:
+    if a < b: a else: b
+
+fn _max(a: i32, b: i32) -> i32:
+    if a > b: a else: b
+
+fn _clamp(v: i32, lo: i32, hi: i32) -> i32:
+    """Clamp v to [lo, hi]."""
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+fn _isqrt(n: i32) -> i32:
+    """Integer square root (floor)."""
+    if n <= 0:
+        return 0
+    var r = 1
+    while r * r <= n:
+        r = r + 1
+    return r - 1

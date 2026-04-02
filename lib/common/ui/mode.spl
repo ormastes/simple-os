@@ -1,0 +1,58 @@
+# UI Mode Manager
+#
+# Manages vim-like mode switching (Normal, Command, Insert, Menu)
+# and maps keybindings to UIEvents.
+
+use common.ui.widget.{UIMode, UIEvent, UIState, UITree}
+
+# =========================================================================
+# Mode Transitions
+# =========================================================================
+
+fn switch_mode(state: UIState, new_mode: UIMode) -> UIState:
+    """Switch to a new UI mode."""
+    return UIState(
+        tree: state.tree,
+        mode: new_mode,
+        focused_id: state.focused_id,
+        command_buffer: if new_mode == UIMode.Command: "" else: state.command_buffer
+    )
+
+# =========================================================================
+# Keybinding Resolution
+# =========================================================================
+
+fn resolve_keybinding(state: UIState, key: text) -> UIEvent?:
+    """Look up a key in the current mode's keybindings."""
+    val mode_name = match state.mode:
+        UIMode.Normal: "normal"
+        UIMode.Command: "command"
+        UIMode.Insert: "insert"
+        UIMode.Menu: "menu"
+
+    val all_bindings = state.tree.bindings()
+    if all_bindings.contains_key(mode_name):
+        val bindings = all_bindings[mode_name]
+        if bindings.contains_key(key):
+            val action = bindings[key]
+            return action_to_event(action)
+
+    return nil
+
+fn action_to_event(action: text) -> UIEvent:
+    """Convert an action name to a UIEvent."""
+    match action:
+        "quit":
+            return UIEvent.Quit
+        "focus_next":
+            return UIEvent.FocusNext
+        "focus_prev":
+            return UIEvent.FocusPrev
+        "command_mode":
+            return UIEvent.CommandMode
+        "normal_mode":
+            return UIEvent.NormalMode
+        "insert_mode":
+            return UIEvent.InsertMode
+        _:
+            return UIEvent.Action(name: action)

@@ -1,0 +1,491 @@
+# Calendar App — Monthly Calendar with Events
+#
+# Provides a monthly calendar view with day selection, event
+# management, and keyboard navigation. Follows the Windows
+# Calendar layout and behavior.
+#
+# MDSOC: feature dimension, apps layer
+
+use common.ui.builder.{
+    column, row, panel, button, text_widget, label,
+    statusbar, menubar, build_tree_with_title,
+    with_flex, with_width
+}
+use common.ui.widget.{WidgetNode, UITree, UIEvent}
+use common.ui.session.{UISession}
+
+# =========================================================================
+# Calendar Event
+# =========================================================================
+
+struct CalendarEvent:
+    """A single calendar event entry."""
+    day: i32
+    month: i32
+    year: i32
+    title: text
+    description: text
+    hour: i32
+    minute: i32
+
+# =========================================================================
+# Calendar App
+# =========================================================================
+
+class CalendarApp:
+    """Monthly calendar application with event management.
+
+    Displays a navigable month grid with day selection, event
+    creation and deletion, and keyboard-driven navigation.
+    """
+    current_year: i32
+    current_month: i32
+    selected_day: i32
+    today_year: i32
+    today_month: i32
+    today_day: i32
+    events: [CalendarEvent]
+    view_mode: text
+    status_message: text
+
+impl CalendarApp:
+
+    static fn new() -> CalendarApp:
+        """Create a calendar app in its initial state."""
+        CalendarApp(
+            current_year: 2026,
+            current_month: 3,
+            selected_day: 31,
+            today_year: 2026,
+            today_month: 3,
+            today_day: 31,
+            events: [],
+            view_mode: "month",
+            status_message: "Ready"
+        )
+
+    # -- Navigation ----------------------------------------------------------
+
+    me prev_month():
+        """Navigate to the previous month."""
+        self.current_month = self.current_month - 1
+        if self.current_month < 1:
+            self.current_month = 12
+            self.current_year = self.current_year - 1
+        val max_day = self._days_in_month(self.current_month, self.current_year)
+        if self.selected_day > max_day:
+            self.selected_day = max_day
+        self.status_message = "Navigated to {self._month_name(self.current_month)} {self.current_year}"
+
+    me next_month():
+        """Navigate to the next month."""
+        self.current_month = self.current_month + 1
+        if self.current_month > 12:
+            self.current_month = 1
+            self.current_year = self.current_year + 1
+        val max_day = self._days_in_month(self.current_month, self.current_year)
+        if self.selected_day > max_day:
+            self.selected_day = max_day
+        self.status_message = "Navigated to {self._month_name(self.current_month)} {self.current_year}"
+
+    me prev_year():
+        """Navigate to the previous year."""
+        self.current_year = self.current_year - 1
+        val max_day = self._days_in_month(self.current_month, self.current_year)
+        if self.selected_day > max_day:
+            self.selected_day = max_day
+        self.status_message = "Navigated to {self._month_name(self.current_month)} {self.current_year}"
+
+    me next_year():
+        """Navigate to the next year."""
+        self.current_year = self.current_year + 1
+        val max_day = self._days_in_month(self.current_month, self.current_year)
+        if self.selected_day > max_day:
+            self.selected_day = max_day
+        self.status_message = "Navigated to {self._month_name(self.current_month)} {self.current_year}"
+
+    me go_today():
+        """Jump to today's date."""
+        self.current_year = self.today_year
+        self.current_month = self.today_month
+        self.selected_day = self.today_day
+        self.status_message = "Jumped to today"
+
+    # -- Selection -----------------------------------------------------------
+
+    me select_day(day: i32):
+        """Select a specific day in the current month."""
+        val max_day = self._days_in_month(self.current_month, self.current_year)
+        if day >= 1 and day <= max_day:
+            self.selected_day = day
+            val day_events = self.get_events_for_day(day)
+            val count = day_events.len()
+            self.status_message = "{self._month_name(self.current_month)} {day} - {count} event(s)"
+
+    me select_next_day():
+        """Move selection to the next day, wrapping to next month."""
+        val max_day = self._days_in_month(self.current_month, self.current_year)
+        if self.selected_day < max_day:
+            self.selected_day = self.selected_day + 1
+        else:
+            self.next_month()
+            self.selected_day = 1
+        self.status_message = "Selected {self._month_name(self.current_month)} {self.selected_day}"
+
+    me select_prev_day():
+        """Move selection to the previous day, wrapping to previous month."""
+        if self.selected_day > 1:
+            self.selected_day = self.selected_day - 1
+        else:
+            self.prev_month()
+            self.selected_day = self._days_in_month(self.current_month, self.current_year)
+        self.status_message = "Selected {self._month_name(self.current_month)} {self.selected_day}"
+
+    # -- Events --------------------------------------------------------------
+
+    me add_event(day: i32, title: text, hour: i32, minute: i32):
+        """Add a new event on the given day of the current month."""
+        val event = CalendarEvent(
+            day: day,
+            month: self.current_month,
+            year: self.current_year,
+            title: title,
+            description: "",
+            hour: hour,
+            minute: minute
+        )
+        self.events = self.events.push(event)
+        self.status_message = "Added event: {title}"
+
+    me remove_event(index: i32):
+        """Remove an event by its index in the global events list."""
+        if index >= 0 and index < self.events.len():
+            var new_events: [CalendarEvent] = []
+            var i = 0
+            while i < self.events.len():
+                if i != index:
+                    new_events = new_events.push(self.events[i])
+                i = i + 1
+            self.events = new_events
+            self.status_message = "Event removed"
+
+    fn get_events_for_day(day: i32) -> [CalendarEvent]:
+        """Return all events matching the given day in the current month/year."""
+        var result: [CalendarEvent] = []
+        for event in self.events:
+            if (event.day == day and
+                event.month == self.current_month and
+                event.year == self.current_year):
+                result = result.push(event)
+        result
+
+    fn _has_events_on_day(day: i32) -> bool:
+        """Check whether any event exists on the given day."""
+        for event in self.events:
+            if (event.day == day and
+                event.month == self.current_month and
+                event.year == self.current_year):
+                return true
+        false
+
+    # -- Calendar Math -------------------------------------------------------
+
+    fn _days_in_month(month: i32, year: i32) -> i32:
+        """Return the number of days in the given month/year."""
+        match month:
+            1 => 31
+            2:
+                if self._is_leap_year(year):
+                    return 29
+                28
+            3 => 31
+            4 => 30
+            5 => 31
+            6 => 30
+            7 => 31
+            8 => 31
+            9 => 30
+            10 => 31
+            11 => 30
+            12 => 31
+            _ => 30
+
+    fn _is_leap_year(year: i32) -> bool:
+        """Determine if a year is a leap year."""
+        if year % 400 == 0:
+            return true
+        if year % 100 == 0:
+            return false
+        year % 4 == 0
+
+    fn _day_of_week(year: i32, month: i32, day: i32) -> i32:
+        """Compute day of week using Tomohiko Sakamoto's algorithm.
+
+        Returns 0=Sunday, 1=Monday, ..., 6=Saturday.
+        """
+        val t_table = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4]
+        var y = year
+        if month < 3:
+            y = y - 1
+        val t_val = t_table[month - 1]
+        val result = (y + y / 4 - y / 100 + y / 400 + t_val + day) % 7
+        result
+
+    fn _month_name(month: i32) -> text:
+        """Return the full name of the given month."""
+        match month:
+            1 => "January"
+            2 => "February"
+            3 => "March"
+            4 => "April"
+            5 => "May"
+            6 => "June"
+            7 => "July"
+            8 => "August"
+            9 => "September"
+            10 => "October"
+            11 => "November"
+            12 => "December"
+            _ => "Unknown"
+
+    # -- Input Handling ------------------------------------------------------
+
+    me handle_key(key: text):
+        """Map keyboard input to calendar actions."""
+        match key:
+            "Left" => self.select_prev_day()
+            "Right" => self.select_next_day()
+            "Up":
+                # Move selection up one week
+                if self.selected_day > 7:
+                    self.selected_day = self.selected_day - 7
+                    self.status_message = "Selected {self._month_name(self.current_month)} {self.selected_day}"
+                else:
+                    self.prev_month()
+                    val max_day = self._days_in_month(self.current_month, self.current_year)
+                    self.selected_day = max_day - (7 - self.selected_day)
+                    if self.selected_day < 1:
+                        self.selected_day = 1
+            "Down":
+                # Move selection down one week
+                val max_day = self._days_in_month(self.current_month, self.current_year)
+                if self.selected_day + 7 <= max_day:
+                    self.selected_day = self.selected_day + 7
+                    self.status_message = "Selected {self._month_name(self.current_month)} {self.selected_day}"
+                else:
+                    val overflow = self.selected_day + 7 - max_day
+                    self.next_month()
+                    self.selected_day = overflow
+                    val new_max = self._days_in_month(self.current_month, self.current_year)
+                    if self.selected_day > new_max:
+                        self.selected_day = new_max
+            "PageUp" => self.prev_month()
+            "PageDown" => self.next_month()
+            "Home" => self.go_today()
+            "a" => self._add_default_event()
+            "d" => self._delete_last_event_for_day()
+            _ => pass_dn
+
+    me handle_action(action: text):
+        """Dispatch button action strings."""
+        match action:
+            "prev_year" => self.prev_year()
+            "prev_month" => self.prev_month()
+            "next_month" => self.next_month()
+            "next_year" => self.next_year()
+            "go_today" => self.go_today()
+            "add_event" => self._add_default_event()
+            "delete_event" => self._delete_last_event_for_day()
+            "view_month" => self.view_mode = "month"
+            "view_week" => self.view_mode = "week"
+            _ =>
+                # Handle day selection buttons: "select_day_N"
+                if action.starts_with("select_day_"):
+                    val day_str = action.slice(11, action.len())
+                    val day_num = day_str.parse_i32()
+                    self.select_day(day_num)
+
+    # -- Internal helpers ----------------------------------------------------
+
+    me _add_default_event():
+        """Add a default event on the selected day."""
+        val count = self.get_events_for_day(self.selected_day).len() + 1
+        self.add_event(self.selected_day, "Event {count}", 9, 0)
+
+    me _delete_last_event_for_day():
+        """Delete the last event on the selected day."""
+        # Find the last event matching the selected day
+        var last_index = -1
+        var i = 0
+        while i < self.events.len():
+            val event = self.events[i]
+            if (event.day == self.selected_day and
+                event.month == self.current_month and
+                event.year == self.current_year):
+                last_index = i
+            i = i + 1
+        if last_index >= 0:
+            self.remove_event(last_index)
+
+    # -- UI Construction -----------------------------------------------------
+
+    fn build_ui() -> UISession:
+        """Build the calendar UI.
+
+        Layout:
+          Menu bar (View, Events)
+          Navigation row: << < "Month Year" > >> Today
+          Day-of-week header: Sun Mon Tue Wed Thu Fri Sat
+          6 week rows with 7 day cells each
+          Events panel for selected day
+          Status bar
+        """
+        val month_name = self._month_name(self.current_month)
+        val title_text = "{month_name} {self.current_year}"
+        val day_events = self.get_events_for_day(self.selected_day)
+        val event_count = day_events.len()
+
+        val root = column("cal_root", [
+            # Menu bar
+            menubar("cal_menu", [
+                "View", "Events"
+            ]),
+
+            # Navigation row
+            row("cal_nav_row", [
+                button("btn_prev_year", "<<", "prev_year"),
+                button("btn_prev_month", "<", "prev_month"),
+                with_flex(label("cal_title", title_text), 1),
+                button("btn_next_month", ">", "next_month"),
+                button("btn_next_year", ">>", "next_year"),
+                button("btn_today", "Today", "go_today")
+            ]),
+
+            # Day-of-week header
+            row("cal_dow_header", [
+                with_flex(label("dow_sun", "Sun"), 1),
+                with_flex(label("dow_mon", "Mon"), 1),
+                with_flex(label("dow_tue", "Tue"), 1),
+                with_flex(label("dow_wed", "Wed"), 1),
+                with_flex(label("dow_thu", "Thu"), 1),
+                with_flex(label("dow_fri", "Fri"), 1),
+                with_flex(label("dow_sat", "Sat"), 1)
+            ]),
+
+            # Calendar grid (6 week rows)
+            with_flex(self._build_calendar_grid(), 1),
+
+            # Events panel for selected day
+            self._build_events_panel(day_events),
+
+            # Status bar
+            statusbar("cal_status",
+                "{month_name} {self.selected_day}, {self.current_year}",
+                "{event_count} event(s) | {self.view_mode}"
+            )
+        ])
+
+        val tree = build_tree_with_title(root, "Calendar", "dark")
+        UISession.new(tree)
+
+    # -- Grid Construction ---------------------------------------------------
+
+    fn _build_calendar_grid() -> WidgetNode:
+        """Build the 6x7 calendar day grid for the current month."""
+        val days_in = self._days_in_month(self.current_month, self.current_year)
+        val first_dow = self._day_of_week(self.current_year, self.current_month, 1)
+
+        val is_today_month = (self.current_year == self.today_year and
+            self.current_month == self.today_month)
+
+        var week_rows: [WidgetNode] = []
+        var day_num = 1
+        var week = 0
+
+        while week < 6:
+            var day_cells: [WidgetNode] = []
+            var col = 0
+
+            while col < 7:
+                val cell_pos = week * 7 + col
+                if cell_pos < first_dow or day_num > days_in:
+                    # Empty cell - outside the month
+                    day_cells = day_cells.push(
+                        with_flex(label("cal_empty_{week}_{col}", " "), 1)
+                    )
+                else:
+                    # Active day cell
+                    val d = day_num
+                    val has_ev = self._has_events_on_day(d)
+                    val is_today = is_today_month and d == self.today_day
+                    val is_selected = d == self.selected_day
+
+                    # Build cell label: [>] day [*] [.]
+                    var cell_text = ""
+                    if is_selected:
+                        cell_text = ">"
+                    else:
+                        cell_text = " "
+                    if is_today:
+                        cell_text = "{cell_text}[{d}]"
+                    else:
+                        cell_text = "{cell_text} {d} "
+                    if has_ev:
+                        cell_text = "{cell_text}."
+
+                    day_cells = day_cells.push(
+                        with_flex(
+                            button("cal_day_{d}", cell_text, "select_day_{d}"),
+                            1
+                        )
+                    )
+                    day_num = day_num + 1
+                col = col + 1
+
+            week_rows = week_rows.push(
+                row("cal_week_{week}", day_cells)
+            )
+            week = week + 1
+
+        column("cal_grid", week_rows)
+
+    fn _build_events_panel(day_events: [CalendarEvent]) -> WidgetNode:
+        """Build the events list panel for the selected day."""
+        var event_widgets: [WidgetNode] = []
+
+        var idx = 0
+        while idx < day_events.len():
+            val event = day_events[idx]
+            val time_str = "{_pad_zero(event.hour)}:{_pad_zero(event.minute)}"
+            val event_row = row("event_row_{idx}", [
+                label("event_time_{idx}", time_str),
+                with_flex(label("event_title_{idx}", event.title), 1)
+            ])
+            event_widgets = event_widgets.push(event_row)
+            idx = idx + 1
+
+        if day_events.len() == 0:
+            event_widgets = event_widgets.push(
+                label("event_empty", "No events for this day")
+            )
+
+        val month_name = self._month_name(self.current_month)
+        val panel_title = "Events - {month_name} {self.selected_day}"
+
+        panel("cal_events_panel", panel_title, [
+            column("event_list", event_widgets),
+            row("event_actions", [
+                button("btn_add_event", "+ Add Event", "add_event"),
+                button("btn_del_event", "- Remove Last", "delete_event")
+            ])
+        ])
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn _pad_zero(n: i32) -> text:
+    """Pad a single-digit number with a leading zero."""
+    if n < 10:
+        return "0{n}"
+    "{n}"

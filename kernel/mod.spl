@@ -1,0 +1,20 @@
+# SimpleOS Kernel — MDSOC Architecture
+#
+# Organized by MDSOC dimensions:
+#
+# ENTITY dimension (types/):
+#   types/   — Core OS types (VmMap, TaskContext, CapabilityToken, etc.)
+#   arch/    — Architecture-specific types (x86, RISC-V, ARM)
+#
+# FEATURE dimension (directional layers, boot → memory → ... → ipc):
+#   boot/        — Limine entry, early serial, boot info (Layer 0)
+#   memory/      — PMM, VMM, paging, kernel heap (Layer 1)
+#   interrupts/  — IDT/GDT, APIC, exception handlers (Layer 2)
+#   scheduler/   — Preemptive scheduler, task management (Layer 3)
+#   ipc/         — Message passing, capability system, pledge/unveil (Layer 4)
+#
+# TRANSFORM dimension (adapters):
+#   arch_adapt/  — Platform-specific → generic kernel port bridges
+#
+# Layering enforced at compile time via capsule.sdn.
+# Upper layers may depend on lower layers, never reverse.

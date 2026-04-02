@@ -1,0 +1,275 @@
+# Local APIC — Interrupts Layer
+#
+# x86_64 Local APIC controller for hardware interrupt delivery and timer.
+# Uses MMIO at the standard base address 0xFEE00000.
+#
+# The APIC replaces the legacy 8259 PIC for interrupt routing.
+# Provides a programmable timer for preemptive scheduling.
+
+use os.kernel.boot.mmio.{mmio_read32, mmio_write32}
+use os.kernel.interrupts.idt.{VEC_TIMER, VEC_SPURIOUS}
+use os.kernel.interrupts.pic.{pic_disable}
+
+# --- APIC Register Offsets ---
+# All offsets are from the APIC base address (0xFEE00000).
+
+val APIC_BASE: u64              = 0xFEE00000
+
+val APIC_REG_ID: u32            = 0x020   # Local APIC ID
+val APIC_REG_VERSION: u32       = 0x030   # APIC Version
+val APIC_REG_TPR: u32           = 0x080   # Task Priority Register
+val APIC_REG_APR: u32           = 0x090   # Arbitration Priority Register
+val APIC_REG_PPR: u32           = 0x0A0   # Processor Priority Register
+val APIC_REG_EOI: u32           = 0x0B0   # End of Interrupt
+val APIC_REG_RRD: u32           = 0x0C0   # Remote Read Register
+val APIC_REG_LDR: u32           = 0x0D0   # Logical Destination Register
+val APIC_REG_DFR: u32           = 0x0E0   # Destination Format Register
+val APIC_REG_SVR: u32           = 0x0F0   # Spurious Interrupt Vector Register
+val APIC_REG_ISR_BASE: u32      = 0x100   # In-Service Register (8 x 32-bit)
+val APIC_REG_TMR_BASE: u32      = 0x180   # Trigger Mode Register (8 x 32-bit)
+val APIC_REG_IRR_BASE: u32      = 0x200   # Interrupt Request Register (8 x 32-bit)
+val APIC_REG_ESR: u32           = 0x280   # Error Status Register
+val APIC_REG_ICR_LOW: u32       = 0x300   # Interrupt Command Register (low 32)
+val APIC_REG_ICR_HIGH: u32      = 0x310   # Interrupt Command Register (high 32)
+val APIC_REG_TIMER_LVT: u32     = 0x320   # Timer Local Vector Table entry
+val APIC_REG_THERMAL_LVT: u32   = 0x330   # Thermal Sensor LVT
+val APIC_REG_PERFCNT_LVT: u32   = 0x340   # Performance Counter LVT
+val APIC_REG_LINT0_LVT: u32     = 0x350   # Local Interrupt 0 LVT
+val APIC_REG_LINT1_LVT: u32     = 0x360   # Local Interrupt 1 LVT
+val APIC_REG_ERROR_LVT: u32     = 0x370   # Error LVT
+val APIC_REG_TIMER_INIT: u32    = 0x380   # Timer Initial Count
+val APIC_REG_TIMER_CURRENT: u32 = 0x390   # Timer Current Count (read-only)
+val APIC_REG_TIMER_DIV: u32     = 0x3E0   # Timer Divide Configuration
+
+# --- SVR Flags ---
+
+val SVR_APIC_ENABLE: u32       = 0x100    # Bit 8: APIC Software Enable
+
+# --- Timer LVT Flags ---
+
+val TIMER_PERIODIC: u32        = 0x20000  # Bit 17: Periodic mode
+val TIMER_ONE_SHOT: u32        = 0x00000  # Bits 17: One-shot mode (default)
+val TIMER_MASKED: u32          = 0x10000  # Bit 16: Masked (disabled)
+
+# --- Timer Divider Values ---
+# Divide Configuration Register encoding:
+#   0b0000 = divide by 2     0b0001 = divide by 4
+#   0b0010 = divide by 8     0b0011 = divide by 16
+#   0b1000 = divide by 32    0b1001 = divide by 64
+#   0b1010 = divide by 128   0b1011 = divide by 1
+
+val TIMER_DIV_1: u32   = 0x0B
+val TIMER_DIV_2: u32   = 0x00
+val TIMER_DIV_4: u32   = 0x01
+val TIMER_DIV_8: u32   = 0x02
+val TIMER_DIV_16: u32  = 0x03
+val TIMER_DIV_32: u32  = 0x08
+val TIMER_DIV_64: u32  = 0x09
+val TIMER_DIV_128: u32 = 0x0A
+
+# --- Module State ---
+
+var apic_calibrated_ticks_per_ms: u32 = 0
+
+# --- Public API ---
+
+fn apic_read(reg: u32) -> u32:
+    """Read a 32-bit APIC register via MMIO."""
+    val addr = APIC_BASE + (reg as u64)
+    mmio_read32(addr)
+
+fn apic_write(reg: u32, value: u32):
+    """Write a 32-bit value to an APIC register via MMIO."""
+    val addr = APIC_BASE + (reg as u64)
+    mmio_write32(addr, value)
+
+fn apic_init():
+    """Initialize the Local APIC.
+
+    Steps:
+    1. Disable legacy 8259 PIC (mask all IRQs)
+    2. Enable APIC via SVR (Spurious Interrupt Vector Register)
+    3. Set Task Priority to 0 (accept all interrupts)
+    4. Clear error status register
+    5. Calibrate timer
+    """
+    # Step 1: Disable legacy PIC
+    pic_disable()
+
+    # Step 2: Enable APIC via MSR (IA32_APIC_BASE, MSR 0x1B)
+    # Set bit 11 (APIC Global Enable) — usually already set by BIOS
+    _enable_apic_msr()
+
+    # Step 3: Set Spurious Interrupt Vector and enable APIC
+    # SVR[7:0] = spurious vector, SVR[8] = APIC enable
+    val svr_value = SVR_APIC_ENABLE | (VEC_SPURIOUS as u32)
+    apic_write(APIC_REG_SVR, svr_value)
+
+    # Step 4: Set Task Priority to 0 — accept all interrupts
+    apic_write(APIC_REG_TPR, 0)
+
+    # Step 5: Clear Error Status Register (write 0 twice per Intel manual)
+    apic_write(APIC_REG_ESR, 0)
+    apic_write(APIC_REG_ESR, 0)
+
+    # Step 6: Send initial EOI to clear any pending interrupts
+    apic_eoi()
+
+    # Step 7: Mask all LVT entries initially
+    apic_write(APIC_REG_TIMER_LVT, TIMER_MASKED)
+    apic_write(APIC_REG_THERMAL_LVT, TIMER_MASKED)
+    apic_write(APIC_REG_PERFCNT_LVT, TIMER_MASKED)
+    apic_write(APIC_REG_LINT0_LVT, TIMER_MASKED)
+    apic_write(APIC_REG_LINT1_LVT, TIMER_MASKED)
+    apic_write(APIC_REG_ERROR_LVT, TIMER_MASKED)
+
+    # Step 8: Calibrate timer using PIT
+    _calibrate_timer()
+
+fn apic_eoi():
+    """Signal End of Interrupt to the Local APIC.
+    Must be called at the end of every interrupt handler (except spurious)."""
+    apic_write(APIC_REG_EOI, 0)
+
+fn apic_set_timer(hz: u32):
+    """Configure APIC timer for periodic interrupts at the given frequency.
+    Uses calibrated tick count from apic_init().
+
+    hz: desired interrupt frequency in Hertz (e.g., 100 for 100Hz = 10ms tick)"""
+    if apic_calibrated_ticks_per_ms == 0:
+        # Not calibrated — use a reasonable default (assume ~1GHz bus)
+        apic_calibrated_ticks_per_ms = 1000000
+
+    # Calculate initial count: ticks_per_ms * 1000 / hz
+    val ticks_per_second = apic_calibrated_ticks_per_ms * 1000
+    val initial_count = ticks_per_second / hz
+
+    # Set divide configuration (divide by 16 for reasonable granularity)
+    apic_write(APIC_REG_TIMER_DIV, TIMER_DIV_16)
+
+    # Configure Timer LVT: periodic mode, mapped to VEC_TIMER
+    val lvt_value = TIMER_PERIODIC | (VEC_TIMER as u32)
+    apic_write(APIC_REG_TIMER_LVT, lvt_value)
+
+    # Set initial count — timer starts immediately
+    apic_write(APIC_REG_TIMER_INIT, initial_count)
+
+fn apic_stop_timer():
+    """Stop the APIC timer by masking its LVT entry."""
+    apic_write(APIC_REG_TIMER_LVT, TIMER_MASKED)
+    apic_write(APIC_REG_TIMER_INIT, 0)
+
+fn apic_get_id() -> u32:
+    """Get the Local APIC ID of the current processor."""
+    val id_reg = apic_read(APIC_REG_ID)
+    (id_reg >> 24) & 0xFF
+
+fn apic_get_version() -> u32:
+    """Get APIC version register value."""
+    apic_read(APIC_REG_VERSION)
+
+# --- Internal Helpers ---
+
+fn _enable_apic_msr():
+    """Enable APIC via IA32_APIC_BASE MSR (0x1B).
+    Sets bit 11 (Global Enable) while preserving base address."""
+    asm """
+        mov ecx, 0x1B
+        rdmsr
+        or eax, 0x800
+        wrmsr
+    """
+
+fn _calibrate_timer():
+    """Calibrate APIC timer against PIT channel 2.
+
+    Uses PIT to measure how many APIC timer ticks occur in ~1ms.
+    PIT frequency: 1193182 Hz. Count for 1ms = 1193.
+
+    Method:
+    1. Set APIC timer to one-shot with max count
+    2. Start PIT channel 2 countdown for ~1ms
+    3. Wait for PIT to expire
+    4. Read how many APIC ticks elapsed
+    """
+    # Set APIC timer divider to 16
+    apic_write(APIC_REG_TIMER_DIV, TIMER_DIV_16)
+
+    # Set APIC timer to one-shot, masked (we just want to count)
+    apic_write(APIC_REG_TIMER_LVT, TIMER_MASKED | TIMER_ONE_SHOT | (VEC_TIMER as u32))
+
+    # PIT channel 2 setup for ~10ms measurement (more accurate than 1ms)
+    # Count = 1193182 * 10 / 1000 = 11932
+    val pit_count: u32 = 11932
+
+    # Gate PIT channel 2 off, then configure
+    var gate = _pit_read_gate()
+    gate = (gate & 0xFD) | 0x01    # Clear bit 1 (gate), set bit 0 (speaker data)
+    _pit_write_gate(gate)
+
+    # PIT channel 2: mode 0 (interrupt on terminal count), binary, LSB then MSB
+    _pit_command(0xB0)    # Channel 2, Access lobyte/hibyte, Mode 0, Binary
+    _pit_write_count(pit_count)
+
+    # Start APIC timer with max initial count
+    apic_write(APIC_REG_TIMER_INIT, 0xFFFFFFFF)
+
+    # Enable PIT channel 2 gate
+    gate = _pit_read_gate()
+    gate = gate | 0x01
+    _pit_write_gate(gate)
+
+    # Wait for PIT channel 2 output to go high (bit 5 of port 0x61)
+    var status = _pit_read_gate()
+    while (status & 0x20) == 0:
+        status = _pit_read_gate()
+
+    # Stop APIC timer
+    apic_write(APIC_REG_TIMER_LVT, TIMER_MASKED)
+
+    # Read how many ticks elapsed
+    val current = apic_read(APIC_REG_TIMER_CURRENT)
+    val elapsed = 0xFFFFFFFF - current
+
+    # elapsed ticks in ~10ms, so ticks_per_ms = elapsed / 10
+    apic_calibrated_ticks_per_ms = elapsed / 10
+
+    # Disable PIT channel 2 gate
+    gate = _pit_read_gate()
+    gate = gate & 0xFC
+    _pit_write_gate(gate)
+
+fn _pit_read_gate() -> u8:
+    """Read PIT gate/speaker control register (port 0x61)."""
+    var result: u8 = 0
+    asm """
+        in al, 0x61
+        movzx eax, al
+        mov {result}, eax
+    """
+    result
+
+fn _pit_write_gate(value: u8):
+    """Write PIT gate/speaker control register (port 0x61)."""
+    asm """
+        mov al, {value}
+        out 0x61, al
+    """
+
+fn _pit_command(cmd: u8):
+    """Write PIT command register (port 0x43)."""
+    asm """
+        mov al, {cmd}
+        out 0x43, al
+    """
+
+fn _pit_write_count(count: u32):
+    """Write 16-bit count to PIT channel 2 (port 0x42), LSB then MSB."""
+    val lo = (count & 0xFF) as u8
+    val hi = ((count >> 8) & 0xFF) as u8
+    asm """
+        mov al, {lo}
+        out 0x42, al
+        mov al, {hi}
+        out 0x42, al
+    """

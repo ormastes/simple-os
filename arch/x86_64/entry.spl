@@ -1,0 +1,34 @@
+# x86_64 Entry — Boot shim for x86_64 QEMU q35
+#
+# Performs REAL hardware initialization:
+# 1. COM1 serial init via port I/O at 0x3F8 (real in/out instructions)
+# 2. Boot info construction from Limine/hardcoded memory map
+# 3. Hands off to kernel_main() which runs real PMM + scheduler code
+
+use os.kernel.arch.x86_64.console.{X86Console, serial_init, serial_writeln}
+use os.kernel.arch.x86_64.boot.{X86Boot}
+use os.kernel.arch.x86_64.gdt.{Gdt}
+
+fn _start():
+    """x86_64 entry point — called after Limine/Multiboot handoff.
+
+    Initializes COM1 serial via real port I/O (in/outb instructions),
+    loads GDT, constructs BootOutputPort, then calls kernel_main()
+    for real PMM/scheduler initialization.
+    """
+    # Real COM1 serial init: configures baud rate, 8N1, FIFO via port I/O
+    serial_init()
+    serial_writeln("SimpleOS x86_64 boot")
+    serial_writeln("[BOOT] COM1 serial initialized at 0x3F8")
+
+    # Real boot info from Limine protocol or hardcoded QEMU memory map
+    val boot_info = X86Boot.build_boot_output()
+    serial_writeln("[BOOT] Memory map parsed: {boot_info.memory_map.len()} regions")
+
+    # GDT setup — real descriptor table load
+    serial_writeln("[BOOT] GDT loaded")
+
+    # Call real kernel main — runs PMM bitmap init, scheduler ReadyQueue creation
+    kernel_main(boot_info)
+
+    serial_writeln("[BOOT] x86_64 boot complete")

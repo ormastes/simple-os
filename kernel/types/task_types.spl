@@ -1,0 +1,60 @@
+# Task Types — Entity Dimension
+#
+# Process/task types used by scheduler, IPC, and capability layers.
+
+struct TaskId:
+    """Unique task identifier."""
+    id: u64
+
+enum TaskState:
+    """Task execution state."""
+    Ready           # Can be scheduled
+    Running         # Currently executing
+    Blocked(reason: BlockReason)  # Waiting for something
+    Zombie          # Exited, waiting for parent to collect
+
+enum BlockReason:
+    """Why a task is blocked."""
+    IpcRecv(port: u64)      # Waiting for IPC message
+    IpcSend(port: u64)      # Waiting for IPC send to complete
+    Sleep(until_ns: u64)    # Sleeping until timestamp
+    PageFault(addr: u64)    # Waiting for page-in
+    Exit                    # Exited
+
+enum TaskPriority:
+    """Task scheduling priority."""
+    Realtime    # Highest: interrupt handlers, critical services
+    High        # System services (compositor, VFS)
+    Normal      # User applications
+    Low         # Background tasks (package manager, indexer)
+    Idle        # Only when nothing else to run
+
+@repr("C")
+struct TaskContext:
+    """Saved CPU state for context switch.
+    Architecture-specific fields filled by arch_adapt transform."""
+    # General purpose registers (x86_64)
+    rax: u64
+    rbx: u64
+    rcx: u64
+    rdx: u64
+    rsi: u64
+    rdi: u64
+    rbp: u64
+    rsp: u64
+    r8: u64
+    r9: u64
+    r10: u64
+    r11: u64
+    r12: u64
+    r13: u64
+    r14: u64
+    r15: u64
+    # Instruction pointer and flags
+    rip: u64
+    rflags: u64
+    # Segment selectors
+    cs: u64
+    ss: u64
+    # FPU/SSE state pointer (optional, 0 if not saved)
+    fpu_state: u64

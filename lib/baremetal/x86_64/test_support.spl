@@ -1,0 +1,79 @@
+# x86_64 Test Support Functions
+#
+# Helper functions for testing bare-metal x86_64 boot code.
+# Supports Multiboot2 specification.
+
+
+# Multiboot2 constants
+val MULTIBOOT2_MAGIC: u32 = 0xE85250D6
+val MULTIBOOT2_ARCH_I386: u32 = 0
+val MULTIBOOT2_HEADER_LENGTH: u32 = 24  # Minimal header length
+
+# Calculate checksum: -(magic + architecture + length)
+fn calculate_checksum() -> u32:
+    val sum = MULTIBOOT2_MAGIC + MULTIBOOT2_ARCH_I386 + MULTIBOOT2_HEADER_LENGTH
+    (0 - sum) as u32
+
+val MULTIBOOT2_CHECKSUM: u32 = calculate_checksum()
+
+# Stack configuration (must be 16-byte aligned for x86_64)
+val STACK_SIZE: u32 = 65536  # 64KB stack
+
+# Control register bits for long mode
+val CR4_PAE: u32 = 0x00000020   # Physical Address Extension
+val EFER_LME: u64 = 0x00000100  # Long Mode Enable (in EFER MSR)
+val CR0_PG: u32 = 0x80000000    # Paging Enable
+
+# Multiboot2 header structure
+struct Multiboot2Header:
+    magic: u32
+    architecture: u32
+    header_length: u32
+    checksum: u32
+
+# Get multiboot2 header for testing
+fn multiboot2_header() -> Multiboot2Header:
+    Multiboot2Header(
+        magic: MULTIBOOT2_MAGIC,
+        architecture: MULTIBOOT2_ARCH_I386,
+        header_length: MULTIBOOT2_HEADER_LENGTH,
+        checksum: MULTIBOOT2_CHECKSUM
+    )
+
+# Validate multiboot2 header
+fn validate_multiboot2(header: Multiboot2Header) -> bool:
+    # Check magic number
+    if header.magic != MULTIBOOT2_MAGIC:
+        return false
+
+    # Check architecture (should be i386)
+    if header.architecture != MULTIBOOT2_ARCH_I386:
+        return false
+
+    # Check checksum: magic + architecture + length + checksum should equal 0
+    val sum = header.magic + header.architecture + header.header_length + header.checksum
+    if sum != 0:
+        return false
+
+    true
+
+# Get simulated stack pointer (for testing)
+# Stack must be 16-byte aligned for x86_64 ABI
+fn get_stack_pointer() -> u64:
+    # Simulate stack pointer at top of stack
+    val stack_top = 0x0000000000110000  # Simulated stack top
+    stack_top
+
+# Verify stack alignment
+fn check_stack_alignment(sp: u64) -> bool:
+    (sp % 16) == 0
+
+# Long mode setup verification functions
+fn is_pae_enabled(cr4: u32) -> bool:
+    (cr4 & CR4_PAE) != 0
+
+fn is_long_mode_enabled(efer: u64) -> bool:
+    (efer & EFER_LME) != 0
+
+fn is_paging_enabled(cr0: u32) -> bool:
+    (cr0 & CR0_PG) != 0

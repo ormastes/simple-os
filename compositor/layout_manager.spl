@@ -1,0 +1,233 @@
+@allow(primitive_api)
+# Window Layout Manager — iOS-style window modes
+#
+# Supports: FullScreen, Split View, Slide Over, Stage Manager, PiP
+# Computes target layouts for windows based on their current mode,
+# inspired by iPadOS multi-tasking.
+
+# ============================================================================
+# Window Mode
+# ============================================================================
+
+enum WindowMode:
+    FullScreen
+    SplitLeft
+    SplitRight
+    SlideOver
+    StageManager
+    PictureInPicture
+    Minimized
+
+# ============================================================================
+# Split Configuration
+# ============================================================================
+
+struct SplitConfig:
+    """Configuration for split-view mode."""
+    ratio: f64           # 0.33, 0.5, 0.67
+    left_id: i64
+    right_id: i64
+
+# ============================================================================
+# Window Layout
+# ============================================================================
+
+struct WindowLayout:
+    """Computed layout rectangle for a window."""
+    x: i64
+    y: i64
+    width: i64
+    height: i64
+
+# ============================================================================
+# Layout Manager
+# ============================================================================
+
+class LayoutManager:
+    """Manages window layout modes and computes target positions.
+
+    Each window has a mode (FullScreen, Split, SlideOver, etc.)
+    and the manager computes the exact pixel layout based on
+    screen dimensions and the mode.
+    """
+    screen_width: i64
+    screen_height: i64
+    taskbar_height: i64
+    modes: Dict<i64, WindowMode>          # window_id -> mode
+    split_config: SplitConfig?
+    slide_over_id: i64                    # -1 = none
+    pip_id: i64                           # -1 = none
+    stage_positions: Dict<i64, WindowLayout>  # free positions for Stage Manager
+
+impl LayoutManager:
+
+    static fn create(screen_w: i64, screen_h: i64, taskbar_h: i64) -> LayoutManager:
+        """Create a new layout manager for the given screen dimensions."""
+        LayoutManager(
+            screen_width: screen_w,
+            screen_height: screen_h,
+            taskbar_height: taskbar_h,
+            modes: {},
+            split_config: nil,
+            slide_over_id: -1,
+            pip_id: -1,
+            stage_positions: {}
+        )
+
+    # -- Layout Computation --------------------------------------------------
+
+    fn compute_layout(window_id: i64) -> WindowLayout:
+        """Compute target layout based on the window's current mode."""
+        val mode = self.get_mode(window_id)
+        val usable_h = self.screen_height - self.taskbar_height
+        match mode:
+            WindowMode.FullScreen:
+                return WindowLayout(x: 0, y: 0, width: self.screen_width, height: usable_h)
+            WindowMode.SplitLeft:
+                val w = self._split_width(self.screen_width)
+                return WindowLayout(x: 0, y: 0, width: w, height: usable_h)
+            WindowMode.SplitRight:
+                val left_w = self._split_width(self.screen_width)
+                return WindowLayout(x: left_w, y: 0, width: self.screen_width - left_w, height: usable_h)
+            WindowMode.SlideOver:
+                val w: i64 = 320
+                val h = usable_h - 40
+                return WindowLayout(x: self.screen_width - w - 10, y: 20, width: w, height: h)
+            WindowMode.PictureInPicture:
+                return WindowLayout(x: self.screen_width - 280, y: usable_h - 180, width: 260, height: 160)
+            WindowMode.StageManager:
+                val pos = self.stage_positions.get(window_id)
+                if pos != nil:
+                    return pos
+                return self._default_stage_position(window_id)
+            WindowMode.Minimized:
+                return WindowLayout(x: 0, y: self.screen_height, width: 0, height: 0)
+        # Fallback (should not reach here)
+        return WindowLayout(x: 0, y: 0, width: self.screen_width, height: usable_h)
+
+    # -- Mode Management -----------------------------------------------------
+
+    me set_mode(window_id: i64, mode: WindowMode):
+        """Set the layout mode for a window."""
+        self.modes = self.modes.set(window_id, mode)
+
+    me apply_split_view(left_id: i64, right_id: i64, ratio: f64):
+        """Configure split view between two windows."""
+        self.split_config = SplitConfig(ratio: ratio, left_id: left_id, right_id: right_id)
+        self.modes = self.modes.set(left_id, WindowMode.SplitLeft)
+        self.modes = self.modes.set(right_id, WindowMode.SplitRight)
+
+    me set_slide_over(window_id: i64):
+        """Set a window as the slide-over panel."""
+        self.slide_over_id = window_id
+        self.modes = self.modes.set(window_id, WindowMode.SlideOver)
+
+    me set_pip(window_id: i64):
+        """Set a window as the picture-in-picture overlay."""
+        self.pip_id = window_id
+        self.modes = self.modes.set(window_id, WindowMode.PictureInPicture)
+
+    me set_stage_position(window_id: i64, layout: WindowLayout):
+        """Store a custom position for a Stage Manager window."""
+        self.stage_positions = self.stage_positions.set(window_id, layout)
+        self.modes = self.modes.set(window_id, WindowMode.StageManager)
+
+    # -- Queries -------------------------------------------------------------
+
+    fn get_mode(window_id: i64) -> WindowMode:
+        """Get the current mode for a window (defaults to FullScreen)."""
+        val mode = self.modes.get(window_id)
+        if mode != nil:
+            return mode
+        WindowMode.FullScreen
+
+    fn get_split_config() -> SplitConfig?:
+        """Get the current split configuration, if any."""
+        self.split_config
+
+    fn get_slide_over_id() -> i64:
+        """Get the slide-over window ID (-1 if none)."""
+        self.slide_over_id
+
+    fn get_pip_id() -> i64:
+        """Get the PiP window ID (-1 if none)."""
+        self.pip_id
+
+    # -- Internal Helpers ----------------------------------------------------
+
+    fn _split_ratio() -> f64:
+        """Get the split ratio from config, defaulting to 0.5."""
+        if self.split_config != nil:
+            return self.split_config.ratio
+        0.5
+
+    fn _split_width(screen_w: i64) -> i64:
+        """Compute split left-side width from config ratio and screen width.
+
+        Uses the ratio as a float multiplied directly with the screen width,
+        then truncates to integer. Defaults to half the screen.
+        """
+        if self.split_config != nil:
+            val ratio = self.split_config.ratio
+            return _apply_ratio(screen_w, ratio)
+        screen_w / 2
+
+    fn _default_stage_position(window_id: i64) -> WindowLayout:
+        """Compute a default Stage Manager position based on window ID.
+
+        Offsets each window slightly so they cascade.
+        """
+        val usable_h = self.screen_height - self.taskbar_height
+        val offset = (window_id % 5) * 40
+        val base_w = self.screen_width * 3 / 4
+        val base_h = usable_h * 3 / 4
+        WindowLayout(
+            x: 60 + offset,
+            y: 30 + offset,
+            width: base_w,
+            height: base_h
+        )
+
+# ============================================================================
+# Internal Helpers
+# ============================================================================
+
+fn _apply_ratio(total: i64, ratio: f64) -> i64:
+    """Apply a float ratio to an integer total, returning integer result.
+
+    Uses integer math: multiply total by (ratio * 10000) then divide by 10000.
+    This avoids float-to-int conversion issues in interpreter mode.
+    Example: _apply_ratio(1920, 0.5) => 1920 * 5000 / 10000 => 960
+    """
+    # Convert ratio to integer thousandths to avoid float arithmetic on total
+    # ratio * 10000 gives us enough precision (0.33 -> 3300, 0.5 -> 5000, 0.67 -> 6700)
+    val ratio_scaled = ratio * 10000.0
+    # Use integer truncation: add a small value to avoid float imprecision
+    val ratio_int = _trunc(ratio_scaled)
+    return total * ratio_int / 10000
+
+fn _trunc(v: f64) -> i64:
+    """Truncate f64 to i64 using iterative approach.
+
+    Avoids .to_i64() which may not be available in interpreter mode.
+    Works for positive values up to reasonable screen sizes.
+    """
+    # For positive values, find the integer part
+    if v < 0.0:
+        return 0 - _trunc(0.0 - v)
+    var result: i64 = 0
+    var remaining = v
+    # Fast path: step by 1000s, then 100s, then 10s, then 1s
+    while remaining >= 1000.0:
+        result = result + 1000
+        remaining = remaining - 1000.0
+    while remaining >= 100.0:
+        result = result + 100
+        remaining = remaining - 100.0
+    while remaining >= 10.0:
+        result = result + 10
+        remaining = remaining - 10.0
+    while remaining >= 1.0:
+        result = result + 1
+        remaining = remaining - 1.0
+    return result

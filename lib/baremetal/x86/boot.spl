@@ -1,0 +1,92 @@
+# x86 Bare-Metal Boot Code
+#
+# Multiboot-compliant entry point for bare-metal x86 systems.
+# This module provides the bootstrap code needed to boot on QEMU or real hardware.
+#
+# Memory Layout (after boot):
+#   0x00100000 - Multiboot header + kernel image
+#   0x???????? - Stack (grows downward from top)
+#   0x000B8000 - VGA text buffer
+#
+# Note: This is a design/stub file. Real implementation requires:
+#   - @section attribute for placing code in specific sections
+#   - @naked attribute for functions without prologue/epilogue
+#   - Inline assembly support
+
+# Multiboot header constants (Multiboot Specification v1)
+val MULTIBOOT_MAGIC: i32 = 0x1BADB002
+val MULTIBOOT_PAGE_ALIGN: i32 = 1       # Align modules on page boundaries
+val MULTIBOOT_MEMORY_INFO: i32 = 2      # Request memory map
+val MULTIBOOT_FLAGS: i32 = 3            # PAGE_ALIGN | MEMORY_INFO
+
+# Multiboot header checksum: magic + flags + checksum = 0
+# MULTIBOOT_CHECKSUM = -(MULTIBOOT_MAGIC + MULTIBOOT_FLAGS)
+val MULTIBOOT_CHECKSUM: i32 = -464367621  # Precomputed
+
+# Stack size (64KB default)
+val STACK_SIZE: i32 = 65536
+
+# Multiboot info structure fields
+# These would be populated by the bootloader
+var g_multiboot_magic: i32 = 0
+var g_multiboot_info_addr: i32 = 0
+var g_mem_lower: i32 = 0
+var g_mem_upper: i32 = 0
+
+# Entry point - called by bootloader
+# At entry:
+#   EAX = Multiboot magic number (0x2BADB002)
+#   EBX = Physical address of multiboot info structure
+#   Interrupts disabled
+#   A20 line enabled
+#   Paging disabled (running in 32-bit protected mode)
+#
+# Note: Real implementation would be:
+#   @entry
+#   @naked
+#   fn _start():
+#       asm:
+#           "lea esp, [stack_buffer + STACK_SIZE]"
+#           "mov [g_multiboot_info], ebx"
+#           "cld"
+#           "call kernel_main"
+#           "cli"
+#           ".halt: hlt"
+#           "jmp .halt"
+
+fn _start_stub():
+    # This is a stub - real _start needs inline assembly
+    # The bootloader passes:
+    # - EAX: magic (0x2BADB002)
+    # - EBX: pointer to multiboot info
+    print "[BOOT] _start called (stub)"
+
+# Initialize from multiboot info
+fn boot_init(magic: i32, info_addr: i32):
+    g_multiboot_magic = magic
+    g_multiboot_info_addr = info_addr
+    # Would parse multiboot info structure here
+
+# Get amount of available memory (in bytes)
+fn get_memory_size() -> i64:
+    if g_multiboot_info_addr == 0:
+        0
+    else:
+        # Convert KB to bytes
+        (g_mem_upper as i64 + 1024) * 1024
+
+# Halt the CPU
+# Disables interrupts and enters an infinite halt loop
+fn halt():
+    # Real implementation:
+    # asm:
+    #     "cli"
+    #     ".halt: hlt"
+    #     "jmp .halt"
+    print "[HALT] CPU halted (stub)"
+
+# Kernel main entry point - to be implemented by user
+# This is called after basic initialization
+fn kernel_main():
+    # Default implementation just halts
+    halt()

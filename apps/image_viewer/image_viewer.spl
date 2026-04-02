@@ -1,0 +1,680 @@
+# Image Viewer / Photos App — ASCII Art Image Viewer
+#
+# TUI-based image viewer that renders images as ASCII art with ANSI
+# color approximation. Supports PPM (P3 plain text) and a simple
+# bitmap format. Features zoom, scroll, slideshow navigation, and
+# directory browsing for image files.
+#
+# MDSOC: feature dimension, apps layer
+
+use common.ui.builder.{
+    column, row, panel, button, text_widget, label,
+    statusbar, menubar, build_tree_with_title,
+    with_flex, with_width, scroll
+}
+use common.ui.widget.{WidgetNode, UITree, UIEvent}
+use common.ui.session.{UISession}
+use os.services.vfs.vfs.{VfsManager}
+use os.kernel.types.fs_types.{DirEntry, FsNode, FsNodeKind}
+
+# =========================================================================
+# Zoom Level
+# =========================================================================
+
+enum ZoomLevel:
+    """Image zoom level."""
+    Fit
+    Zoom50
+    Zoom100
+    Zoom200
+
+fn zoom_name(zoom: ZoomLevel) -> text:
+    """Human-readable zoom level."""
+    match zoom:
+        ZoomLevel.Fit     => "Fit"
+        ZoomLevel.Zoom50  => "50%"
+        ZoomLevel.Zoom100 => "100%"
+        ZoomLevel.Zoom200 => "200%"
+
+fn zoom_factor(zoom: ZoomLevel) -> i32:
+    """Zoom factor as percentage."""
+    match zoom:
+        ZoomLevel.Fit     => 0
+        ZoomLevel.Zoom50  => 50
+        ZoomLevel.Zoom100 => 100
+        ZoomLevel.Zoom200 => 200
+
+# =========================================================================
+# View Mode
+# =========================================================================
+
+enum ViewMode:
+    """Image viewing mode."""
+    Single
+    Thumbnail
+    Slideshow
+
+fn view_mode_name(mode: ViewMode) -> text:
+    """Human-readable view mode."""
+    match mode:
+        ViewMode.Single    => "Single"
+        ViewMode.Thumbnail => "Thumbnail"
+        ViewMode.Slideshow => "Slideshow"
+
+# =========================================================================
+# Image Data Structures
+# =========================================================================
+
+struct ImagePixel:
+    """A single pixel with RGB components."""
+    r: i32
+    g: i32
+    b: i32
+
+struct ImageData:
+    """Decoded image data."""
+    width: i32
+    height: i32
+    pixels: [[ImagePixel]]
+    format: text
+
+struct ImageInfo:
+    """Metadata about an image file."""
+    path: text
+    name: text
+    width: i32
+    height: i32
+    format: text
+    size_bytes: u64
+
+# =========================================================================
+# Image Viewer
+# =========================================================================
+
+class ImageViewer:
+    """TUI image viewer that renders images as colored ASCII art.
+
+    Supports PPM P3 (plain text) and simple bitmap formats. Images are
+    downscaled to fit the terminal viewport and converted to ASCII
+    characters weighted by brightness, with ANSI color codes for
+    approximate color reproduction.
+    """
+    current_image: ImageData?
+    current_path: text?
+    image_list: [ImageInfo]
+    current_index: i32
+    zoom: ZoomLevel
+    view_mode: ViewMode
+    scroll_x: i32
+    scroll_y: i32
+    view_width: i32
+    view_height: i32
+    directory: text
+    status_message: text
+    vfs: VfsManager?
+
+impl ImageViewer:
+
+    static fn new() -> ImageViewer:
+        """Create an image viewer with default settings."""
+        return ImageViewer(
+            current_image: nil,
+            current_path: nil,
+            image_list: [],
+            current_index: 0,
+            zoom: ZoomLevel.Fit,
+            view_mode: ViewMode.Single,
+            scroll_x: 0,
+            scroll_y: 0,
+            view_width: 80,
+            view_height: 24,
+            directory: "/",
+            status_message: "No image loaded",
+            vfs: nil
+        )
+
+    static fn with_vfs(vfs: VfsManager) -> ImageViewer:
+        """Create an image viewer connected to a VFS."""
+        var viewer = ImageViewer.new()
+        viewer.vfs = vfs
+        return viewer
+
+    # -- File Operations -----------------------------------------------------
+
+    me open_image(path: text) -> Result<bool, text>:
+        """Open and decode an image file."""
+        if self.vfs == nil:
+            return Result.Err("no filesystem available")
+        val result = self.vfs.read(path)
+        if result.is_err():
+            return Result.Err("cannot read: {result.unwrap_err()}")
+        val content = result.unwrap()
+        # Detect format by content
+        var image_result: Result<ImageData, text> = Result.Err("unknown format")
+        if content.starts_with("P3"):
+            image_result = self._parse_ppm(content)
+        else:
+            image_result = self._parse_simple_bitmap(content)
+        if image_result.is_err():
+            return Result.Err(image_result.unwrap_err())
+        self.current_image = image_result.unwrap()
+        self.current_path = path
+        self.scroll_x = 0
+        self.scroll_y = 0
+        self.status_message = "Opened {_basename(path)}"
+        return Result.Ok(true)
+
+    me open_directory(path: text):
+        """Scan a directory for image files and load the list."""
+        self.directory = path
+        self.image_list = self._scan_images(path)
+        self.current_index = 0
+        if self.image_list.len() > 0:
+            val first = self.image_list[0]
+            val _ = self.open_image(first.path)
+            self.status_message = "Found {self.image_list.len()} images in {path}"
+        else:
+            self.status_message = "No images found in {path}"
+
+    me next_image():
+        """Navigate to the next image in the list."""
+        if self.image_list.len() == 0:
+            self.status_message = "No images loaded"
+            return
+        self.current_index = (self.current_index + 1) % self.image_list.len()
+        val info = self.image_list[self.current_index]
+        val _ = self.open_image(info.path)
+
+    me prev_image():
+        """Navigate to the previous image in the list."""
+        if self.image_list.len() == 0:
+            self.status_message = "No images loaded"
+            return
+        self.current_index = self.current_index - 1
+        if self.current_index < 0:
+            self.current_index = self.image_list.len() - 1
+        val info = self.image_list[self.current_index]
+        val _ = self.open_image(info.path)
+
+    fn _scan_images(dir: text) -> [ImageInfo]:
+        """Scan a directory for image files (.ppm, .bmp, .sbm)."""
+        if self.vfs == nil:
+            return []
+        val result = self.vfs.readdir(dir)
+        if result.is_err():
+            return []
+        var images: [ImageInfo] = []
+        val entries = result.unwrap()
+        for entry in entries:
+            match entry.node.kind:
+                FsNodeKind.File:
+                    val name = entry.name
+                    val is_image = (name.ends_with(".ppm") or
+                        name.ends_with(".sbm") or
+                        name.ends_with(".bmp"))
+                    if is_image:
+                        val path = _join_path(dir, name)
+                        val fmt = if name.ends_with(".ppm"): "PPM"
+                            elif name.ends_with(".sbm"): "SBM"
+                            else: "BMP"
+                        images = images.push(ImageInfo(
+                            path: path,
+                            name: name,
+                            width: 0,
+                            height: 0,
+                            format: fmt,
+                            size_bytes: entry.node.size
+                        ))
+                _ => pass_dn
+        return images
+
+    # -- Parsing -------------------------------------------------------------
+
+    fn _parse_ppm(content: text) -> Result<ImageData, text>:
+        """Parse a PPM P3 (plain text ASCII) image.
+
+        Format:
+          P3
+          <width> <height>
+          <max_val>
+          r g b r g b ...
+        Comments starting with # are skipped.
+        """
+        val lines = _split_lines(content)
+        var tokens: [text] = []
+        # Collect all non-comment tokens
+        for line in lines:
+            val trimmed = line.trim()
+            if trimmed == "" or trimmed.starts_with("#"):
+                pass_dn
+            else:
+                val parts = _split_whitespace(trimmed)
+                for part in parts:
+                    tokens = tokens.push(part)
+        # Validate header
+        if tokens.len() < 4:
+            return Result.Err("PPM: too few tokens")
+        if tokens[0] != "P3":
+            return Result.Err("PPM: expected P3 magic")
+        val w = _parse_int(tokens[1])
+        val h = _parse_int(tokens[2])
+        val max_val = _parse_int(tokens[3])
+        if w <= 0 or h <= 0:
+            return Result.Err("PPM: invalid dimensions {w}x{h}")
+        if max_val <= 0:
+            return Result.Err("PPM: invalid max value {max_val}")
+        # Parse pixel data
+        val pixel_start = 4
+        val expected = w * h * 3
+        if tokens.len() - pixel_start < expected:
+            return Result.Err("PPM: not enough pixel data (need {expected}, have {tokens.len() - pixel_start})")
+        var pixels: [[ImagePixel]] = []
+        var idx = pixel_start
+        var y = 0
+        while y < h:
+            var row_pixels: [ImagePixel] = []
+            var x = 0
+            while x < w:
+                val r = _parse_int(tokens[idx]) * 255 / max_val
+                val g = _parse_int(tokens[idx + 1]) * 255 / max_val
+                val b = _parse_int(tokens[idx + 2]) * 255 / max_val
+                row_pixels = row_pixels.push(ImagePixel(r: r, g: g, b: b))
+                idx = idx + 3
+                x = x + 1
+            pixels = pixels.push(row_pixels)
+            y = y + 1
+        return Result.Ok(ImageData(width: w, height: h, pixels: pixels, format: "PPM"))
+
+    fn _parse_simple_bitmap(content: text) -> Result<ImageData, text>:
+        """Parse a simple bitmap format.
+
+        Format:
+          SBM
+          <width>x<height>
+          r g b
+          r g b
+          ...
+        One pixel per line in RGB 0-255.
+        """
+        val lines = _split_lines(content)
+        if lines.len() < 3:
+            return Result.Err("SBM: too few lines")
+        val header = lines[0].trim()
+        if header != "SBM":
+            return Result.Err("SBM: expected SBM header, got {header}")
+        val dims = lines[1].trim()
+        val x_pos = dims.index_of("x")
+        if x_pos < 0:
+            return Result.Err("SBM: invalid dimensions line (expected WxH)")
+        val w = _parse_int(dims.slice(0, x_pos))
+        val h = _parse_int(dims.slice(x_pos + 1, dims.len()))
+        if w <= 0 or h <= 0:
+            return Result.Err("SBM: invalid dimensions {w}x{h}")
+        var pixels: [[ImagePixel]] = []
+        var line_idx = 2
+        var y = 0
+        while y < h:
+            var row_pixels: [ImagePixel] = []
+            var x = 0
+            while x < w:
+                if line_idx >= lines.len():
+                    return Result.Err("SBM: not enough pixel data at line {line_idx}")
+                val parts = _split_whitespace(lines[line_idx].trim())
+                if parts.len() < 3:
+                    return Result.Err("SBM: invalid pixel at line {line_idx}")
+                val r = _parse_int(parts[0])
+                val g = _parse_int(parts[1])
+                val b = _parse_int(parts[2])
+                row_pixels = row_pixels.push(ImagePixel(r: r, g: g, b: b))
+                line_idx = line_idx + 1
+                x = x + 1
+            pixels = pixels.push(row_pixels)
+            y = y + 1
+        return Result.Ok(ImageData(width: w, height: h, pixels: pixels, format: "SBM"))
+
+    # -- Rendering -----------------------------------------------------------
+
+    fn _render_ascii(image: ImageData, target_w: i32, target_h: i32) -> [text]:
+        """Render image as ASCII art with ANSI color codes.
+
+        Downscales the image to target dimensions and maps each sampled
+        pixel to a brightness-weighted ASCII character with approximate
+        ANSI foreground color.
+        """
+        val esc = "\u{001b}"
+        var lines: [text] = []
+        if image.width == 0 or image.height == 0:
+            return ["(empty image)"]
+        # Calculate scale factors
+        val scale_x = image.width / target_w
+        val scale_y = image.height / target_h
+        val scale = if scale_x > scale_y: scale_x else: scale_y
+        val effective_scale = if scale < 1: 1 else: scale
+        var y = 0
+        while y < target_h and y * effective_scale < image.height:
+            var line = ""
+            var x = 0
+            while x < target_w and x * effective_scale < image.width:
+                val src_x = x * effective_scale
+                val src_y = y * effective_scale
+                val pixel = image.pixels[src_y][src_x]
+                val ansi = _rgb_to_ansi(pixel.r, pixel.g, pixel.b)
+                val ch = _pixel_to_char(pixel)
+                line = "{line}{ansi}{ch}{esc}[0m"
+                x = x + 1
+            lines = lines.push(line)
+            y = y + 1
+        return lines
+
+    # -- Zoom ----------------------------------------------------------------
+
+    me zoom_in():
+        """Increase zoom level."""
+        self.zoom = match self.zoom:
+            ZoomLevel.Fit     => ZoomLevel.Zoom50
+            ZoomLevel.Zoom50  => ZoomLevel.Zoom100
+            ZoomLevel.Zoom100 => ZoomLevel.Zoom200
+            ZoomLevel.Zoom200 => ZoomLevel.Zoom200
+        self.status_message = "Zoom: {zoom_name(self.zoom)}"
+
+    me zoom_out():
+        """Decrease zoom level."""
+        self.zoom = match self.zoom:
+            ZoomLevel.Fit     => ZoomLevel.Fit
+            ZoomLevel.Zoom50  => ZoomLevel.Fit
+            ZoomLevel.Zoom100 => ZoomLevel.Zoom50
+            ZoomLevel.Zoom200 => ZoomLevel.Zoom100
+        self.status_message = "Zoom: {zoom_name(self.zoom)}"
+
+    me zoom_fit():
+        """Reset zoom to fit."""
+        self.zoom = ZoomLevel.Fit
+        self.scroll_x = 0
+        self.scroll_y = 0
+        self.status_message = "Zoom: Fit"
+
+    # -- Scrolling -----------------------------------------------------------
+
+    me scroll_up():
+        """Scroll the image view up."""
+        if self.scroll_y > 0:
+            self.scroll_y = self.scroll_y - 1
+
+    me scroll_down():
+        """Scroll the image view down."""
+        self.scroll_y = self.scroll_y + 1
+
+    me scroll_left():
+        """Scroll the image view left."""
+        if self.scroll_x > 0:
+            self.scroll_x = self.scroll_x - 1
+
+    me scroll_right():
+        """Scroll the image view right."""
+        self.scroll_x = self.scroll_x + 1
+
+    # -- Key / Action Handling -----------------------------------------------
+
+    me handle_key(key: text):
+        """Handle keyboard input.
+
+        Arrows = scroll, +/- = zoom, n/p = next/prev image,
+        f = fit, Ctrl+O = open.
+        """
+        match key:
+            "up":    self.scroll_up()
+            "down":  self.scroll_down()
+            "left":  self.scroll_left()
+            "right": self.scroll_right()
+            "+":     self.zoom_in()
+            "-":     self.zoom_out()
+            "n":     self.next_image()
+            "p":     self.prev_image()
+            "f":     self.zoom_fit()
+            "ctrl_o": self.status_message = "Open: provide file path"
+            _ => pass_dn
+
+    me handle_action(action: text):
+        """Dispatch button / menu action strings."""
+        match action:
+            # File menu
+            "Open":    self.status_message = "Open: provide file path"
+            "OpenDir": self.status_message = "OpenDir: provide directory path"
+            "Exit":    self.status_message = "exit"
+            # View menu
+            "ZoomIn":  self.zoom_in()
+            "ZoomOut": self.zoom_out()
+            "Fit":     self.zoom_fit()
+            "Next":    self.next_image()
+            "Prev":    self.prev_image()
+            # Toolbar
+            "btn_open":     self.status_message = "Open: provide file path"
+            "btn_prev":     self.prev_image()
+            "btn_next":     self.next_image()
+            "btn_zoom_in":  self.zoom_in()
+            "btn_zoom_out": self.zoom_out()
+            "btn_fit":      self.zoom_fit()
+            _ => self.status_message = "Unknown action: {action}"
+
+    # -- UI Construction -----------------------------------------------------
+
+    fn build_ui() -> UISession:
+        """Build the image viewer UI.
+
+        Layout:
+          Menubar: File (Open, OpenDir, Exit) | View (ZoomIn, ZoomOut, Fit, Next, Prev)
+          Toolbar: Open | Prev | Next | - | Fit | + | image name label
+          Image panel: scrollable ASCII art rendering
+          Info panel: filename, dimensions, format, size
+          Statusbar: image position | zoom + dimensions
+        """
+        # -- Render image content --
+        var image_widgets: [WidgetNode] = []
+        if self.current_image != nil:
+            val img = self.current_image
+            # Determine render dimensions based on zoom
+            var render_w = self.view_width
+            var render_h = self.view_height
+            val zf = zoom_factor(self.zoom)
+            if zf > 0:
+                render_w = img.width * zf / 100
+                render_h = img.height * zf / 100
+            if render_w < 1:
+                render_w = 1
+            if render_h < 1:
+                render_h = 1
+            val ascii_lines = self._render_ascii(img, render_w, render_h)
+            # Apply scroll offset
+            var line_idx = 0
+            for line in ascii_lines:
+                if line_idx >= self.scroll_y:
+                    image_widgets = image_widgets.push(
+                        text_widget("img_line_{line_idx}", line)
+                    )
+                line_idx = line_idx + 1
+        else:
+            image_widgets = [
+                text_widget("img_empty_1", ""),
+                text_widget("img_empty_2", "  No image loaded."),
+                text_widget("img_empty_3", "  Use File > Open to load an image."),
+                text_widget("img_empty_4", "  Supported formats: PPM (P3), SBM"),
+                text_widget("img_empty_5", "")
+            ]
+
+        # -- Info panel content --
+        var info_widgets: [WidgetNode] = []
+        if self.current_image != nil:
+            val img = self.current_image
+            val filename = if self.current_path != nil: _basename(self.current_path) else: "unknown"
+            info_widgets = [
+                label("info_file", "File: {filename}"),
+                label("info_dims", "Size: {img.width} x {img.height}"),
+                label("info_fmt", "Format: {img.format}"),
+                label("info_pixels", "Pixels: {img.width * img.height}")
+            ]
+        else:
+            info_widgets = [
+                label("info_none", "No image")
+            ]
+
+        # -- Image name for toolbar --
+        val img_name = if self.current_path != nil: _basename(self.current_path) else: "(none)"
+
+        # -- Toolbar --
+        val toolbar = row("iv_toolbar", [
+            button("btn_open_tb", "Open", "btn_open"),
+            button("btn_prev_tb", "< Prev", "btn_prev"),
+            button("btn_next_tb", "Next >", "btn_next"),
+            button("btn_zout_tb", "-", "btn_zoom_out"),
+            button("btn_fit_tb", "Fit", "btn_fit"),
+            button("btn_zin_tb", "+", "btn_zoom_in"),
+            with_flex(label("iv_img_name", "  {img_name}"), 1)
+        ])
+
+        # -- Status bar text --
+        val position_text = if self.image_list.len() > 0:
+            "Image {self.current_index + 1} of {self.image_list.len()}"
+        else:
+            "No images"
+        val dims_text = if self.current_image != nil:
+            val img = self.current_image
+            "{zoom_name(self.zoom)} | {img.width}x{img.height}"
+        else:
+            ""
+
+        val root = column("iv_root", [
+            menubar("iv_menu", [
+                "File: Open | OpenDir | Exit",
+                "View: ZoomIn | ZoomOut | Fit | Next | Prev"
+            ]),
+            toolbar,
+            row("iv_body", [
+                with_flex(
+                    panel("iv_image_panel", "Image", image_widgets),
+                    3
+                ),
+                with_width(
+                    panel("iv_info_panel", "Info", info_widgets),
+                    22
+                )
+            ]),
+            statusbar("iv_status", position_text, dims_text)
+        ])
+
+        val title = if self.current_path != nil:
+            "Image Viewer - {_basename(self.current_path)}"
+        else:
+            "Image Viewer"
+        val tree = build_tree_with_title(root, title, "dark")
+        return UISession.new(tree)
+
+# =========================================================================
+# Color / Character Mapping Helpers
+# =========================================================================
+
+fn _rgb_to_ansi(r: i32, g: i32, b: i32) -> text:
+    """Map RGB to the nearest ANSI 256-color foreground escape sequence.
+
+    Uses the 6x6x6 color cube (indices 16-231) for approximate color.
+    """
+    val esc = "\u{001b}"
+    # Map 0-255 to 0-5 for the 6x6x6 cube
+    val ri = r * 5 / 255
+    val gi = g * 5 / 255
+    val bi = b * 5 / 255
+    val color_index = 16 + ri * 36 + gi * 6 + bi
+    return "{esc}[38;5;{color_index}m"
+
+fn _pixel_to_char(pixel: ImagePixel) -> text:
+    """Map pixel brightness to an ASCII density character.
+
+    Density ramp from dark to bright: ` .:-=+*#%@`
+    """
+    val brightness = (pixel.r * 299 + pixel.g * 587 + pixel.b * 114) / 1000
+    val chars = " .:-=+*#%@"
+    val idx = brightness * 9 / 255
+    val clamped = if idx < 0: 0 elif idx > 9: 9 else: idx
+    return chars.slice(clamped, clamped + 1)
+
+# =========================================================================
+# Text / Path Helpers
+# =========================================================================
+
+fn _split_lines(content: text) -> [text]:
+    """Split content into lines on newline characters."""
+    var lines: [text] = []
+    var current = ""
+    for ch in content:
+        if ch == "\n":
+            lines = lines.push(current)
+            current = ""
+        else:
+            current = "{current}{ch}"
+    if current != "":
+        lines = lines.push(current)
+    return lines
+
+fn _split_whitespace(s: text) -> [text]:
+    """Split a string on whitespace into non-empty tokens."""
+    var tokens: [text] = []
+    var current = ""
+    for ch in s:
+        if ch == " " or ch == "\t":
+            if current != "":
+                tokens = tokens.push(current)
+                current = ""
+        else:
+            current = "{current}{ch}"
+    if current != "":
+        tokens = tokens.push(current)
+    return tokens
+
+fn _parse_int(s: text) -> i32:
+    """Parse a decimal integer string. Returns 0 on failure."""
+    var result = 0
+    var negative = false
+    var started = false
+    for ch in s:
+        if ch == "-" and not started:
+            negative = true
+            started = true
+        elif ch >= "0" and ch <= "9":
+            val digit = match ch:
+                "0" => 0
+                "1" => 1
+                "2" => 2
+                "3" => 3
+                "4" => 4
+                "5" => 5
+                "6" => 6
+                "7" => 7
+                "8" => 8
+                "9" => 9
+                _   => 0
+            result = result * 10 + digit
+            started = true
+        else:
+            pass_dn
+    if negative:
+        return 0 - result
+    return result
+
+fn _join_path(base: text, name: text) -> text:
+    """Join a base path and filename."""
+    if base == "/":
+        return "/{name}"
+    return "{base}/{name}"
+
+fn _basename(path: text) -> text:
+    """Get the last component of a path."""
+    if path == "/" or path == "":
+        return ""
+    var last_slash = -1
+    var i = 0
+    for ch in path:
+        if ch == "/":
+            last_slash = i
+        i = i + 1
+    if last_slash < 0:
+        return path
+    return path.slice(last_slash + 1, path.len())

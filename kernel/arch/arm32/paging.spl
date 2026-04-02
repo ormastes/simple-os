@@ -1,0 +1,626 @@
+# ARM32 Paging — Short-Descriptor 2-Level Page Table Management
+#
+# Implements ARMv7-A short-descriptor page tables with 2 levels.
+#
+# Short-Descriptor Format (2-level):
+#   L1 (First-level table): 4096 entries * 4 bytes = 16KB
+#     - Each entry covers 1MB of virtual address space
+#     - Section entry (1MB mapping): [31:20] base, [11:10] AP, [3] C, [2] B, [1:0]=0b10
+#     - Page table entry (points to L2): [31:10] L2 base, [1:0]=0b01
+#     - Fault entry: [1:0]=0b00
+#
+#   L2 (Second-level table): 256 entries * 4 bytes = 1KB
+#     - Each entry covers 4KB (small page)
+#     - Small page (4KB): [31:12] base, [9] AP[2], [5:4] AP[1:0], [3] C, [2] B, [1]=1, [0] XN
+#     - Large page (64KB): [31:16] base, [15]=1, [1:0]=0b01
+#     - Fault entry: [1:0]=0b00
+#
+# Address decomposition (32-bit virtual):
+#   [31:20] L1 index   (12 bits, 4096 entries)
+#   [19:12] L2 index   (8 bits, 256 entries)
+#   [11:0]  Page offset (12 bits, 4KB)
+#
+# Key cp15 registers:
+#   TTBR0  (c2,c0,0) — Translation Table Base Register 0
+#   TTBR1  (c2,c0,1) — Translation Table Base Register 1
+#   TTBCR  (c2,c0,2) — Translation Table Base Control Register (TTBR0/TTBR1 split)
+#   DACR   (c3,c0,0) — Domain Access Control Register (16 domains, 2 bits each)
+#   SCTLR  (c1,c0,0) — System Control Register (MMU enable bit [0])
+
+use os.kernel.types.memory_types.{PhysAddr, VirtAddr, PageFrame, VmFlags}
+use os.kernel.boot.mmio.{mmio_read32, mmio_write32}
+use os.kernel.boot.ports.{BootOutputPort}
+use os.kernel.arch.arm32.cpu.{mcr_ttbr0, mcr_ttbcr, mcr_dacr, mcr_sctlr, mrc_sctlr, dsb, isb, tlbiall, tlbimva}
+use os.kernel.arch.arm32.console.{uart_writeln}
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+val PAGE_SIZE: u32 = 4096
+val SECTION_SIZE: u32 = 0x00100000            # 1MB section
+val L1_ENTRIES: u32 = 4096
+val L2_ENTRIES: u32 = 256
+val L1_TABLE_SIZE: u32 = 16384               # 4096 entries * 4 bytes = 16KB
+val L2_TABLE_SIZE: u32 = 1024                # 256 entries * 4 bytes = 1KB
+
+# ============================================================================
+# L1 (First-Level) Descriptor Bits
+# ============================================================================
+
+val L1_FAULT: u32 = 0x00000000               # Fault entry [1:0] = 0b00
+val L1_PAGE_TABLE: u32 = 0x00000001          # Page table pointer [1:0] = 0b01
+val L1_SECTION: u32 = 0x00000002             # 1MB section [1:0] = 0b10
+
+# Section entry bits
+val L1_SECTION_B: u32 = 1 << 2              # Bufferable
+val L1_SECTION_C: u32 = 1 << 3              # Cacheable
+val L1_SECTION_XN: u32 = 1 << 4             # Execute-Never
+val L1_SECTION_DOMAIN_SHIFT: u32 = 5        # Domain field [8:5]
+val L1_SECTION_AP0: u32 = 1 << 10           # AP[1:0] bit 0
+val L1_SECTION_AP1: u32 = 1 << 11           # AP[1:0] bit 1
+val L1_SECTION_TEX_SHIFT: u32 = 12          # TEX[2:0] field [14:12]
+val L1_SECTION_AP2: u32 = 1 << 15           # AP[2] (APX)
+val L1_SECTION_S: u32 = 1 << 16             # Shareable
+val L1_SECTION_NG: u32 = 1 << 17            # Not Global
+val L1_SECTION_NS: u32 = 1 << 19            # Non-Secure
+
+# L1 address masks
+val L1_SECTION_BASE_MASK: u32 = 0xFFF00000  # Section base address [31:20]
+val L1_PAGE_TABLE_BASE_MASK: u32 = 0xFFFFFC00  # L2 table base address [31:10]
+
+# ============================================================================
+# L2 (Second-Level) Small Page Descriptor Bits
+# ============================================================================
+
+val L2_FAULT: u32 = 0x00000000               # Fault entry [1:0] = 0b00
+val L2_SMALL_PAGE: u32 = 0x00000002          # Small page (4KB) [1] = 1
+
+# Small page bits
+val L2_PAGE_B: u32 = 1 << 2                 # Bufferable
+val L2_PAGE_C: u32 = 1 << 3                 # Cacheable
+val L2_PAGE_AP0: u32 = 1 << 4               # AP[1:0] bit 0
+val L2_PAGE_AP1: u32 = 1 << 5               # AP[1:0] bit 1
+val L2_PAGE_TEX_SHIFT: u32 = 6              # TEX[2:0] field [8:6]
+val L2_PAGE_AP2: u32 = 1 << 9               # AP[2] (APX)
+val L2_PAGE_S: u32 = 1 << 10                # Shareable
+val L2_PAGE_NG: u32 = 1 << 11               # Not Global
+val L2_PAGE_XN: u32 = 1 << 0                # Execute-Never (bit 0 for small page)
+
+# L2 address mask
+val L2_SMALL_PAGE_BASE_MASK: u32 = 0xFFFFF000  # Small page base [31:12]
+
+# ============================================================================
+# Access Permission Encodings (AP[2:0])
+# ============================================================================
+
+# AP[2] = APX bit, AP[1:0] = access permission
+# AP[2:0] = 0b001: PL1 RW, PL0 No access
+# AP[2:0] = 0b011: PL1 RW, PL0 RW
+# AP[2:0] = 0b101: PL1 RO, PL0 No access
+# AP[2:0] = 0b111: PL1 RO, PL0 RO
+
+# ============================================================================
+# DACR (Domain Access Control Register) Values
+# ============================================================================
+
+# All 16 domains set to Client (0b01) — access checks use AP bits
+val DACR_CLIENT_ALL: u32 = 0x55555555
+
+# Domain 0 as Manager (0b11) — no AP check (for early boot)
+val DACR_MANAGER_D0: u32 = 0x00000003
+
+# ============================================================================
+# SCTLR Bits
+# ============================================================================
+
+val SCTLR_M: u32 = 1 << 0                   # MMU enable
+val SCTLR_A: u32 = 1 << 1                   # Alignment check enable
+val SCTLR_C: u32 = 1 << 2                   # Data cache enable
+val SCTLR_I: u32 = 1 << 12                  # Instruction cache enable
+val SCTLR_AFE: u32 = 1 << 29                # Access Flag Enable
+
+# ============================================================================
+# Address Decomposition
+# ============================================================================
+
+fn _l1_index(virt: u32) -> u32:
+    """Extract L1 index from virtual address (bits 31:20)."""
+    (virt >> 20) & 0xFFF
+
+fn _l2_index(virt: u32) -> u32:
+    """Extract L2 index from virtual address (bits 19:12)."""
+    (virt >> 12) & 0xFF
+
+# ============================================================================
+# Page Table Entry Helpers
+# ============================================================================
+
+fn _read_l1_entry(table_phys: u32, index: u32) -> u32:
+    """Read an L1 page table entry. Uses physical address directly (MMU may be off)."""
+    mmio_read32((table_phys + (index * 4)) as u64)
+
+fn _write_l1_entry(table_phys: u32, index: u32, value: u32):
+    """Write an L1 page table entry."""
+    mmio_write32((table_phys + (index * 4)) as u64, value)
+
+fn _read_l2_entry(table_phys: u32, index: u32) -> u32:
+    """Read an L2 page table entry."""
+    mmio_read32((table_phys + (index * 4)) as u64)
+
+fn _write_l2_entry(table_phys: u32, index: u32, value: u32):
+    """Write an L2 page table entry."""
+    mmio_write32((table_phys + (index * 4)) as u64, value)
+
+fn _l1_is_fault(entry: u32) -> bool:
+    """Check if an L1 entry is a fault (unmapped)."""
+    (entry & 0x3) == 0
+
+fn _l1_is_section(entry: u32) -> bool:
+    """Check if an L1 entry is a 1MB section mapping."""
+    (entry & 0x3) == 2
+
+fn _l1_is_page_table(entry: u32) -> bool:
+    """Check if an L1 entry points to an L2 page table."""
+    (entry & 0x3) == 1
+
+fn _l2_is_fault(entry: u32) -> bool:
+    """Check if an L2 entry is a fault (unmapped)."""
+    (entry & 0x3) == 0
+
+fn _flags_to_section_bits(flags: VmFlags) -> u32:
+    """Convert VmFlags to ARM32 L1 section descriptor bits.
+
+    Maps generic flags to ARMv7 section attributes:
+    - present -> L1_SECTION
+    - writable + kernel -> AP[2:0] = 0b001 (PL1 RW)
+    - !writable + kernel -> AP[2:0] = 0b101 (PL1 RO)
+    - writable + user -> AP[2:0] = 0b011 (PL1/PL0 RW)
+    - !writable + user -> AP[2:0] = 0b111 (PL1/PL0 RO)
+    - cache_disable -> no C/B bits (Device memory)
+    - !cache_disable -> C + B + TEX[0] (Write-Back, Write-Allocate)
+    - no_execute -> XN bit
+    """
+    var bits: u32 = L1_SECTION | L1_SECTION_S
+
+    # Memory type
+    if flags.cache_disable():
+        # Device / Strongly-ordered: no C, no B, TEX=0b000
+        pass_do_nothing
+    else:
+        # Normal memory: C=1, B=1, TEX=0b001 (Write-Back, Write-Allocate)
+        bits = bits | L1_SECTION_C | L1_SECTION_B | (1 << L1_SECTION_TEX_SHIFT)
+
+    # Access permissions
+    if flags.user():
+        if flags.writable():
+            # AP[2:0] = 0b011: PL1 RW, PL0 RW
+            bits = bits | L1_SECTION_AP0 | L1_SECTION_AP1
+        else:
+            # AP[2:0] = 0b111: PL1 RO, PL0 RO
+            bits = bits | L1_SECTION_AP0 | L1_SECTION_AP1 | L1_SECTION_AP2
+    else:
+        if flags.writable():
+            # AP[2:0] = 0b001: PL1 RW, PL0 No access
+            bits = bits | L1_SECTION_AP0
+        else:
+            # AP[2:0] = 0b101: PL1 RO, PL0 No access
+            bits = bits | L1_SECTION_AP0 | L1_SECTION_AP2
+
+    # Execute-Never
+    if flags.no_execute():
+        bits = bits | L1_SECTION_XN
+
+    bits
+
+fn _flags_to_page_bits(flags: VmFlags) -> u32:
+    """Convert VmFlags to ARM32 L2 small page descriptor bits.
+
+    Maps generic flags to ARMv7 small page attributes.
+    """
+    var bits: u32 = L2_SMALL_PAGE | L2_PAGE_S
+
+    # Memory type
+    if flags.cache_disable():
+        # Device / Strongly-ordered: no C, no B, TEX=0b000
+        pass_do_nothing
+    else:
+        # Normal memory: C=1, B=1, TEX=0b001 (Write-Back, Write-Allocate)
+        bits = bits | L2_PAGE_C | L2_PAGE_B | (1 << L2_PAGE_TEX_SHIFT)
+
+    # Access permissions
+    if flags.user():
+        if flags.writable():
+            # AP[2:0] = 0b011: PL1 RW, PL0 RW
+            bits = bits | L2_PAGE_AP0 | L2_PAGE_AP1
+        else:
+            # AP[2:0] = 0b111: PL1 RO, PL0 RO
+            bits = bits | L2_PAGE_AP0 | L2_PAGE_AP1 | L2_PAGE_AP2
+    else:
+        if flags.writable():
+            # AP[2:0] = 0b001: PL1 RW, PL0 No access
+            bits = bits | L2_PAGE_AP0
+        else:
+            # AP[2:0] = 0b101: PL1 RO, PL0 No access
+            bits = bits | L2_PAGE_AP0 | L2_PAGE_AP2
+
+    # Execute-Never
+    if flags.no_execute():
+        bits = bits | L2_PAGE_XN
+
+    bits
+
+# ============================================================================
+# Global Paging State
+# ============================================================================
+
+var g_root_table_phys: u32 = 0   # Physical address of L1 table (16KB aligned)
+
+# ============================================================================
+# Simple Page Allocator (bump allocator for page tables)
+# ============================================================================
+
+# During early boot we use a simple bump allocator for page table pages.
+# The real PMM takes over after full initialization.
+var g_page_alloc_next: u32 = 0
+var g_page_alloc_end: u32 = 0
+
+fn _early_alloc_l1_table() -> u32:
+    """Allocate a zeroed 16KB L1 page table from the early bump allocator.
+
+    L1 table must be 16KB aligned (14-bit aligned).
+    Returns physical address of the table, or 0 on failure.
+    """
+    if g_page_alloc_next == 0:
+        return 0
+
+    # Align up to 16KB boundary
+    val aligned = (g_page_alloc_next + 0x3FFF) & ~0x3FFF
+    if aligned + L1_TABLE_SIZE > g_page_alloc_end:
+        uart_writeln("[PAGING] FATAL: Early page allocator exhausted (L1)")
+        return 0
+
+    g_page_alloc_next = aligned + L1_TABLE_SIZE
+
+    # Zero the table
+    var i: u32 = 0
+    while i < L1_ENTRIES:
+        _write_l1_entry(aligned, i, 0)
+        i = i + 1
+
+    aligned
+
+fn _early_alloc_l2_table() -> u32:
+    """Allocate a zeroed 1KB L2 page table from the early bump allocator.
+
+    L2 table must be 1KB aligned (10-bit aligned).
+    Returns physical address of the table, or 0 on failure.
+    """
+    if g_page_alloc_next == 0:
+        return 0
+
+    # Align up to 1KB boundary
+    val aligned = (g_page_alloc_next + 0x3FF) & ~0x3FF
+    if aligned + L2_TABLE_SIZE > g_page_alloc_end:
+        uart_writeln("[PAGING] FATAL: Early page allocator exhausted (L2)")
+        return 0
+
+    g_page_alloc_next = aligned + L2_TABLE_SIZE
+
+    # Zero the table
+    var i: u32 = 0
+    while i < L2_ENTRIES:
+        _write_l2_entry(aligned, i, 0)
+        i = i + 1
+
+    aligned
+
+fn _init_early_allocator(boot_info: BootOutputPort):
+    """Initialize the early bump allocator from usable boot memory.
+
+    Uses the first usable memory region after the kernel.
+    Reserves 1MB for page tables.
+    """
+    var i: u64 = 0
+    while i < boot_info.memory_map.len() as u64:
+        val region = boot_info.memory_map[i as i64]
+        if region.kind.? == MemoryRegionKind.Usable:
+            g_page_alloc_next = region.base.addr as u32
+            # Reserve 1MB for early page tables
+            val alloc_size: u32 = 0x100000
+            if region.size < alloc_size as u64:
+                g_page_alloc_end = region.base.addr as u32 + region.size as u32
+            else:
+                g_page_alloc_end = region.base.addr as u32 + alloc_size
+            uart_writeln("[PAGING] Early allocator: 0x{g_page_alloc_next}..0x{g_page_alloc_end}")
+            return
+        i = i + 1
+
+    uart_writeln("[PAGING] WARNING: No usable memory for early allocator")
+
+# ============================================================================
+# Table Walk & Mapping
+# ============================================================================
+
+fn _ensure_l2_table(l1_index: u32) -> u32:
+    """Ensure the L1 entry at l1_index points to a valid L2 table.
+
+    If the entry is a fault, allocates a new L2 table.
+    If it's already a page table entry, returns the existing L2 base.
+    Returns the physical address of the L2 table, or 0 on failure.
+    """
+    val entry = _read_l1_entry(g_root_table_phys, l1_index)
+
+    if _l1_is_page_table(entry):
+        return entry & L1_PAGE_TABLE_BASE_MASK
+
+    if _l1_is_section(entry):
+        # Already a section mapping — cannot split to pages without unmapping
+        uart_writeln("[PAGING] WARNING: L1[{l1_index}] is section, cannot create L2")
+        return 0
+
+    # Fault entry — allocate new L2 table
+    val new_l2_phys = _early_alloc_l2_table()
+    if new_l2_phys == 0:
+        return 0
+
+    # Write L1 page table descriptor: L2 base | domain 0 | type=page table
+    val new_entry = (new_l2_phys & L1_PAGE_TABLE_BASE_MASK) | L1_PAGE_TABLE
+    _write_l1_entry(g_root_table_phys, l1_index, new_entry)
+
+    new_l2_phys
+
+# ============================================================================
+# Identity Mapping
+# ============================================================================
+
+fn _identity_map_section(virt: u32, flags: VmFlags):
+    """Identity map a 1MB section using an L1 section descriptor."""
+    val l1_idx = _l1_index(virt)
+    val section_bits = _flags_to_section_bits(flags)
+    val entry = (virt & L1_SECTION_BASE_MASK) | section_bits
+    _write_l1_entry(g_root_table_phys, l1_idx, entry)
+
+fn _identity_map_range(start: u32, end: u32, flags: VmFlags):
+    """Identity map a range of physical addresses using 1MB sections.
+
+    For simplicity during early boot, maps at 1MB section granularity.
+    """
+    var addr = start & ~(SECTION_SIZE - 1)  # Align down to 1MB boundary
+    while addr < end:
+        _identity_map_section(addr, flags)
+        addr = addr + SECTION_SIZE
+
+fn _identity_map_boot(boot_info: BootOutputPort):
+    """Create identity mappings for all boot memory regions.
+
+    Maps:
+    - Kernel region as RW (code + data)
+    - Usable RAM as RW
+    - Device MMIO as device memory (uncacheable)
+    - UART and GIC as device memory
+    """
+    var i: u64 = 0
+    while i < boot_info.memory_map.len() as u64:
+        val region = boot_info.memory_map[i as i64]
+        val base = region.base.addr as u32
+        val end = base + region.size as u32
+
+        match region.kind:
+            MemoryRegionKind.Kernel:
+                _identity_map_range(base, end, VmFlags.kernel_rw())
+            MemoryRegionKind.Usable:
+                _identity_map_range(base, end, VmFlags.kernel_rw())
+            MemoryRegionKind.Reserved:
+                _identity_map_range(base, end, VmFlags.mmio())
+            _:
+                _identity_map_range(base, end, VmFlags.kernel_rw())
+
+        i = i + 1
+
+    # Explicitly map UART and GIC device regions
+    _identity_map_range(0x08000000, 0x08100000, VmFlags.mmio())  # GIC (1MB section)
+    _identity_map_range(0x09000000, 0x09100000, VmFlags.mmio())  # PL011 UART (1MB section)
+
+    uart_writeln("[PAGING] Identity mapping complete (1MB sections)")
+
+# ============================================================================
+# Internal Map/Unmap (4KB page granularity)
+# ============================================================================
+
+fn _map_page_internal(virt: u32, phys: u32, flags: VmFlags) -> bool:
+    """Map a single 4KB page: virt -> phys with given flags.
+
+    Walks L1 -> L2, creating L2 table as needed.
+    Writes the final L2 small page descriptor.
+    """
+    val l1_idx = _l1_index(virt)
+    val l2_idx = _l2_index(virt)
+
+    # Ensure L2 table exists
+    val l2_phys = _ensure_l2_table(l1_idx)
+    if l2_phys == 0:
+        return false
+
+    # Write L2 small page descriptor
+    val page_bits = _flags_to_page_bits(flags)
+    val entry = (phys & L2_SMALL_PAGE_BASE_MASK) | page_bits
+    _write_l2_entry(l2_phys, l2_idx, entry)
+
+    true
+
+# ============================================================================
+# Arm32Paging — HAL-Compatible Paging Interface
+# ============================================================================
+
+struct Arm32Paging:
+    """ARM32 short-descriptor 2-level paging (1MB sections / 4KB pages).
+
+    Wraps the page table operations behind a HAL-compatible interface.
+    The kernel's portable memory layer dispatches through this struct
+    for all paging operations.
+
+    Key differences from ARM64:
+    - 2-level instead of 4-level
+    - L1 table is 16KB (largest of all arches)
+    - Short-descriptor format (32-bit entries)
+    - Domain Access Control (DACR) — unique to ARM32
+    """
+    pass_dn
+
+impl Arm32Paging:
+    fn init(boot_info: BootOutputPort):
+        """Initialize ARM32 short-descriptor paging.
+
+        Steps:
+        1. Initialize early page allocator
+        2. Set TTBCR for TTBR0-only mapping (N=0, full 4GB via TTBR0)
+        3. Set DACR — Domain 0 as Client (use AP bits for access control)
+        4. Allocate L1 root table (16KB aligned)
+        5. Identity-map boot memory regions using 1MB sections
+        6. Set TTBR0 to root table
+        7. Invalidate TLB and enable MMU via SCTLR
+        """
+        uart_writeln("[PAGING] Initializing ARM32 2-level page tables...")
+
+        # Step 1: Init early allocator
+        _init_early_allocator(boot_info)
+
+        # Step 2: Configure TTBCR — N=0 means TTBR0 maps entire 4GB
+        mcr_ttbcr(0)
+        isb()
+        uart_writeln("[PAGING] TTBCR configured (N=0, TTBR0 maps full 4GB)")
+
+        # Step 3: Configure DACR — Domain 0 as Client (check AP bits)
+        mcr_dacr(DACR_CLIENT_ALL)
+        isb()
+        uart_writeln("[PAGING] DACR configured (all domains Client)")
+
+        # Step 4: Allocate root (L1) table — 16KB aligned
+        g_root_table_phys = _early_alloc_l1_table()
+        if g_root_table_phys == 0:
+            uart_writeln("[PAGING] FATAL: Could not allocate L1 table")
+            return
+        uart_writeln("[PAGING] L1 table at physical 0x{g_root_table_phys}")
+
+        # Step 5: Identity map using 1MB sections
+        _identity_map_boot(boot_info)
+
+        # Step 6: Set TTBR0
+        mcr_ttbr0(g_root_table_phys)
+        isb()
+        uart_writeln("[PAGING] TTBR0 set to 0x{g_root_table_phys}")
+
+        # Step 7: Invalidate TLB and enable MMU
+        tlbiall()
+        dsb()
+        isb()
+
+        val sctlr = mrc_sctlr()
+        mcr_sctlr(sctlr | SCTLR_M | SCTLR_C | SCTLR_I)
+        isb()
+        uart_writeln("[PAGING] MMU enabled (SCTLR.M=1, C=1, I=1)")
+
+        uart_writeln("[PAGING] ARM32 paging initialization complete")
+
+    fn map_page(virt: VirtAddr, phys: PhysAddr, flags: VmFlags) -> bool:
+        """Map a 4KB virtual page to a physical frame."""
+        val result = _map_page_internal(virt.addr as u32, phys.addr as u32, flags)
+        if result:
+            tlbimva((virt.addr as u32) & 0xFFFFF000)
+            dsb()
+            isb()
+        result
+
+    fn unmap_page(virt: VirtAddr) -> bool:
+        """Unmap a 4KB virtual page.
+
+        Walks to the L2 entry and clears it. Does NOT free physical page.
+        """
+        val vaddr = virt.addr as u32
+        val l1_idx = _l1_index(vaddr)
+        val l2_idx = _l2_index(vaddr)
+
+        val l1_entry = _read_l1_entry(g_root_table_phys, l1_idx)
+        if not _l1_is_page_table(l1_entry):
+            return false
+
+        val l2_phys = l1_entry & L1_PAGE_TABLE_BASE_MASK
+        val l2_entry = _read_l2_entry(l2_phys, l2_idx)
+        if _l2_is_fault(l2_entry):
+            return false
+
+        # Clear the L2 entry
+        _write_l2_entry(l2_phys, l2_idx, 0)
+
+        # Invalidate TLB
+        tlbimva(vaddr & 0xFFFFF000)
+        dsb()
+        isb()
+
+        true
+
+    fn translate(virt: VirtAddr) -> PhysAddr?:
+        """Translate virtual address to physical by walking page tables."""
+        val vaddr = virt.addr as u32
+        val l1_idx = _l1_index(vaddr)
+
+        val l1_entry = _read_l1_entry(g_root_table_phys, l1_idx)
+
+        if _l1_is_fault(l1_entry):
+            return nil
+
+        # Check for 1MB section mapping
+        if _l1_is_section(l1_entry):
+            val base = l1_entry & L1_SECTION_BASE_MASK
+            val offset = vaddr & 0x000FFFFF  # Lower 20 bits
+            return PhysAddr(addr: (base + offset) as u64)
+
+        # Page table entry — walk to L2
+        if _l1_is_page_table(l1_entry):
+            val l2_phys = l1_entry & L1_PAGE_TABLE_BASE_MASK
+            val l2_idx = _l2_index(vaddr)
+            val l2_entry = _read_l2_entry(l2_phys, l2_idx)
+
+            if _l2_is_fault(l2_entry):
+                return nil
+
+            val base = l2_entry & L2_SMALL_PAGE_BASE_MASK
+            val offset = vaddr & 0xFFF  # Lower 12 bits
+            return PhysAddr(addr: (base + offset) as u64)
+
+        nil
+
+    fn create_address_space() -> u64:
+        """Allocate a new L1 root page table for a process.
+
+        Returns the physical address of the new L1 table, or 0 on failure.
+        Copies kernel-space entries (upper half) from the kernel L1 table.
+        """
+        val new_l1_phys = _early_alloc_l1_table()
+        if new_l1_phys == 0:
+            return 0
+
+        # Copy kernel-space entries (upper half: indices 2048..4095 = 0x80000000+)
+        var i: u32 = 2048
+        while i < L1_ENTRIES:
+            val entry = _read_l1_entry(g_root_table_phys, i)
+            _write_l1_entry(new_l1_phys, i, entry)
+            i = i + 1
+
+        new_l1_phys as u64
+
+    fn switch_address_space(root_phys: u64):
+        """Switch to a different address space by loading TTBR0."""
+        mcr_ttbr0(root_phys as u32)
+        tlbiall()
+        dsb()
+        isb()
+
+    fn page_size() -> u64:
+        """Return page size in bytes (4KB for ARM32)."""
+        PAGE_SIZE as u64
+
+    fn address_levels() -> u64:
+        """Return number of page table levels (2 for ARM32 short-descriptor)."""
+        2

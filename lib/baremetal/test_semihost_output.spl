@@ -1,0 +1,120 @@
+# Semihosting Output Format Test
+#
+# This test demonstrates the output format that would be sent
+# over serial when using the semihosting protocol.
+#
+# Binary Protocol Format:
+#   [MAGIC:1][VERSION:1][OP:4][LENGTH:4][PAYLOAD:N]
+#
+# For interned print (SYS_WRITE_HANDLE):
+#   PAYLOAD = [HANDLE:4] + [PARAMS:8 each]
+
+fn to_hex(n: i32) -> text:
+    # Simple hex conversion for small numbers
+    val hex_chars = "0123456789ABCDEF"
+    if n < 16:
+        "{hex_chars[n]}"
+    elif n < 256:
+        "{hex_chars[n / 16]}{hex_chars[n % 16]}"
+    else:
+        # For larger numbers, just show decimal
+        "{n}"
+
+fn main():
+    print "=== Semihosting Output Format Test ==="
+    print ""
+
+    # Protocol constants
+    val PROTO_MAGIC: i32 = 0xAB
+    val PROTO_VERSION: i32 = 0x01
+
+    # Operation codes
+    val SYS_WRITE_HANDLE: i32 = 0x100
+    val SYS_WRITE_HANDLE_P1: i32 = 0x101
+    val SYS_WRITE_HANDLE_P2: i32 = 0x102
+
+    print "Protocol Header:"
+    print "  Magic: 0x{to_hex(PROTO_MAGIC)} (171 decimal)"
+    print "  Version: 0x{to_hex(PROTO_VERSION)} (1 decimal)"
+    print ""
+
+    # Simulate interned string handles
+    # In real usage, these come from compile-time string interning
+    val HANDLE_HELLO: i32 = 0x0001
+    val HANDLE_TESTING: i32 = 0x0002
+    val HANDLE_RESULT: i32 = 0x0003
+
+    print "Simulated String Table:"
+    print "  0x0001 -> \"Hello, World!\""
+    print "  0x0002 -> \"Testing value: {0}\""
+    print "  0x0003 -> \"Result: {0} + {1} = {2}\""
+    print ""
+
+    # Simulate semi_print(HANDLE_HELLO)
+    print "=== Message 1: semi_print(0x0001) ==="
+    print "Binary: AB 01 00 01 00 00 04 00 00 00 01 00 00 00"
+    print "  [AB]       Magic"
+    print "  [01]       Version"
+    print "  [00 01 00 00] Op: SYS_WRITE_HANDLE ({SYS_WRITE_HANDLE})"
+    print "  [04 00 00 00] Length: 4 bytes"
+    print "  [01 00 00 00] Handle: 0x0001"
+    print "Reconstructed: \"Hello, World!\""
+    print ""
+
+    # Simulate semi_print1(HANDLE_TESTING, 42)
+    print "=== Message 2: semi_print1(0x0002, 42) ==="
+    print "Binary: AB 01 01 01 00 00 0C 00 00 00 02 00 00 00 2A 00 00 00 00 00 00 00"
+    print "  Op: SYS_WRITE_HANDLE_P1 ({SYS_WRITE_HANDLE_P1})"
+    print "  Handle: 0x0002"
+    print "  Param0: 42 (i64 little-endian)"
+    print "Reconstructed: \"Testing value: 42\""
+    print ""
+
+    # Test protocol output parsing
+    print "=== Test Protocol Handles ==="
+
+    val HANDLE_TEST_START: i32 = 0x7FFF0001
+    val HANDLE_TEST_PASS: i32 = 0x7FFF0002
+    val HANDLE_TEST_FAIL: i32 = 0x7FFF0003
+    val HANDLE_TEST_END: i32 = 0x7FFF0004
+
+    print "  HANDLE_TEST_START = {HANDLE_TEST_START}"
+    print "  HANDLE_TEST_PASS  = {HANDLE_TEST_PASS}"
+    print "  HANDLE_TEST_FAIL  = {HANDLE_TEST_FAIL}"
+    print "  HANDLE_TEST_END   = {HANDLE_TEST_END}"
+    print ""
+
+    print "Output when host reconstructs:"
+    print "  test_start()        -> [TEST START]"
+    print "  test_pass(name)     -> [PASS] <name>"
+    print "  test_fail(n, msg)   -> [FAIL] <name>: <msg>"
+    print "  test_end(5, 1)      -> [TEST END] passed=5 failed=1"
+    print ""
+
+    # Verify constants are correct
+    var passed = 0
+    var failed = 0
+
+    if PROTO_MAGIC == 171:
+        passed = passed + 1
+        print "[PASS] PROTO_MAGIC = 0xAB (171)"
+    else:
+        failed = failed + 1
+        print "[FAIL] PROTO_MAGIC"
+
+    if SYS_WRITE_HANDLE == 256:
+        passed = passed + 1
+        print "[PASS] SYS_WRITE_HANDLE = 0x100 (256)"
+    else:
+        failed = failed + 1
+        print "[FAIL] SYS_WRITE_HANDLE"
+
+    if HANDLE_TEST_START == 2147418113:
+        passed = passed + 1
+        print "[PASS] HANDLE_TEST_START = 0x7FFF0001"
+    else:
+        failed = failed + 1
+        print "[FAIL] HANDLE_TEST_START"
+
+    print ""
+    print "=== Results: {passed} passed, {failed} failed ==="

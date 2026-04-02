@@ -1,0 +1,124 @@
+# x86_32 Serial Console — COM1 via Port I/O
+#
+# Implements early serial output over x86 I/O ports.
+# COM1 at 0x3F8, 115200 baud, 8N1 configuration.
+#
+# This is the x86_32-specific console implementation.
+# Identical to x86_64 — serial port I/O is the same in 32-bit mode.
+
+# ============================================================================
+# Port I/O Extern Declarations
+# ============================================================================
+
+extern fn rt_port_outb(port: u16, value: u8)
+extern fn rt_port_inb(port: u16) -> u8
+
+# ============================================================================
+# COM1 Port Addresses
+# ============================================================================
+
+val COM1_BASE: u16 = 0x3F8
+val COM1_DATA: u16 = 0x3F8
+val COM1_IER: u16 = 0x3F9         # Interrupt Enable Register
+val COM1_FCR: u16 = 0x3FA         # FIFO Control Register
+val COM1_LCR: u16 = 0x3FB         # Line Control Register
+val COM1_MCR: u16 = 0x3FC         # Modem Control Register
+val COM1_LSR: u16 = 0x3FD         # Line Status Register
+
+# ============================================================================
+# X86_32Console
+# ============================================================================
+
+struct X86_32Console:
+    """x86_32 serial console via COM1 port I/O.
+
+    Provides early debug output before framebuffer or full terminal
+    drivers are available. Uses legacy x86 I/O port instructions
+    (in/out) at the standard COM1 address 0x3F8.
+    """
+    pass_dn
+
+var g_serial_ready: bool = false
+
+impl X86_32Console:
+    fn init():
+        """Initialize COM1 serial port at 115200 baud, 8N1."""
+        if g_serial_ready:
+            return
+
+        # Disable all interrupts
+        rt_port_outb(COM1_IER, 0x00)
+
+        # Enable DLAB (set baud rate divisor)
+        rt_port_outb(COM1_LCR, 0x80)
+
+        # Set divisor to 1 (115200 baud)
+        rt_port_outb(COM1_DATA, 0x01)    # Low byte
+        rt_port_outb(COM1_IER, 0x00)     # High byte
+
+        # 8 bits, no parity, one stop bit (8N1), clear DLAB
+        rt_port_outb(COM1_LCR, 0x03)
+
+        # Enable FIFO, clear, 14-byte threshold
+        rt_port_outb(COM1_FCR, 0xC7)
+
+        # RTS/DSR set, IRQs enabled
+        rt_port_outb(COM1_MCR, 0x0B)
+
+        # Loopback test
+        rt_port_outb(COM1_MCR, 0x1E)
+        rt_port_outb(COM1_DATA, 0xAE)
+
+        # Back to normal operation
+        rt_port_outb(COM1_MCR, 0x0F)
+
+        g_serial_ready = true
+
+    fn write_byte(byte: u8):
+        """Write one byte to COM1, blocking until transmit ready."""
+        # Wait until transmit holding register is empty
+        while (rt_port_inb(COM1_LSR) & 0x20) == 0:
+            pass_do_nothing
+        rt_port_outb(COM1_DATA, byte)
+
+    fn write(msg: text):
+        """Write string to serial console."""
+        if not g_serial_ready:
+            self.init()
+        for i in 0..msg.len():
+            val ch = msg.char_at(i)
+            self.write_byte(ch as u8)
+
+    fn writeln(msg: text):
+        """Write string followed by CR+LF to serial console."""
+        self.write(msg)
+        self.write_byte(0x0D)  # CR
+        self.write_byte(0x0A)  # LF
+
+    fn base_port() -> u16:
+        """Return the base I/O port address for this console."""
+        COM1_BASE
+
+# ============================================================================
+# Module-Level Convenience Functions
+# ============================================================================
+
+fn serial_init():
+    """Initialize COM1 serial port (module-level convenience)."""
+    var console = X86_32Console()
+    console.init()
+
+fn serial_write_byte(byte: u8):
+    """Write one byte to COM1 (module-level convenience)."""
+    val console = X86_32Console()
+    console.write_byte(byte)
+
+fn serial_write(msg: text):
+    """Write string to COM1 (module-level convenience)."""
+    val console = X86_32Console()
+    console.write(msg)
+
+fn serial_writeln(msg: text):
+    """Write string + newline to COM1 (module-level convenience)."""
+    val console = X86_32Console()
+    console.writeln(msg)

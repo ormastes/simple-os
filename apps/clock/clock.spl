@@ -1,0 +1,552 @@
+# Clock App — Timer, Stopwatch, and Alarms
+#
+# Provides a multi-tab clock utility with world clock display,
+# alarm management, countdown timer, and stopwatch with lap
+# tracking. Follows the Windows Clock layout and behavior.
+#
+# MDSOC: feature dimension, apps layer
+
+use common.ui.builder.{
+    column, row, panel, tabs, button, text_widget, label,
+    statusbar, build_tree_with_title,
+    with_flex
+}
+use common.ui.widget.{WidgetNode, UITree, UIEvent}
+use common.ui.session.{UISession}
+
+# =========================================================================
+# Clock Tab Enum
+# =========================================================================
+
+enum ClockTab:
+    """Active tab selection."""
+    Clock
+    Alarm
+    Timer
+    Stopwatch
+
+# =========================================================================
+# Alarm Entry
+# =========================================================================
+
+struct AlarmEntry:
+    """A single alarm definition."""
+    hour: i32
+    minute: i32
+    label_text: text
+    enabled: bool
+    days: text
+
+# =========================================================================
+# Timer State
+# =========================================================================
+
+struct TimerState:
+    """Countdown timer state."""
+    hours: i32
+    minutes: i32
+    seconds: i32
+    remaining_ms: i64
+    running: bool
+    label_text: text
+
+# =========================================================================
+# Stopwatch State
+# =========================================================================
+
+struct StopwatchState:
+    """Stopwatch with lap tracking."""
+    elapsed_ms: i64
+    running: bool
+    laps: [i64]
+
+# =========================================================================
+# Clock App
+# =========================================================================
+
+class ClockApp:
+    """Multi-function clock application.
+
+    Provides four modes: world clock display, alarm management,
+    countdown timer, and stopwatch with lap recording.
+    """
+    current_tab: ClockTab
+    current_time_text: text
+    current_date_text: text
+    timezone: text
+    use_24h: bool
+    alarms: [AlarmEntry]
+    timer: TimerState
+    stopwatch: StopwatchState
+    status_message: text
+
+impl ClockApp:
+
+    static fn new() -> ClockApp:
+        """Create a clock app in its initial state."""
+        ClockApp(
+            current_tab: ClockTab.Clock,
+            current_time_text: "00:00:00",
+            current_date_text: "2026-03-31",
+            timezone: "UTC",
+            use_24h: true,
+            alarms: [],
+            timer: TimerState(
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                remaining_ms: 0,
+                running: false,
+                label_text: "Timer"
+            ),
+            stopwatch: StopwatchState(
+                elapsed_ms: 0,
+                running: false,
+                laps: []
+            ),
+            status_message: "Ready"
+        )
+
+    # -- Clock ---------------------------------------------------------------
+
+    me update_time(hours: i32, minutes: i32, seconds: i32):
+        """Update the displayed clock time."""
+        self.current_time_text = self.format_time(hours, minutes, seconds)
+
+    fn format_time(h: i32, m: i32, s: i32) -> text:
+        """Format time respecting 12h/24h preference."""
+        if self.use_24h:
+            val hh = _pad_zero(h)
+            val mm = _pad_zero(m)
+            val ss = _pad_zero(s)
+            return "{hh}:{mm}:{ss}"
+        # 12-hour format
+        val period = if h >= 12: "PM" else: "AM"
+        var display_h = h % 12
+        if display_h == 0:
+            display_h = 12
+        val hh = _pad_zero(display_h)
+        val mm = _pad_zero(m)
+        val ss = _pad_zero(s)
+        "{hh}:{mm}:{ss} {period}"
+
+    me toggle_24h():
+        """Toggle between 24-hour and 12-hour display."""
+        self.use_24h = not self.use_24h
+        val mode = if self.use_24h: "24h" else: "12h"
+        self.status_message = "Switched to {mode} format"
+
+    # -- Alarm ---------------------------------------------------------------
+
+    me add_alarm(hour: i32, minute: i32, label_text: text):
+        """Add a new alarm entry."""
+        val entry = AlarmEntry(
+            hour: hour,
+            minute: minute,
+            label_text: label_text,
+            enabled: true,
+            days: "Daily"
+        )
+        self.alarms = self.alarms.push(entry)
+        self.status_message = "Alarm added: {label_text}"
+
+    me remove_alarm(index: i32):
+        """Remove an alarm by index."""
+        if index >= 0 and index < self.alarms.len():
+            var new_alarms: [AlarmEntry] = []
+            var i = 0
+            while i < self.alarms.len():
+                if i != index:
+                    new_alarms = new_alarms.push(self.alarms[i])
+                i = i + 1
+            self.alarms = new_alarms
+            self.status_message = "Alarm removed"
+
+    me toggle_alarm(index: i32):
+        """Enable or disable an alarm."""
+        if index >= 0 and index < self.alarms.len():
+            self.alarms[index].enabled = not self.alarms[index].enabled
+            val state = if self.alarms[index].enabled: "enabled" else: "disabled"
+            self.status_message = "Alarm {state}"
+
+    fn check_alarms(h: i32, m: i32) -> text?:
+        """Check if any enabled alarm matches the given time."""
+        for alarm in self.alarms:
+            if alarm.enabled and alarm.hour == h and alarm.minute == m:
+                return alarm.label_text
+        nil
+
+    # -- Timer ---------------------------------------------------------------
+
+    me timer_set(hours: i32, minutes: i32, seconds: i32):
+        """Set the countdown timer duration."""
+        self.timer.hours = hours
+        self.timer.minutes = minutes
+        self.timer.seconds = seconds
+        val total_ms: i64 = ((hours * 3600 + minutes * 60 + seconds) * 1000).to_i64()
+        self.timer.remaining_ms = total_ms
+        self.status_message = "Timer set"
+
+    me timer_start():
+        """Start or resume the countdown timer."""
+        if self.timer.remaining_ms > 0:
+            self.timer.running = true
+            self.status_message = "Timer running"
+
+    me timer_pause():
+        """Pause the countdown timer."""
+        self.timer.running = false
+        self.status_message = "Timer paused"
+
+    me timer_reset():
+        """Reset the timer to its configured duration."""
+        val total_ms: i64 = ((self.timer.hours * 3600 + self.timer.minutes * 60 + self.timer.seconds) * 1000).to_i64()
+        self.timer.remaining_ms = total_ms
+        self.timer.running = false
+        self.status_message = "Timer reset"
+
+    me timer_tick(delta_ms: i64):
+        """Advance the timer by the given delta. Stops at zero."""
+        if not self.timer.running:
+            return
+        self.timer.remaining_ms = self.timer.remaining_ms - delta_ms
+        if self.timer.remaining_ms <= 0:
+            self.timer.remaining_ms = 0
+            self.timer.running = false
+            self.status_message = "Timer finished!"
+
+    fn _format_timer() -> text:
+        """Format the remaining timer duration as HH:MM:SS."""
+        val total_s = (self.timer.remaining_ms / 1000).to_i32()
+        val h = total_s / 3600
+        val m = (total_s % 3600) / 60
+        val s = total_s % 60
+        val hh = _pad_zero(h)
+        val mm = _pad_zero(m)
+        val ss = _pad_zero(s)
+        "{hh}:{mm}:{ss}"
+
+    # -- Stopwatch -----------------------------------------------------------
+
+    me stopwatch_start():
+        """Start or resume the stopwatch."""
+        self.stopwatch.running = true
+        self.status_message = "Stopwatch running"
+
+    me stopwatch_pause():
+        """Pause the stopwatch."""
+        self.stopwatch.running = false
+        self.status_message = "Stopwatch paused"
+
+    me stopwatch_reset():
+        """Reset the stopwatch and clear laps."""
+        self.stopwatch.elapsed_ms = 0
+        self.stopwatch.running = false
+        self.stopwatch.laps = []
+        self.status_message = "Stopwatch reset"
+
+    me stopwatch_lap():
+        """Record a lap at the current elapsed time."""
+        if self.stopwatch.running:
+            self.stopwatch.laps = self.stopwatch.laps.push(self.stopwatch.elapsed_ms)
+            val lap_num = self.stopwatch.laps.len()
+            self.status_message = "Lap {lap_num} recorded"
+
+    me stopwatch_tick(delta_ms: i64):
+        """Advance the stopwatch by the given delta."""
+        if self.stopwatch.running:
+            self.stopwatch.elapsed_ms = self.stopwatch.elapsed_ms + delta_ms
+
+    fn _format_stopwatch() -> text:
+        """Format the stopwatch elapsed time."""
+        _format_ms(self.stopwatch.elapsed_ms)
+
+    # -- Tab -----------------------------------------------------------------
+
+    me select_tab(tab: ClockTab):
+        """Switch the active tab."""
+        self.current_tab = tab
+        val name = match tab:
+            ClockTab.Clock: "Clock"
+            ClockTab.Alarm: "Alarm"
+            ClockTab.Timer: "Timer"
+            ClockTab.Stopwatch: "Stopwatch"
+        self.status_message = "{name} tab"
+
+    # -- Input Handling ------------------------------------------------------
+
+    me handle_key(key: text):
+        """Map keyboard input to clock actions."""
+        match key:
+            "Tab" => self._cycle_tab()
+            "t" => self.toggle_24h()
+            " " => self._space_action()
+            "r" => self._reset_action()
+            "l" => self._lap_action()
+            "a" => self._add_default_alarm()
+            "d" => self._delete_last_alarm()
+            _ => pass_dn
+
+    me handle_action(action: text):
+        """Dispatch button action strings."""
+        match action:
+            "tab_clock" => self.select_tab(ClockTab.Clock)
+            "tab_alarm" => self.select_tab(ClockTab.Alarm)
+            "tab_timer" => self.select_tab(ClockTab.Timer)
+            "tab_stopwatch" => self.select_tab(ClockTab.Stopwatch)
+            "toggle_24h" => self.toggle_24h()
+            "add_alarm" => self._add_default_alarm()
+            "delete_alarm" => self._delete_last_alarm()
+            "timer_hour_up" => self._timer_adjust(3600)
+            "timer_hour_down" => self._timer_adjust(-3600)
+            "timer_min_up" => self._timer_adjust(60)
+            "timer_min_down" => self._timer_adjust(-60)
+            "timer_sec_up" => self._timer_adjust(1)
+            "timer_sec_down" => self._timer_adjust(-1)
+            "timer_start" => self.timer_start()
+            "timer_pause" => self.timer_pause()
+            "timer_reset" => self.timer_reset()
+            "sw_start" => self.stopwatch_start()
+            "sw_pause" => self.stopwatch_pause()
+            "sw_reset" => self.stopwatch_reset()
+            "sw_lap" => self.stopwatch_lap()
+            _ => pass_dn
+
+    # -- Internal helpers ----------------------------------------------------
+
+    me _cycle_tab():
+        """Cycle to the next tab."""
+        val next = match self.current_tab:
+            ClockTab.Clock: ClockTab.Alarm
+            ClockTab.Alarm: ClockTab.Timer
+            ClockTab.Timer: ClockTab.Stopwatch
+            ClockTab.Stopwatch: ClockTab.Clock
+        self.select_tab(next)
+
+    me _space_action():
+        """Space bar toggles start/pause for timer or stopwatch."""
+        match self.current_tab:
+            ClockTab.Timer:
+                if self.timer.running:
+                    self.timer_pause()
+                else:
+                    self.timer_start()
+            ClockTab.Stopwatch:
+                if self.stopwatch.running:
+                    self.stopwatch_pause()
+                else:
+                    self.stopwatch_start()
+            _ => pass_dn
+
+    me _reset_action():
+        """Reset the active timer or stopwatch."""
+        match self.current_tab:
+            ClockTab.Timer => self.timer_reset()
+            ClockTab.Stopwatch => self.stopwatch_reset()
+            _ => pass_dn
+
+    me _lap_action():
+        """Record a lap if on stopwatch tab."""
+        match self.current_tab:
+            ClockTab.Stopwatch => self.stopwatch_lap()
+            _ => pass_dn
+
+    me _add_default_alarm():
+        """Add a default alarm (07:00)."""
+        val count = self.alarms.len() + 1
+        self.add_alarm(7, 0, "Alarm {count}")
+
+    me _delete_last_alarm():
+        """Delete the last alarm in the list."""
+        if self.alarms.len() > 0:
+            self.remove_alarm(self.alarms.len() - 1)
+
+    me _timer_adjust(delta_seconds: i32):
+        """Adjust the timer set value by delta seconds."""
+        if self.timer.running:
+            return
+        var total = self.timer.hours * 3600 + self.timer.minutes * 60 + self.timer.seconds
+        total = total + delta_seconds
+        if total < 0:
+            total = 0
+        val h = total / 3600
+        val m = (total % 3600) / 60
+        val s = total % 60
+        self.timer_set(h, m, s)
+
+    # -- UI Construction -----------------------------------------------------
+
+    fn build_ui() -> UISession:
+        """Build the clock UI.
+
+        Layout:
+          Tab bar (Clock / Alarm / Timer / Stopwatch)
+          Content panel (varies by active tab)
+          Status bar
+        """
+        val tab_index = match self.current_tab:
+            ClockTab.Clock: 0
+            ClockTab.Alarm: 1
+            ClockTab.Timer: 2
+            ClockTab.Stopwatch: 3
+
+        val tab_names = ["Clock", "Alarm", "Timer", "Stopwatch"]
+
+        val content = match self.current_tab:
+            ClockTab.Clock: self._build_clock_panel()
+            ClockTab.Alarm: self._build_alarm_panel()
+            ClockTab.Timer: self._build_timer_panel()
+            ClockTab.Stopwatch: self._build_stopwatch_panel()
+
+        val tab_label = match self.current_tab:
+            ClockTab.Clock: "Clock"
+            ClockTab.Alarm: "Alarm"
+            ClockTab.Timer: "Timer"
+            ClockTab.Stopwatch: "Stopwatch"
+
+        val root = column("clock_root", [
+            tabs("clock_tabs", tab_names, tab_index),
+            with_flex(content, 1),
+            statusbar("clock_status",
+                self.status_message,
+                "{tab_label} | {self.timezone}"
+            )
+        ])
+
+        val tree = build_tree_with_title(root, "Clock", "dark")
+        UISession.new(tree)
+
+    # -- Tab Panels ----------------------------------------------------------
+
+    fn _build_clock_panel() -> WidgetNode:
+        """Build the world clock display panel."""
+        val mode_label = if self.use_24h: "24h" else: "12h"
+
+        panel("clock_panel", "World Clock", [
+            text_widget("clock_time_display", self.current_time_text),
+            label("clock_date_display", self.current_date_text),
+            row("clock_info_row", [
+                label("clock_tz_label", "Timezone: {self.timezone}"),
+                button("btn_toggle_24h", "Mode: {mode_label}", "toggle_24h")
+            ])
+        ])
+
+    fn _build_alarm_panel() -> WidgetNode:
+        """Build the alarm list panel."""
+        var alarm_widgets: [WidgetNode] = []
+
+        var idx = 0
+        while idx < self.alarms.len():
+            val alarm = self.alarms[idx]
+            val time_str = "{_pad_zero(alarm.hour)}:{_pad_zero(alarm.minute)}"
+            val state = if alarm.enabled: "[ON]" else: "[OFF]"
+            val alarm_row = row("alarm_row_{idx}", [
+                label("alarm_time_{idx}", "{state} {time_str}"),
+                label("alarm_label_{idx}", alarm.label_text),
+                label("alarm_days_{idx}", alarm.days)
+            ])
+            alarm_widgets = alarm_widgets.push(alarm_row)
+            idx = idx + 1
+
+        if self.alarms.len() == 0:
+            alarm_widgets = alarm_widgets.push(
+                label("alarm_empty", "No alarms set")
+            )
+
+        panel("alarm_panel", "Alarms", [
+            column("alarm_list", alarm_widgets),
+            row("alarm_actions", [
+                button("btn_add_alarm", "+ Add Alarm", "add_alarm"),
+                button("btn_del_alarm", "- Remove Last", "delete_alarm")
+            ])
+        ])
+
+    fn _build_timer_panel() -> WidgetNode:
+        """Build the countdown timer panel."""
+        val timer_display = self._format_timer()
+        val running_indicator = if self.timer.running: "Running" else: "Stopped"
+
+        panel("timer_panel", "Timer", [
+            text_widget("timer_display", timer_display),
+            label("timer_state_label", running_indicator),
+            # Set controls: hours / minutes / seconds with +/- buttons
+            row("timer_set_row", [
+                column("timer_h_col", [
+                    button("btn_h_up", "+", "timer_hour_up"),
+                    label("timer_h_label", "H: {_pad_zero(self.timer.hours)}"),
+                    button("btn_h_down", "-", "timer_hour_down")
+                ]),
+                column("timer_m_col", [
+                    button("btn_m_up", "+", "timer_min_up"),
+                    label("timer_m_label", "M: {_pad_zero(self.timer.minutes)}"),
+                    button("btn_m_down", "-", "timer_min_down")
+                ]),
+                column("timer_s_col", [
+                    button("btn_s_up", "+", "timer_sec_up"),
+                    label("timer_s_label", "S: {_pad_zero(self.timer.seconds)}"),
+                    button("btn_s_down", "-", "timer_sec_down")
+                ])
+            ]),
+            # Control buttons
+            row("timer_ctrl_row", [
+                button("btn_timer_start", "Start", "timer_start"),
+                button("btn_timer_pause", "Pause", "timer_pause"),
+                button("btn_timer_reset", "Reset", "timer_reset")
+            ])
+        ])
+
+    fn _build_stopwatch_panel() -> WidgetNode:
+        """Build the stopwatch panel with lap list."""
+        val sw_display = self._format_stopwatch()
+        val running_indicator = if self.stopwatch.running: "Running" else: "Stopped"
+
+        # Build lap list
+        var lap_widgets: [WidgetNode] = []
+        var lap_idx = 0
+        while lap_idx < self.stopwatch.laps.len():
+            val lap_num = lap_idx + 1
+            val lap_time = _format_ms(self.stopwatch.laps[lap_idx])
+            lap_widgets = lap_widgets.push(
+                label("lap_{lap_idx}", "Lap {lap_num}: {lap_time}")
+            )
+            lap_idx = lap_idx + 1
+
+        if self.stopwatch.laps.len() == 0:
+            lap_widgets = lap_widgets.push(
+                label("lap_empty", "No laps recorded")
+            )
+
+        panel("sw_panel", "Stopwatch", [
+            text_widget("sw_display", sw_display),
+            label("sw_state_label", running_indicator),
+            row("sw_ctrl_row", [
+                button("btn_sw_start", "Start", "sw_start"),
+                button("btn_sw_pause", "Pause", "sw_pause"),
+                button("btn_sw_reset", "Reset", "sw_reset"),
+                button("btn_sw_lap", "Lap", "sw_lap")
+            ]),
+            with_flex(panel("sw_laps_panel", "Laps", lap_widgets), 1)
+        ])
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn _pad_zero(n: i32) -> text:
+    """Pad a single-digit number with a leading zero."""
+    if n < 10:
+        return "0{n}"
+    "{n}"
+
+fn _format_ms(ms: i64) -> text:
+    """Format milliseconds as HH:MM:SS.mm."""
+    val total_s = (ms / 1000).to_i32()
+    val centis = ((ms % 1000) / 10).to_i32()
+    val h = total_s / 3600
+    val m = (total_s % 3600) / 60
+    val s = total_s % 60
+    val hh = _pad_zero(h)
+    val mm = _pad_zero(m)
+    val ss = _pad_zero(s)
+    val cc = _pad_zero(centis)
+    "{hh}:{mm}:{ss}.{cc}"

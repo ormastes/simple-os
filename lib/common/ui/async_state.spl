@@ -1,0 +1,102 @@
+# Async State Manager
+#
+# Thread-safe state management wrapper that dispatches events through
+# the UIEventBus channel instead of calling update_state directly.
+# This allows any thread or async task to trigger state updates by
+# sending events to the bus.
+#
+# Usage:
+#   val bus = new_event_bus()
+#   val async_state = new_async_state(initial_state, bus)
+#   dispatch(async_state, UIEvent.FocusNext)
+
+use common.ui.widget.{UIState, UITree, UIEvent, UIMode}
+use common.ui.state.{init_state, update_state}
+use common.ui.async_loop.{UIEventBus, send_event}
+
+# =========================================================================
+# AsyncUIState
+# =========================================================================
+
+struct AsyncUIState:
+    """State handle backed by a UIEventBus.
+
+    Instead of mutating state directly, all changes go through the
+    event bus so the async loop can process them in order.
+    """
+    state: UIState
+    event_bus: UIEventBus
+
+fn new_async_state(state: UIState, bus: UIEventBus) -> AsyncUIState:
+    """Create an async state manager from initial state and event bus."""
+    return AsyncUIState(
+        state: state,
+        event_bus: bus
+    )
+
+# =========================================================================
+# Dispatch — send events through the bus
+# =========================================================================
+
+fn dispatch(async_state: AsyncUIState, event: UIEvent):
+    """Send an event to the event bus for async processing.
+
+    The event will be picked up by the async main loop, which applies
+    update_state and queues a render. This is safe to call from any
+    thread.
+
+    Args:
+        async_state: The async state manager
+        event:       Event to dispatch
+    """
+    send_event(async_state.event_bus, event)
+
+# =========================================================================
+# Read access
+# =========================================================================
+
+fn get_current(async_state: AsyncUIState) -> UIState:
+    """Get the current state snapshot.
+
+    Note: this returns the state as of the last sync point. Events
+    dispatched but not yet processed by the loop may not be reflected.
+
+    Args:
+        async_state: The async state manager
+
+    Returns:
+        Current UIState snapshot
+    """
+    return async_state.state
+
+fn get_current_mode(async_state: AsyncUIState) -> text:
+    """Get the current mode name."""
+    return async_state.state.mode_name()
+
+fn get_focused_id(async_state: AsyncUIState) -> text:
+    """Get the currently focused widget ID."""
+    return async_state.state.focused_id
+
+# =========================================================================
+# Convenience dispatchers
+# =========================================================================
+
+fn dispatch_quit(async_state: AsyncUIState):
+    """Send a Quit event through the bus."""
+    dispatch(async_state, UIEvent.Quit)
+
+fn dispatch_key(async_state: AsyncUIState, key: text):
+    """Send a KeyPress event through the bus."""
+    dispatch(async_state, UIEvent.KeyPress(key: key))
+
+fn dispatch_action(async_state: AsyncUIState, name: text):
+    """Send an Action event through the bus."""
+    dispatch(async_state, UIEvent.Action(name: name))
+
+fn dispatch_focus_next(async_state: AsyncUIState):
+    """Send a FocusNext event through the bus."""
+    dispatch(async_state, UIEvent.FocusNext)
+
+fn dispatch_focus_prev(async_state: AsyncUIState):
+    """Send a FocusPrev event through the bus."""
+    dispatch(async_state, UIEvent.FocusPrev)

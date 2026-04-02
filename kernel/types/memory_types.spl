@@ -1,0 +1,73 @@
+# Memory Types — Entity Dimension
+#
+# Physical and virtual memory types used by boot, memory, and scheduler layers.
+
+@repr("C")
+struct PhysAddr:
+    """Physical memory address."""
+    addr: u64
+
+@repr("C")
+struct VirtAddr:
+    """Virtual memory address."""
+    addr: u64
+
+@repr("C")
+struct PageFrame:
+    """Physical page frame number (4KB aligned)."""
+    pfn: u64
+
+impl PageFrame:
+    fn to_phys_addr() -> PhysAddr:
+        PhysAddr(addr: self.pfn * 4096)
+
+    static fn from_phys_addr(pa: PhysAddr) -> PageFrame:
+        PageFrame(pfn: pa.addr / 4096)
+
+@repr("C")
+struct VmMap:
+    """Virtual memory mapping entry."""
+    virt: VirtAddr
+    phys: PhysAddr
+    size: u64
+    flags: VmFlags
+
+struct VmFlags:
+    """Page table entry flags as bitfield.
+    Bit 0: present, Bit 1: writable, Bit 2: user,
+    Bit 3: write_through, Bit 4: cache_disable, Bit 5: no_execute.
+    Uses u32 to avoid cross-module bool struct codegen bug."""
+    bits: u32
+
+val VM_PRESENT: u32 = 1
+val VM_WRITABLE: u32 = 2
+val VM_USER: u32 = 4
+val VM_WRITE_THROUGH: u32 = 8
+val VM_CACHE_DISABLE: u32 = 16
+val VM_NO_EXECUTE: u32 = 32
+
+impl VmFlags:
+    fn present() -> bool: (self.bits & VM_PRESENT) != 0
+    fn writable() -> bool: (self.bits & VM_WRITABLE) != 0
+    fn user() -> bool: (self.bits & VM_USER) != 0
+    fn write_through() -> bool: (self.bits & VM_WRITE_THROUGH) != 0
+    fn cache_disable() -> bool: (self.bits & VM_CACHE_DISABLE) != 0
+    fn no_execute() -> bool: (self.bits & VM_NO_EXECUTE) != 0
+
+    static fn kernel_rw() -> VmFlags:
+        VmFlags(bits: VM_PRESENT | VM_WRITABLE)
+
+    static fn kernel_ro() -> VmFlags:
+        VmFlags(bits: VM_PRESENT)
+
+    static fn kernel_rx() -> VmFlags:
+        VmFlags(bits: VM_PRESENT)
+
+    static fn user_rw() -> VmFlags:
+        VmFlags(bits: VM_PRESENT | VM_WRITABLE | VM_USER | VM_NO_EXECUTE)
+
+    static fn user_rx() -> VmFlags:
+        VmFlags(bits: VM_PRESENT | VM_USER)
+
+    static fn mmio() -> VmFlags:
+        VmFlags(bits: VM_PRESENT | VM_WRITABLE | VM_WRITE_THROUGH | VM_CACHE_DISABLE | VM_NO_EXECUTE)

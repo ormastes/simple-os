@@ -1,0 +1,252 @@
+# ARM32 CPU Primitives — ARMv7-A Coprocessor Register Access
+#
+# Wraps ARMv7-A coprocessor register operations via extern functions
+# (implemented in assembly or C runtime). ARM32 uses MRC/MCR cp15
+# coprocessor instructions instead of AArch64 MSR/MRS system registers.
+#
+# Key cp15 registers:
+#   MIDR      (c0,c0,0) — Main ID Register (CPU identification)
+#   MPIDR     (c0,c0,5) — Multiprocessor Affinity Register (CPU ID)
+#   SCTLR     (c1,c0,0) — System Control Register (MMU enable, caches)
+#   TTBR0     (c2,c0,0) — Translation Table Base Register 0
+#   TTBR1     (c2,c0,1) — Translation Table Base Register 1
+#   TTBCR     (c2,c0,2) — Translation Table Base Control Register
+#   DACR      (c3,c0,0) — Domain Access Control Register
+#   DFSR      (c5,c0,0) — Data Fault Status Register
+#   IFSR      (c5,c0,1) — Instruction Fault Status Register
+#   VBAR      (c12,c0,0) — Vector Base Address Register
+#   CONTEXTIDR(c13,c0,1) — Context ID Register (ASID)
+#
+# Interrupt control:
+#   CPSID i — disable IRQ (set I bit in CPSR)
+#   CPSIE i — enable IRQ (clear I bit in CPSR)
+#   CPSID f — disable FIQ
+#   CPSIE f — enable FIQ
+#
+# Memory barriers:
+#   DSB — Data Synchronization Barrier
+#   DMB — Data Memory Barrier
+#   ISB — Instruction Synchronization Barrier
+#
+# TLB operations:
+#   MCR p15,0,r0,c8,c7,0 — TLBIALL (Invalidate entire TLB)
+#   MCR p15,0,r0,c8,c7,1 — TLBIMVA (Invalidate TLB by MVA)
+
+# ============================================================================
+# ARMv7-A Coprocessor Register Access (extern — implemented in asm/C runtime)
+# ============================================================================
+
+extern fn rt_arm32_mrc_midr() -> u32
+extern fn rt_arm32_mrc_mpidr() -> u32
+extern fn rt_arm32_mrc_sctlr() -> u32
+extern fn rt_arm32_mcr_sctlr(val: u32)
+extern fn rt_arm32_mrc_ttbr0() -> u32
+extern fn rt_arm32_mcr_ttbr0(val: u32)
+extern fn rt_arm32_mrc_ttbr1() -> u32
+extern fn rt_arm32_mcr_ttbr1(val: u32)
+extern fn rt_arm32_mcr_ttbcr(val: u32)
+extern fn rt_arm32_mcr_dacr(val: u32)
+extern fn rt_arm32_mcr_vbar(val: u32)
+extern fn rt_arm32_mcr_tlbiall()
+extern fn rt_arm32_mcr_tlbimva(mva: u32)
+extern fn rt_arm32_isb()
+extern fn rt_arm32_dsb()
+extern fn rt_arm32_dmb()
+extern fn rt_arm32_wfi()
+extern fn rt_arm32_wfe()
+extern fn rt_arm32_cpsid_i()
+extern fn rt_arm32_cpsie_i()
+extern fn rt_arm32_cpsid_f()
+extern fn rt_arm32_cpsie_f()
+extern fn rt_arm32_cpsid_if()
+extern fn rt_arm32_cpsie_if()
+
+# ============================================================================
+# Coprocessor Register Wrapper Functions
+# ============================================================================
+
+fn mrc_midr() -> u32:
+    """Read MIDR — Main ID Register (CPU identification)."""
+    rt_arm32_mrc_midr()
+
+fn mrc_mpidr() -> u32:
+    """Read MPIDR — Multiprocessor Affinity Register.
+
+    Bits [7:0] = Aff0 (core ID within cluster).
+    """
+    rt_arm32_mrc_mpidr()
+
+fn mrc_sctlr() -> u32:
+    """Read SCTLR — System Control Register."""
+    rt_arm32_mrc_sctlr()
+
+fn mcr_sctlr(val: u32):
+    """Write SCTLR — System Control Register (MMU, caches, alignment)."""
+    rt_arm32_mcr_sctlr(val)
+
+fn mrc_ttbr0() -> u32:
+    """Read TTBR0 — Translation Table Base Register 0."""
+    rt_arm32_mrc_ttbr0()
+
+fn mcr_ttbr0(val: u32):
+    """Write TTBR0 — Translation Table Base Register 0."""
+    rt_arm32_mcr_ttbr0(val)
+
+fn mrc_ttbr1() -> u32:
+    """Read TTBR1 — Translation Table Base Register 1."""
+    rt_arm32_mrc_ttbr1()
+
+fn mcr_ttbr1(val: u32):
+    """Write TTBR1 — Translation Table Base Register 1."""
+    rt_arm32_mcr_ttbr1(val)
+
+fn mcr_ttbcr(val: u32):
+    """Write TTBCR — Translation Table Base Control Register.
+
+    Controls TTBR0/TTBR1 split (N field determines boundary).
+    N=0: TTBR0 maps entire 4GB space.
+    N>0: TTBR0 maps lower 2^(32-N) bytes, TTBR1 maps rest.
+    """
+    rt_arm32_mcr_ttbcr(val)
+
+fn mcr_dacr(val: u32):
+    """Write DACR — Domain Access Control Register.
+
+    16 domains, 2 bits each:
+    0b00 = No access (fault), 0b01 = Client (check AP),
+    0b10 = Reserved, 0b11 = Manager (no AP check).
+    """
+    rt_arm32_mcr_dacr(val)
+
+fn mcr_vbar(val: u32):
+    """Write VBAR — Vector Base Address Register (exception vectors).
+
+    Must be 32-byte aligned.
+    """
+    rt_arm32_mcr_vbar(val)
+
+fn tlbiall():
+    """Invalidate entire TLB (TLBIALL).
+
+    Must be followed by DSB + ISB to ensure completion.
+    """
+    rt_arm32_mcr_tlbiall()
+
+fn tlbimva(mva: u32):
+    """Invalidate TLB entry for a single Modified Virtual Address.
+
+    The address should include the ASID in bits [7:0].
+    Must be followed by DSB + ISB to ensure completion.
+    """
+    rt_arm32_mcr_tlbimva(mva)
+
+fn isb():
+    """Instruction Synchronization Barrier.
+
+    Ensures all previous instructions complete and pipeline is flushed
+    before subsequent instructions execute. Required after writing
+    cp15 registers that affect instruction execution.
+    """
+    rt_arm32_isb()
+
+fn dsb():
+    """Data Synchronization Barrier (full system).
+
+    Ensures all previous memory accesses complete before any
+    subsequent memory accesses. Required before TLB invalidation
+    and after page table modifications.
+    """
+    rt_arm32_dsb()
+
+fn dmb():
+    """Data Memory Barrier (full system).
+
+    Ensures ordering of memory accesses but doesn't wait for
+    completion. Lighter weight than DSB.
+    """
+    rt_arm32_dmb()
+
+fn wfi():
+    """Wait For Interrupt — halt CPU until interrupt fires."""
+    rt_arm32_wfi()
+
+fn wfe():
+    """Wait For Event — halt CPU until event fires."""
+    rt_arm32_wfe()
+
+fn cpsid_i():
+    """Disable IRQ interrupts (CPSID i — set I bit in CPSR)."""
+    rt_arm32_cpsid_i()
+
+fn cpsie_i():
+    """Enable IRQ interrupts (CPSIE i — clear I bit in CPSR)."""
+    rt_arm32_cpsie_i()
+
+fn cpsid_if():
+    """Disable both IRQ and FIQ interrupts (CPSID if)."""
+    rt_arm32_cpsid_if()
+
+fn cpsie_if():
+    """Enable both IRQ and FIQ interrupts (CPSIE if)."""
+    rt_arm32_cpsie_if()
+
+# ============================================================================
+# Arm32Cpu — HAL-Compatible CPU Interface
+# ============================================================================
+
+struct Arm32Cpu:
+    """ARM32 CPU primitives.
+
+    Provides architecture-specific CPU operations: coprocessor register
+    access, interrupt control, barriers, TLB management, CPU
+    identification. Uses MRC/MCR cp15 instead of AArch64 MSR/MRS.
+    """
+    pass_dn
+
+impl Arm32Cpu:
+    fn cpu_id() -> u64:
+        """Return current CPU core ID from MPIDR Aff0 field."""
+        (mrc_mpidr() & 0xFF) as u64
+
+    fn cpu_address_width() -> u64:
+        """Return virtual address width in bits (32 for ARMv7-A)."""
+        32
+
+    fn cpu_enable_interrupts():
+        """Enable IRQ and FIQ interrupts (CPSIE if)."""
+        cpsie_if()
+
+    fn cpu_disable_interrupts():
+        """Disable all maskable interrupts (CPSID if)."""
+        cpsid_if()
+
+    fn cpu_halt():
+        """Halt CPU until next interrupt (WFI)."""
+        wfi()
+
+    fn cpu_halt_loop():
+        """Disable interrupts and halt forever."""
+        cpsid_if()
+        while true:
+            wfi()
+
+    fn cpu_flush_tlb(vaddr: u64):
+        """Invalidate TLB entry for a single virtual address."""
+        tlbimva((vaddr & 0xFFFFF000) as u32)
+        dsb()
+        isb()
+
+    fn cpu_flush_tlb_all():
+        """Flush the entire TLB on the current CPU."""
+        tlbiall()
+        dsb()
+        isb()
+
+    fn cpu_read_page_table_base() -> u64:
+        """Read current page table base (TTBR0)."""
+        mrc_ttbr0() as u64
+
+    fn cpu_write_page_table_base(addr: u64):
+        """Write page table base (TTBR0)."""
+        mcr_ttbr0(addr as u32)
+        isb()

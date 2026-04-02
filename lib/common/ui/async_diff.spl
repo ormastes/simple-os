@@ -1,0 +1,39 @@
+# Async Diff Pipeline
+#
+# Connects tree diffing to the lifecycle event system. When a UI tree
+# is updated, this module computes the diff patches and emits the
+# corresponding lifecycle events through the registry.
+
+use common.ui.widget.{WidgetNode, UITree}
+use common.ui.widget_store.{WidgetStore}
+use common.ui.diff.{diff_trees, diff_trees_with}
+use common.ui.patch.{UIPatch}
+use common.ui.lifecycle.{LifecycleRegistry, emit_lifecycle_events}
+
+# =========================================================================
+# Async Tree Update
+# =========================================================================
+
+fn async_update_tree(old_tree: UITree, new_tree: UITree, registry: LifecycleRegistry) -> [UIPatch]:
+    """Diff two trees and emit lifecycle events for all changes.
+    Returns the patch list for the caller to apply to the backend."""
+    val patches = diff_trees(old_tree.root_node(), new_tree.root_node())
+    emit_lifecycle_events(registry, patches)
+    return patches
+
+fn async_update_nodes(old_root: WidgetNode, new_root: WidgetNode, registry: LifecycleRegistry) -> [UIPatch]:
+    """Diff two widget nodes and emit lifecycle events.
+    Convenience wrapper when working with nodes directly."""
+    val patches = diff_trees(old_root, new_root)
+    emit_lifecycle_events(registry, patches)
+    return patches
+
+# =========================================================================
+# Store-Aware Async Tree Update
+# =========================================================================
+
+fn async_update_tree_with(old_tree: UITree, new_tree: UITree, registry: LifecycleRegistry, store: WidgetStore) -> [UIPatch]:
+    """Diff two trees using a session-scoped store and emit lifecycle events."""
+    val patches = diff_trees_with(old_tree.root_node(), new_tree.root_node(), store)
+    emit_lifecycle_events(registry, patches)
+    return patches

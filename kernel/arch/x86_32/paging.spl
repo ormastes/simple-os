@@ -1,0 +1,425 @@
+# x86_32 Paging — 2-Level Page Table Management
+#
+# Implements x86 32-bit 2-level paging (Page Directory -> Page Table).
+# Handles virtual-to-physical mapping, address space creation,
+# kernel identity mapping, and TLB management.
+#
+# Page table entry format (x86_32, 4-byte entries):
+#   Bit 0:  Present
+#   Bit 1:  Read/Write
+#   Bit 2:  User/Supervisor
+#   Bit 3:  Write-Through (PWT)
+#   Bit 4:  Cache Disable (PCD)
+#   Bit 5:  Accessed
+#   Bit 6:  Dirty (PT only)
+#   Bit 7:  Page Size (1 = 4MB superpage in PD)
+#   Bits 12..31: Physical address (upper 20 bits, 4KB aligned)
+#
+# Address decomposition (32-bit virtual):
+#   [31:22] Page Directory index  (10 bits, 1024 entries)
+#   [21:12] Page Table index      (10 bits, 1024 entries)
+#   [11:0]  Page offset            (12 bits, 4KB)
+
+use os.kernel.types.memory_types.{PhysAddr, VirtAddr, PageFrame, VmFlags}
+use os.kernel.boot.mmio.{mmio_read32, mmio_write32}
+use os.kernel.memory.pmm.{PhysMemManager}
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+val PAGE_SIZE: u32 = 4096
+val ENTRIES_PER_TABLE: u32 = 1024
+val TABLE_SIZE: u32 = 4096          # 1024 entries * 4 bytes
+
+# Page table entry flag bits
+val PTE_PRESENT: u32 = 1 << 0
+val PTE_WRITABLE: u32 = 1 << 1
+val PTE_USER: u32 = 1 << 2
+val PTE_WRITE_THROUGH: u32 = 1 << 3
+val PTE_CACHE_DISABLE: u32 = 1 << 4
+val PTE_ACCESSED: u32 = 1 << 5
+val PTE_DIRTY: u32 = 1 << 6
+val PTE_HUGE_PAGE: u32 = 1 << 7     # 4MB superpage at PD level
+
+# Address mask to extract physical address from PTE (bits 12..31)
+val PTE_ADDR_MASK: u32 = 0xFFFFF000
+
+# Identity map range: first 4MB (minimum) or full address space
+val IDENTITY_MAP_END: u32 = 0x400000    # 4MB initial identity map
+
+# ============================================================================
+# Virtual Memory Manager (32-bit)
+# ============================================================================
+
+struct VirtMemManager32:
+    """2-level x86_32 page table manager.
+
+    Manages Page Directory for the kernel and per-process
+    address spaces. Allocates pages from the PMM for page tables.
+    """
+    pd_phys: u32            # Physical address of kernel Page Directory
+
+impl VirtMemManager32:
+    fn pd_address() -> u32:
+        """Get physical address of Page Directory (for CR3)."""
+        self.pd_phys
+
+# ============================================================================
+# Address Decomposition
+# ============================================================================
+
+fn _pd_index(virt: u32) -> u32:
+    """Extract Page Directory index from virtual address (bits 31:22)."""
+    (virt >> 22) & 0x3FF
+
+fn _pt_index(virt: u32) -> u32:
+    """Extract Page Table index from virtual address (bits 21:12)."""
+    (virt >> 12) & 0x3FF
+
+# ============================================================================
+# Page Table Entry Helpers
+# ============================================================================
+
+fn _flags_to_pte_bits(flags: VmFlags) -> u32:
+    """Convert VmFlags to x86_32 page table entry bits."""
+    var bits: u32 = 0
+
+    if flags.present:
+        bits = bits | PTE_PRESENT
+    if flags.writable:
+        bits = bits | PTE_WRITABLE
+    if flags.user:
+        bits = bits | PTE_USER
+    if flags.write_through:
+        bits = bits | PTE_WRITE_THROUGH
+    if flags.cache_disable:
+        bits = bits | PTE_CACHE_DISABLE
+    # Note: x86_32 has no NX bit without PAE
+
+    bits
+
+fn _read_pte(table_addr: u32, index: u32) -> u32:
+    """Read a page table entry (4 bytes)."""
+    mmio_read32((table_addr + (index * 4)) as u64)
+
+fn _write_pte(table_addr: u32, index: u32, value: u32):
+    """Write a page table entry (4 bytes)."""
+    mmio_write32((table_addr + (index * 4)) as u64, value)
+
+fn _pte_is_present(entry: u32) -> bool:
+    """Check if a PTE has the present bit set."""
+    (entry & PTE_PRESENT) != 0
+
+fn _pte_phys_addr(entry: u32) -> u32:
+    """Extract physical address from a PTE."""
+    entry & PTE_ADDR_MASK
+
+# ============================================================================
+# Global VMM Instance
+# ============================================================================
+
+var g_vmm: VirtMemManager32 = VirtMemManager32(
+    pd_phys: 0
+)
+
+# ============================================================================
+# PMM Interface (forward declarations)
+# ============================================================================
+
+extern fn pmm_alloc_page() -> PageFrame?
+extern fn pmm_free_page(frame: PageFrame)
+
+fn _alloc_table_page() -> u32:
+    """Allocate a zeroed page for a new page table.
+
+    Returns physical address of the new table, or 0 on failure.
+    """
+    val frame = pmm_alloc_page()
+    if val Some(f) = frame:
+        val phys = (f.pfn as u32) * PAGE_SIZE
+        # Zero the page table (1024 entries)
+        var i: u32 = 0
+        while i < ENTRIES_PER_TABLE:
+            _write_pte(phys, i, 0)
+            i = i + 1
+
+        return phys
+
+    # Allocation failed
+    0
+
+# ============================================================================
+# Page Table Walk & Mapping
+# ============================================================================
+
+fn _ensure_table_entry(pd_addr: u32, index: u32) -> u32:
+    """Ensure a PD entry points to a valid page table.
+
+    If the entry is not present, allocates a new page table.
+    Returns the physical address of the page table, or 0 on failure.
+    """
+    val entry = _read_pte(pd_addr, index)
+
+    if _pte_is_present(entry):
+        # Table exists, return its address
+        return _pte_phys_addr(entry)
+
+    # Allocate new page table
+    val new_table_phys = _alloc_table_page()
+    if new_table_phys == 0:
+        return 0  # Allocation failed
+
+    # Write PD entry: present + writable + user (permissive for intermediate tables)
+    val new_entry = new_table_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER
+    _write_pte(pd_addr, index, new_entry)
+
+    new_table_phys
+
+# ============================================================================
+# Forward declaration for serial debug
+# ============================================================================
+
+extern fn serial_println(msg: text)
+
+# ============================================================================
+# VMM Initialization
+# ============================================================================
+
+fn vmm_init(pmm_manager: PhysMemManager):
+    """Initialize virtual memory manager.
+
+    Creates kernel Page Directory, identity-maps low memory.
+    Does NOT switch CR3 yet -- caller should do that after all mappings.
+    """
+    serial_println("[VMM] Initializing 32-bit virtual memory manager...")
+
+    # Allocate Page Directory
+    val pd_phys = _alloc_table_page()
+    if pd_phys == 0:
+        serial_println("[VMM] FATAL: Could not allocate Page Directory")
+        return
+
+    g_vmm.pd_phys = pd_phys
+
+    serial_println("[VMM] Page Directory at physical 0x{pd_phys}")
+
+    # Identity-map first 4MB using 4MB superpage
+    serial_println("[VMM] Identity-mapping first 4MB...")
+    _identity_map_low_memory()
+
+    serial_println("[VMM] VMM initialization complete")
+
+fn _identity_map_low_memory():
+    """Identity-map first 4MB using a 4MB superpage.
+
+    Maps virtual 0x0..0x400000 to physical 0x0..0x400000.
+    Uses a single PD entry with the Page Size (PS) bit set for a
+    4MB superpage, avoiding the need for a page table.
+    """
+    val pd_addr = g_vmm.pd_phys
+
+    # PD entry 0: 4MB superpage at physical 0x0
+    # Present + Writable + Page Size (4MB)
+    val entry: u32 = 0x0 | PTE_PRESENT | PTE_WRITABLE | PTE_HUGE_PAGE
+    _write_pte(pd_addr, 0, entry)
+
+    serial_println("[VMM] Identity-mapped first 4MB with superpage")
+
+# ============================================================================
+# Page Mapping (4KB pages)
+# ============================================================================
+
+fn vmm_map_page(virt: VirtAddr, phys: PhysAddr, flags: VmFlags) -> bool:
+    """Map a single 4KB virtual page to a physical frame.
+
+    Walks the 2-level page table, creating the page table as needed.
+    Returns true on success, false on failure (e.g., out of memory).
+    """
+    val vaddr = virt.addr as u32
+    val paddr = phys.addr as u32
+
+    val pd_addr = g_vmm.pd_phys
+
+    # Ensure page table exists for this PD entry
+    val pt_addr = _ensure_table_entry(pd_addr, _pd_index(vaddr))
+    if pt_addr == 0:
+        return false
+
+    # Write the final PT entry
+    val pte_flags = _flags_to_pte_bits(flags)
+    val entry = (paddr & PTE_ADDR_MASK) | pte_flags
+    _write_pte(pt_addr, _pt_index(vaddr), entry)
+
+    # Invalidate TLB for this virtual address
+    _invlpg(vaddr)
+
+    true
+
+fn vmm_unmap_page(virt: VirtAddr) -> bool:
+    """Unmap a single 4KB virtual page.
+
+    Clears the page table entry and invalidates the TLB.
+    Does NOT free the physical page -- caller must do that.
+
+    Returns true if the page was mapped, false if it was not.
+    """
+    val vaddr = virt.addr as u32
+    val pd_addr = g_vmm.pd_phys
+
+    # Check PD entry
+    val pd_entry = _read_pte(pd_addr, _pd_index(vaddr))
+    if not _pte_is_present(pd_entry):
+        return false
+
+    val pt_addr = _pte_phys_addr(pd_entry)
+    val pt_entry = _read_pte(pt_addr, _pt_index(vaddr))
+    if not _pte_is_present(pt_entry):
+        return false
+
+    # Clear the entry
+    _write_pte(pt_addr, _pt_index(vaddr), 0)
+
+    # Invalidate TLB
+    _invlpg(vaddr)
+
+    true
+
+# ============================================================================
+# Address Space Management
+# ============================================================================
+
+fn vmm_create_address_space() -> u32:
+    """Create a new address space (Page Directory) for a process.
+
+    Allocates a fresh PD and copies the kernel mappings
+    (upper entries 768..1023, covering 3GB..4GB) from the kernel PD.
+    Returns the physical address of the new PD, or 0 on failure.
+    """
+    val new_pd_phys = _alloc_table_page()
+    if new_pd_phys == 0:
+        return 0
+
+    val kernel_pd = g_vmm.pd_phys
+
+    # Copy kernel-space entries (upper quarter: indices 768..1023)
+    # This maps the 3GB..4GB kernel region in every address space
+    var i: u32 = 768
+    while i < ENTRIES_PER_TABLE:
+        val entry = _read_pte(kernel_pd, i)
+        _write_pte(new_pd_phys, i, entry)
+        i = i + 1
+
+    new_pd_phys
+
+fn vmm_switch_address_space(pd_phys: u32):
+    """Switch to a different address space by loading CR3."""
+    _load_cr3(pd_phys)
+
+# ============================================================================
+# VMM Query Interface
+# ============================================================================
+
+fn vmm_get_manager() -> VirtMemManager32:
+    """Get reference to the global VMM."""
+    g_vmm
+
+fn vmm_translate(virt: VirtAddr) -> PhysAddr?:
+    """Translate virtual address to physical by walking page tables.
+
+    Returns nil if the address is not mapped.
+    """
+    val vaddr = virt.addr as u32
+    val pd_addr = g_vmm.pd_phys
+
+    val pd_entry = _read_pte(pd_addr, _pd_index(vaddr))
+    if not _pte_is_present(pd_entry):
+        return nil
+
+    # Check for 4MB superpage
+    if (pd_entry & PTE_HUGE_PAGE) != 0:
+        val base = _pte_phys_addr(pd_entry) & 0xFFC00000  # Upper 10 bits for 4MB alignment
+        val offset = vaddr & 0x3FFFFF  # Lower 22 bits
+        return PhysAddr(addr: (base + offset) as u64)
+
+    val pt_addr = _pte_phys_addr(pd_entry)
+    val pt_entry = _read_pte(pt_addr, _pt_index(vaddr))
+    if not _pte_is_present(pt_entry):
+        return nil
+
+    val base = _pte_phys_addr(pt_entry)
+    val offset = vaddr & 0xFFF  # Lower 12 bits
+    PhysAddr(addr: (base + offset) as u64)
+
+# ============================================================================
+# CPU Primitives (inline assembly)
+# ============================================================================
+
+fn _invlpg(vaddr: u32):
+    """Invalidate TLB entry for a virtual address."""
+    unsafe:
+        asm volatile:
+            "invlpg [{addr}]"
+            in(reg) vaddr
+
+fn _load_cr3(pd_phys: u32):
+    """Load CR3 register with a new Page Directory physical address."""
+    unsafe:
+        asm volatile:
+            "mov cr3, {pd}"
+            in(reg) pd_phys
+
+fn _read_cr3() -> u32:
+    """Read current CR3 register value."""
+    var result: u32 = 0
+    unsafe:
+        asm volatile:
+            "mov {out}, cr3"
+            out(reg) result
+    result
+
+# ============================================================================
+# X86_32Paging — HAL-Compatible Paging Interface
+# ============================================================================
+
+struct X86_32Paging:
+    """x86_32 2-level paging implementation.
+
+    Wraps the VirtMemManager32 and page table operations behind
+    a HAL-compatible interface. The kernel's portable memory layer
+    dispatches through this struct for all paging operations.
+    """
+    pass_dn
+
+impl X86_32Paging:
+    fn init(pmm_manager: PhysMemManager):
+        """Initialize x86_32 paging (Page Directory, identity map)."""
+        vmm_init(pmm_manager)
+
+    fn map_page(virt: VirtAddr, phys: PhysAddr, flags: VmFlags) -> bool:
+        """Map a 4KB virtual page to a physical frame."""
+        vmm_map_page(virt, phys, flags)
+
+    fn unmap_page(virt: VirtAddr) -> bool:
+        """Unmap a 4KB virtual page."""
+        vmm_unmap_page(virt)
+
+    fn translate(virt: VirtAddr) -> PhysAddr?:
+        """Translate virtual to physical address."""
+        vmm_translate(virt)
+
+    fn create_address_space() -> u32:
+        """Create a new Page Directory for a process."""
+        vmm_create_address_space()
+
+    fn switch_address_space(root_phys: u32):
+        """Switch to a different address space (load CR3)."""
+        vmm_switch_address_space(root_phys)
+
+    fn page_size() -> u32:
+        """Return page size in bytes (4KB for x86_32)."""
+        PAGE_SIZE
+
+    fn address_levels() -> u32:
+        """Return number of page table levels (2 for x86_32)."""
+        2

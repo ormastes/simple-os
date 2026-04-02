@@ -1,0 +1,52 @@
+# ARM64 (AArch64) HAL Implementation — Module Root
+#
+# Aggregates all ARM64-specific HAL implementations.
+# Each submodule wraps architecture-specific primitives behind
+# a HAL-compatible interface for the kernel's portable layers.
+#
+# Target: QEMU virt machine (aarch64)
+# - PL011 UART at 0x09000000
+# - GICv2 at 0x08000000 / 0x08010000
+# - RAM at 0x40000000
+# - ARM Generic Timer
+
+use os.kernel.arch.arm64.console.{Arm64Console}
+use os.kernel.arch.arm64.boot.{Arm64Boot}
+use os.kernel.arch.arm64.cpu.{Arm64Cpu}
+use os.kernel.arch.arm64.paging.{Arm64Paging}
+use os.kernel.arch.arm64.interrupt.{Arm64Interrupt}
+use os.kernel.arch.arm64.timer.{Arm64Timer}
+use os.kernel.arch.arm64.context.{Arm64ContextSwitch}
+
+struct Arm64Hal:
+    """ARM64 (AArch64) Hardware Abstraction Layer.
+
+    Composes all ARM64-specific HAL subsystems into a single aggregate.
+    The kernel portable layer dispatches through this struct to access
+    architecture-specific functionality.
+
+    Targets QEMU virt machine with:
+    - PL011 UART serial console
+    - GICv2 interrupt controller
+    - 4-level page tables (4KB granule, 48-bit VA)
+    - ARM Generic Timer
+    """
+    console: Arm64Console
+    boot: Arm64Boot
+    cpu: Arm64Cpu
+    paging: Arm64Paging
+    interrupt: Arm64Interrupt
+    timer: Arm64Timer
+    context: Arm64ContextSwitch
+
+fn create_arm64_hal() -> Arm64Hal:
+    """Create ARM64 HAL with default configuration."""
+    Arm64Hal(
+        console: Arm64Console(),
+        boot: Arm64Boot(),
+        cpu: Arm64Cpu(),
+        paging: Arm64Paging(),
+        interrupt: Arm64Interrupt(),
+        timer: Arm64Timer(),
+        context: Arm64ContextSwitch()
+    )

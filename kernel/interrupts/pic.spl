@@ -1,0 +1,100 @@
+# Legacy 8259 PIC Disable — Interrupts Layer
+#
+# Disables the legacy 8259 Programmable Interrupt Controller.
+# Required before using the APIC for interrupt routing.
+#
+# PIC1 (master): command port 0x20, data port 0x21
+# PIC2 (slave):  command port 0xA0, data port 0xA1
+
+use std.baremetal.x86.io.{outb, io_wait}
+
+# --- PIC Port Addresses ---
+
+val PIC1_CMD: i32   = 0x20
+val PIC1_DATA: i32  = 0x21
+val PIC2_CMD: i32   = 0xA0
+val PIC2_DATA: i32  = 0xA1
+
+# --- ICW (Initialization Command Words) ---
+
+val ICW1_INIT: i32  = 0x10    # ICW1: begin initialization sequence
+val ICW1_ICW4: i32  = 0x01    # ICW1: ICW4 needed
+val ICW4_8086: i32  = 0x01    # ICW4: 8086/88 mode
+
+# --- Public API ---
+
+fn pic_disable():
+    """Fully disable the legacy 8259 PIC by masking all IRQs.
+
+    Steps:
+    1. Remap PIC to vectors 0x20-0x2F (to avoid conflicts with CPU exceptions)
+    2. Mask all 16 IRQ lines on both chips
+
+    We remap first because some hardware may still trigger PIC interrupts
+    during the transition to APIC, and we don't want them hitting exception
+    vectors 0-15."""
+
+    # Remap PIC to safe vectors (0x20-0x2F) before masking
+    _pic_remap(0x20, 0x28)
+
+    # Mask all IRQs on both PICs (0xFF = all bits set = all masked)
+    outb(PIC1_DATA, 0xFF)
+    outb(PIC2_DATA, 0xFF)
+
+fn pic_mask_all():
+    """Mask all IRQs without remapping. Quick disable."""
+    outb(PIC1_DATA, 0xFF)
+    outb(PIC2_DATA, 0xFF)
+
+# --- Internal Helpers ---
+
+fn _pic_remap(offset1: i32, offset2: i32):
+    """Remap the PIC interrupt vectors.
+
+    offset1: vector offset for IRQ 0-7 (master PIC)
+    offset2: vector offset for IRQ 8-15 (slave PIC)
+
+    Standard remap is offset1=0x20, offset2=0x28 to move IRQs
+    out of the CPU exception range (vectors 0-31)."""
+
+    # Save existing masks
+    var mask1: i32 = 0
+    var mask2: i32 = 0
+    asm """
+        in al, 0x21
+        movzx eax, al
+        mov {mask1}, eax
+    """
+    asm """
+        in al, 0xA1
+        movzx eax, al
+        mov {mask2}, eax
+    """
+
+    # ICW1: Start initialization (cascade mode, ICW4 needed)
+    outb(PIC1_CMD, ICW1_INIT | ICW1_ICW4)
+    io_wait()
+    outb(PIC2_CMD, ICW1_INIT | ICW1_ICW4)
+    io_wait()
+
+    # ICW2: Set vector offsets
+    outb(PIC1_DATA, offset1)
+    io_wait()
+    outb(PIC2_DATA, offset2)
+    io_wait()
+
+    # ICW3: Tell master about slave on IRQ2, tell slave its cascade identity
+    outb(PIC1_DATA, 0x04)    # Master: slave on IRQ2 (bit 2)
+    io_wait()
+    outb(PIC2_DATA, 0x02)    # Slave: cascade identity 2
+    io_wait()
+
+    # ICW4: 8086 mode
+    outb(PIC1_DATA, ICW4_8086)
+    io_wait()
+    outb(PIC2_DATA, ICW4_8086)
+    io_wait()
+
+    # Restore saved masks
+    outb(PIC1_DATA, mask1)
+    outb(PIC2_DATA, mask2)

@@ -1,0 +1,412 @@
+# x86_64 Limine Boot Protocol — Boot Layer
+#
+# Parses Limine boot info (memory map, framebuffer, RSDP, HHDM,
+# kernel address) and produces a BootOutputPort for the memory layer.
+#
+# Limine protocol reference:
+#   https://github.com/limine-bootloader/limine/blob/trunk/PROTOCOL.md
+#
+# This is x86_64-specific because Limine structures and request layout
+# are tied to the x86_64 Limine bootloader.
+
+use os.kernel.types.memory_types.{PhysAddr, VirtAddr}
+use os.kernel.boot.ports.{BootOutputPort, BootMemoryRegion, FramebufferInfo, MemoryRegionKind}
+use os.kernel.boot.mmio.{mmio_read64, mmio_read32, mmio_write8, mmio_read8}
+use os.kernel.arch.arch_context.{Architecture}
+use os.kernel.arch.x86_64.console.{serial_writeln}
+
+# ============================================================================
+# Limine Magic Numbers
+# ============================================================================
+
+val LIMINE_COMMON_MAGIC_0: u64 = 0xc7b1dd30df4c8b88
+val LIMINE_COMMON_MAGIC_1: u64 = 0x0a82e883a194f07b
+
+# Limine memory map request ID
+val LIMINE_MEMMAP_ID_0: u64 = 0x67cf3d9d378a806f
+val LIMINE_MEMMAP_ID_1: u64 = 0xe304acdfc50c3c62
+
+# Limine framebuffer request ID
+val LIMINE_FRAMEBUFFER_ID_0: u64 = 0x9d5827dcd881dd75
+val LIMINE_FRAMEBUFFER_ID_1: u64 = 0xa3148604f6fab11b
+
+# Limine RSDP request ID
+val LIMINE_RSDP_ID_0: u64 = 0xc5e77b6b397e7b43
+val LIMINE_RSDP_ID_1: u64 = 0x27637845accdcf3c
+
+# Limine HHDM (Higher-Half Direct Map) request ID
+val LIMINE_HHDM_ID_0: u64 = 0x48dcf1cb8ad2b852
+val LIMINE_HHDM_ID_1: u64 = 0x63984e959a98244b
+
+# Limine kernel address request ID
+val LIMINE_KERNEL_ADDR_ID_0: u64 = 0x71ba76863cc55f63
+val LIMINE_KERNEL_ADDR_ID_1: u64 = 0xb2644a48c516a487
+
+# ============================================================================
+# Limine Memory Map Entry Types
+# ============================================================================
+
+val LIMINE_MMAP_USABLE: u64 = 0
+val LIMINE_MMAP_RESERVED: u64 = 1
+val LIMINE_MMAP_ACPI_RECLAIMABLE: u64 = 2
+val LIMINE_MMAP_ACPI_NVS: u64 = 3
+val LIMINE_MMAP_BAD_MEMORY: u64 = 4
+val LIMINE_MMAP_BOOTLOADER_RECLAIMABLE: u64 = 5
+val LIMINE_MMAP_KERNEL_AND_MODULES: u64 = 6
+val LIMINE_MMAP_FRAMEBUFFER: u64 = 7
+
+# ============================================================================
+# Limine C-Compatible Structures
+# ============================================================================
+
+@repr("C")
+struct LimineMemMapEntry:
+    """Single memory map entry from Limine bootloader."""
+    base: u64
+    length: u64
+    type_: u64
+
+@repr("C")
+struct LimineMemMapResponse:
+    """Limine memory map response."""
+    revision: u64
+    entry_count: u64
+    entries: u64        # Pointer to array of LimineMemMapEntry pointers
+
+@repr("C")
+struct LimineFramebuffer:
+    """Limine framebuffer descriptor."""
+    address: u64        # Physical address of framebuffer
+    width: u64
+    height: u64
+    pitch: u64          # Bytes per scanline
+    bpp: u16            # Bits per pixel
+
+@repr("C")
+struct LimineFramebufferResponse:
+    """Limine framebuffer response."""
+    revision: u64
+    framebuffer_count: u64
+    framebuffers: u64   # Pointer to array of LimineFramebuffer pointers
+
+@repr("C")
+struct LimineRsdpResponse:
+    """Limine RSDP response."""
+    revision: u64
+    address: u64        # Physical address of RSDP
+
+@repr("C")
+struct LimineHhdmResponse:
+    """Limine Higher-Half Direct Map response."""
+    revision: u64
+    offset: u64         # Virtual-to-physical offset
+
+@repr("C")
+struct LimineKernelAddressResponse:
+    """Limine kernel address response."""
+    revision: u64
+    physical_base: u64
+    virtual_base: u64
+
+# ============================================================================
+# Limine Request Header
+# ============================================================================
+
+@repr("C")
+struct LimineRequest:
+    """Generic Limine request header."""
+    id: [u64; 4]       # Magic + request-specific ID
+    revision: u64
+    response: u64       # Pointer to response (filled by bootloader)
+
+# ============================================================================
+# Global Limine Requests (linker places in .limine_reqs section)
+# ============================================================================
+
+# @section(".limine_reqs") -- applied by linker script
+var memmap_request: LimineRequest = LimineRequest(
+    id: [LIMINE_COMMON_MAGIC_0, LIMINE_COMMON_MAGIC_1,
+         LIMINE_MEMMAP_ID_0, LIMINE_MEMMAP_ID_1],
+    revision: 0,
+    response: 0
+)
+
+# @section(".limine_reqs") -- applied by linker script
+var framebuffer_request: LimineRequest = LimineRequest(
+    id: [LIMINE_COMMON_MAGIC_0, LIMINE_COMMON_MAGIC_1,
+         LIMINE_FRAMEBUFFER_ID_0, LIMINE_FRAMEBUFFER_ID_1],
+    revision: 0,
+    response: 0
+)
+
+# @section(".limine_reqs") -- applied by linker script
+var rsdp_request: LimineRequest = LimineRequest(
+    id: [LIMINE_COMMON_MAGIC_0, LIMINE_COMMON_MAGIC_1,
+         LIMINE_RSDP_ID_0, LIMINE_RSDP_ID_1],
+    revision: 0,
+    response: 0
+)
+
+# @section(".limine_reqs") -- applied by linker script
+var hhdm_request: LimineRequest = LimineRequest(
+    id: [LIMINE_COMMON_MAGIC_0, LIMINE_COMMON_MAGIC_1,
+         LIMINE_HHDM_ID_0, LIMINE_HHDM_ID_1],
+    revision: 0,
+    response: 0
+)
+
+# @section(".limine_reqs") -- applied by linker script
+var kernel_addr_request: LimineRequest = LimineRequest(
+    id: [LIMINE_COMMON_MAGIC_0, LIMINE_COMMON_MAGIC_1,
+         LIMINE_KERNEL_ADDR_ID_0, LIMINE_KERNEL_ADDR_ID_1],
+    revision: 0,
+    response: 0
+)
+
+# ============================================================================
+# X86Boot
+# ============================================================================
+
+struct X86Boot:
+    """x86_64 Limine boot protocol handler.
+
+    Parses all Limine bootloader responses and assembles them into
+    a BootOutputPort that the kernel's portable memory layer consumes.
+    """
+    pass_dn
+
+# ============================================================================
+# HHDM Offset (Higher-Half Direct Map)
+# ============================================================================
+
+var g_hhdm_offset: u64 = 0
+
+fn _parse_hhdm():
+    """Parse HHDM response to get virtual-to-physical mapping offset."""
+    val resp_ptr = hhdm_request.response
+    if resp_ptr == 0:
+        serial_writeln("[BOOT] WARNING: No HHDM response from Limine")
+        return
+
+    val resp_revision = mmio_read64(resp_ptr)
+    val offset = mmio_read64(resp_ptr + 8)
+    g_hhdm_offset = offset
+    serial_writeln("[BOOT] HHDM offset: 0x{offset}")
+
+fn phys_to_virt(phys: u64) -> u64:
+    """Convert physical address to virtual via HHDM."""
+    phys + g_hhdm_offset
+
+# ============================================================================
+# Memory Map Parsing
+# ============================================================================
+
+fn _limine_type_to_kind(type_: u64) -> MemoryRegionKind:
+    """Convert Limine memory type to MemoryRegionKind enum."""
+    if type_ == LIMINE_MMAP_USABLE:
+        return MemoryRegionKind.Usable
+    if type_ == LIMINE_MMAP_RESERVED:
+        return MemoryRegionKind.Reserved
+    if type_ == LIMINE_MMAP_ACPI_RECLAIMABLE:
+        return MemoryRegionKind.AcpiReclaimable
+    if type_ == LIMINE_MMAP_ACPI_NVS:
+        return MemoryRegionKind.AcpiNvs
+    if type_ == LIMINE_MMAP_BAD_MEMORY:
+        return MemoryRegionKind.BadMemory
+    if type_ == LIMINE_MMAP_BOOTLOADER_RECLAIMABLE:
+        return MemoryRegionKind.BootloaderReclaimable
+    if type_ == LIMINE_MMAP_KERNEL_AND_MODULES:
+        return MemoryRegionKind.Kernel
+    if type_ == LIMINE_MMAP_FRAMEBUFFER:
+        return MemoryRegionKind.Framebuffer
+    # Default: treat unknown as reserved
+    MemoryRegionKind.Reserved
+
+fn _parse_memory_map() -> [BootMemoryRegion]:
+    """Parse Limine memory map response into BootMemoryRegion list."""
+    var regions: [BootMemoryRegion] = []
+
+    val resp_ptr = memmap_request.response
+    if resp_ptr == 0:
+        serial_writeln("[BOOT] WARNING: No memory map response from Limine")
+        return regions
+
+    # Read LimineMemMapResponse fields
+    val _revision = mmio_read64(resp_ptr)
+    val entry_count = mmio_read64(resp_ptr + 8)
+    val entries_ptr = mmio_read64(resp_ptr + 16)
+
+    serial_writeln("[BOOT] Memory map: {entry_count} entries")
+
+    var i: u64 = 0
+    while i < entry_count:
+        # entries is array of pointers to LimineMemMapEntry
+        val entry_ptr_addr = entries_ptr + (i * 8)
+        val entry_ptr = mmio_read64(entry_ptr_addr)
+
+        # Read LimineMemMapEntry fields
+        val base = mmio_read64(entry_ptr)
+        val length = mmio_read64(entry_ptr + 8)
+        val type_ = mmio_read64(entry_ptr + 16)
+
+        val kind = _limine_type_to_kind(type_)
+
+        val region = BootMemoryRegion(
+            base: PhysAddr(addr: base),
+            size: length,
+            kind: kind
+        )
+        regions.push(region)
+
+        serial_writeln("[BOOT]   region {i}: base=0x{base} size=0x{length} type={type_}")
+
+        i = i + 1
+
+    regions
+
+# ============================================================================
+# Framebuffer Parsing
+# ============================================================================
+
+fn _parse_framebuffer() -> FramebufferInfo:
+    """Parse Limine framebuffer response."""
+    val resp_ptr = framebuffer_request.response
+    if resp_ptr == 0:
+        serial_writeln("[BOOT] WARNING: No framebuffer response from Limine")
+        return FramebufferInfo(
+            addr: PhysAddr(addr: 0),
+            width: 0,
+            height: 0,
+            pitch: 0,
+            bpp: 0
+        )
+
+    val _revision = mmio_read64(resp_ptr)
+    val fb_count = mmio_read64(resp_ptr + 8)
+    val fbs_ptr = mmio_read64(resp_ptr + 16)
+
+    if fb_count == 0:
+        serial_writeln("[BOOT] WARNING: No framebuffers available")
+        return FramebufferInfo(
+            addr: PhysAddr(addr: 0),
+            width: 0,
+            height: 0,
+            pitch: 0,
+            bpp: 0
+        )
+
+    # Use first framebuffer
+    val fb_ptr_addr = fbs_ptr
+    val fb_ptr = mmio_read64(fb_ptr_addr)
+
+    val address = mmio_read64(fb_ptr)
+    val width = mmio_read64(fb_ptr + 8)
+    val height = mmio_read64(fb_ptr + 16)
+    val pitch = mmio_read64(fb_ptr + 24)
+    val bpp = mmio_read64(fb_ptr + 32)      # Actually u16, but read full word
+
+    serial_writeln("[BOOT] Framebuffer: {width}x{height} bpp={bpp} pitch={pitch}")
+
+    FramebufferInfo(
+        addr: PhysAddr(addr: address),
+        width: width as u32,
+        height: height as u32,
+        pitch: pitch as u32,
+        bpp: (bpp & 0xFFFF) as u32
+    )
+
+# ============================================================================
+# RSDP Parsing
+# ============================================================================
+
+fn _parse_rsdp() -> PhysAddr?:
+    """Parse Limine RSDP response."""
+    val resp_ptr = rsdp_request.response
+    if resp_ptr == 0:
+        serial_writeln("[BOOT] No RSDP from Limine (ACPI unavailable)")
+        return nil
+
+    val _revision = mmio_read64(resp_ptr)
+    val address = mmio_read64(resp_ptr + 8)
+
+    serial_writeln("[BOOT] RSDP at physical address 0x{address}")
+
+    PhysAddr(addr: address)
+
+# ============================================================================
+# Kernel Address Parsing
+# ============================================================================
+
+fn _parse_kernel_address() -> (PhysAddr, VirtAddr):
+    """Parse Limine kernel address response."""
+    val resp_ptr = kernel_addr_request.response
+    if resp_ptr == 0:
+        serial_writeln("[BOOT] WARNING: No kernel address response")
+        return (PhysAddr(addr: 0), VirtAddr(addr: 0))
+
+    val _revision = mmio_read64(resp_ptr)
+    val phys_base = mmio_read64(resp_ptr + 8)
+    val virt_base = mmio_read64(resp_ptr + 16)
+
+    serial_writeln("[BOOT] Kernel: phys=0x{phys_base} virt=0x{virt_base}")
+
+    (PhysAddr(addr: phys_base), VirtAddr(addr: virt_base))
+
+# ============================================================================
+# Boot Output Assembly
+# ============================================================================
+
+# Linker-provided symbols for kernel size calculation
+extern fn _get_kernel_end() -> u64
+extern fn _get_bss_start() -> u64
+
+fn _build_boot_output() -> BootOutputPort:
+    """Assemble BootOutputPort from all parsed Limine responses.
+
+    Uses the generalized BootOutputPort fields:
+    - serial_base (u64) instead of serial_port (u16)
+    - serial_is_mmio = false (x86 uses port I/O)
+    - arch = Architecture.X86_64
+    - hhdm_offset from parsed HHDM response
+    """
+    val memory_map = _parse_memory_map()
+    val framebuffer = _parse_framebuffer()
+    val rsdp_addr = _parse_rsdp()
+    val (kernel_phys, kernel_virt) = _parse_kernel_address()
+
+    # Estimate kernel size from linker symbols
+    val kernel_size = _get_kernel_end() - kernel_phys.addr
+
+    BootOutputPort(
+        memory_map: memory_map,
+        framebuffer: framebuffer,
+        rsdp_addr: rsdp_addr,
+        kernel_phys_base: kernel_phys,
+        kernel_virt_base: kernel_virt,
+        kernel_size: kernel_size,
+        serial_base: 0x3F8,
+        serial_is_mmio: false,
+        arch: Architecture.X86_64,
+        hhdm_offset: g_hhdm_offset
+    )
+
+# ============================================================================
+# Boot Entry Helpers
+# ============================================================================
+
+impl X86Boot:
+    fn parse_hhdm():
+        """Parse HHDM response (must be called early)."""
+        _parse_hhdm()
+
+    fn build_boot_output() -> BootOutputPort:
+        """Assemble BootOutputPort from all parsed Limine responses."""
+        _build_boot_output()
+
+    fn hhdm_offset() -> u64:
+        """Return the HHDM offset for physical-to-virtual conversions."""
+        g_hhdm_offset
+
+    fn phys_to_virt(phys: u64) -> u64:
+        """Convert physical address to virtual via HHDM."""
+        phys + g_hhdm_offset

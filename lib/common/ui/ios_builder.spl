@@ -1,0 +1,163 @@
+# iOS Widget Builders
+#
+# Builder functions for iOS-style navigation and control widgets.
+# Extends the core builder API with NavigationBar, TabBar, Card,
+# Switch, SegmentedControl, and SearchBar.
+
+use common.ui.widget.{WidgetNode}
+use common.ui.ios_icons.{ios_icon}
+
+# =========================================================================
+# NavigationBar Builders
+# =========================================================================
+
+fn navigation_bar(id: text, title: text, left_items: [WidgetNode], right_items: [WidgetNode]) -> WidgetNode:
+    """Create an iOS-style navigation bar with title and left/right bar items."""
+    var node = WidgetNode.new(id, "navigation_bar")
+    node = node.set_prop("title", title)
+    node = node.set_prop("large_title", "false")
+    node = node.set_layout("hbox")
+    # Left items container
+    var left_container = WidgetNode.new("{id}_left", "panel")
+    left_container = left_container.set_layout("hbox")
+    for item in left_items:
+        left_container = left_container.add_child(item)
+    node = node.add_child(left_container)
+    # Title label
+    var title_label = WidgetNode.new("{id}_title", "text")
+    title_label = title_label.set_prop("label", title)
+    node = node.add_child(title_label)
+    # Right items container
+    var right_container = WidgetNode.new("{id}_right", "panel")
+    right_container = right_container.set_layout("hbox")
+    for item in right_items:
+        right_container = right_container.add_child(item)
+    node = node.add_child(right_container)
+    return node
+
+fn navigation_bar_large(id: text, title: text, left_items: [WidgetNode], right_items: [WidgetNode]) -> WidgetNode:
+    """Create an iOS-style navigation bar with large title display."""
+    var node = WidgetNode.new(id, "navigation_bar")
+    node = node.set_prop("title", title)
+    node = node.set_prop("large_title", "true")
+    node = node.set_layout("hbox")
+    # Left items container
+    var left_container = WidgetNode.new("{id}_left", "panel")
+    left_container = left_container.set_layout("hbox")
+    for item in left_items:
+        left_container = left_container.add_child(item)
+    node = node.add_child(left_container)
+    # Title label
+    var title_label = WidgetNode.new("{id}_title", "text")
+    title_label = title_label.set_prop("label", title)
+    node = node.add_child(title_label)
+    # Right items container
+    var right_container = WidgetNode.new("{id}_right", "panel")
+    right_container = right_container.set_layout("hbox")
+    for item in right_items:
+        right_container = right_container.add_child(item)
+    node = node.add_child(right_container)
+    return node
+
+# =========================================================================
+# TabBar Builders
+# =========================================================================
+
+fn tab_bar(id: text, items: [WidgetNode]) -> WidgetNode:
+    """Create an iOS-style tab bar with tab item children."""
+    var node = WidgetNode.new(id, "tab_bar")
+    node = node.set_layout("hbox")
+    node = node.set_prop("active_index", "0")
+    for item in items:
+        node = node.add_child(item)
+    return node
+
+fn tab_item(id: text, icon_name: text, label_text: text) -> WidgetNode:
+    """Create a tab bar item with an icon and label."""
+    var node = WidgetNode.new(id, "text")
+    node = node.set_prop("icon", ios_icon(icon_name))
+    node = node.set_prop("label", label_text)
+    node = node.set_prop("badge", "")
+    return node
+
+fn tab_item_badge(id: text, icon_name: text, label_text: text, badge_count: i32) -> WidgetNode:
+    """Create a tab bar item with an icon, label, and badge count."""
+    var node = WidgetNode.new(id, "text")
+    node = node.set_prop("icon", ios_icon(icon_name))
+    node = node.set_prop("label", label_text)
+    node = node.set_prop("badge", "{badge_count}")
+    return node
+
+# =========================================================================
+# Card Builders
+# =========================================================================
+
+fn card(id: text, title: text, children: [WidgetNode]) -> WidgetNode:
+    """Create a card container with a title and content children."""
+    var node = WidgetNode.new(id, "card")
+    node = node.set_prop("title", title)
+    node = node.set_layout("vbox")
+    for child in children:
+        node = node.add_child(child)
+    return node
+
+fn card_with_subtitle(id: text, title: text, subtitle: text, children: [WidgetNode]) -> WidgetNode:
+    """Create a card container with title, subtitle, and content children."""
+    var node = WidgetNode.new(id, "card")
+    node = node.set_prop("title", title)
+    node = node.set_prop("subtitle", subtitle)
+    node = node.set_layout("vbox")
+    for child in children:
+        node = node.add_child(child)
+    return node
+
+# =========================================================================
+# Switch/Toggle Builder
+# =========================================================================
+
+fn switch_toggle(id: text, label_text: text, on: bool) -> WidgetNode:
+    """Create an iOS-style toggle switch with a label."""
+    var node = WidgetNode.new(id, "switch")
+    node = node.set_prop("label", label_text)
+    node = node.set_prop("on", if on: "true" else: "false")
+    node = node.set_prop("action", "toggle_{id}")
+    return node
+
+# =========================================================================
+# SegmentedControl Builder
+# =========================================================================
+
+fn segmented_control(id: text, segments: [text], active_index: i32) -> WidgetNode:
+    """Create an iOS-style segmented control with labeled segments."""
+    var node = WidgetNode.new(id, "segmented_control")
+    node = node.set_prop("active_index", "{active_index}")
+    var children: [WidgetNode] = []
+    var idx = 0
+    for segment in segments:
+        var seg_node = WidgetNode.new("{id}_seg_{idx}", "text")
+        seg_node = seg_node.set_prop("label", segment)
+        children = children.push(seg_node)
+        idx = idx + 1
+    for child in children:
+        node = node.add_child(child)
+    return node
+
+# =========================================================================
+# SearchBar Builders
+# =========================================================================
+
+fn search_bar(id: text, placeholder: text, value: text) -> WidgetNode:
+    """Create an iOS-style search bar."""
+    var node = WidgetNode.new(id, "search_bar")
+    node = node.set_prop("placeholder", placeholder)
+    node = node.set_prop("value", value)
+    node = node.set_prop("show_cancel", "false")
+    return node
+
+fn search_bar_with_cancel(id: text, placeholder: text, value: text) -> WidgetNode:
+    """Create an iOS-style search bar with a visible cancel button."""
+    var node = WidgetNode.new(id, "search_bar")
+    node = node.set_prop("placeholder", placeholder)
+    node = node.set_prop("value", value)
+    node = node.set_prop("show_cancel", "true")
+    return node

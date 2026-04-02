@@ -1,0 +1,173 @@
+# x86_32 Timer HAL — PIT 8254 Programmable Interval Timer
+#
+# Implements the PIT 8254 timer for x86_32.
+# Unlike x86_64 which primarily uses the APIC timer, x86_32 relies
+# on the legacy PIT for periodic preemption ticks.
+#
+# PIT channels:
+#   Channel 0 (port 0x40): System timer (connected to IRQ 0)
+#   Channel 1 (port 0x41): DRAM refresh (legacy, not used)
+#   Channel 2 (port 0x42): PC speaker (used for calibration)
+#   Command   (port 0x43): Mode/command register
+#
+# PIT base frequency: 1,193,182 Hz
+# Divisor = base_frequency / desired_frequency
+# Minimum frequency: ~18.2 Hz (divisor = 65535)
+# Maximum frequency: 1,193,182 Hz (divisor = 1)
+
+use os.kernel.arch.x86_32.cpu.{port_outb, port_inb}
+use os.kernel.arch.x86_32.interrupt.{X86_32Interrupt}
+
+# ============================================================================
+# PIT Port Addresses
+# ============================================================================
+
+val PIT_CHANNEL0: u16 = 0x40      # Channel 0 data port (system timer)
+val PIT_CHANNEL1: u16 = 0x41      # Channel 1 data port (DRAM refresh)
+val PIT_CHANNEL2: u16 = 0x42      # Channel 2 data port (PC speaker)
+val PIT_COMMAND: u16 = 0x43        # Mode/command register
+
+# ============================================================================
+# PIT Constants
+# ============================================================================
+
+val PIT_BASE_FREQUENCY: u32 = 1193182   # 1,193,182 Hz
+
+# PIT command byte format:
+#   Bits 7-6: Channel select (00=ch0, 01=ch1, 10=ch2, 11=readback)
+#   Bits 5-4: Access mode (00=latch, 01=lo, 10=hi, 11=lo/hi)
+#   Bits 3-1: Operating mode (000=mode0..101=mode5)
+#   Bit 0:    BCD/binary (0=binary, 1=BCD)
+
+# Mode 2 (rate generator) for periodic interrupts, lo/hi access, channel 0
+val PIT_CMD_CHANNEL0_RATE: u8 = 0x34    # 00 11 010 0
+
+# Mode 0 (one-shot) for oneshot, lo/hi access, channel 0
+val PIT_CMD_CHANNEL0_ONESHOT: u8 = 0x30 # 00 11 000 0
+
+# ============================================================================
+# Timer State
+# ============================================================================
+
+var g_pit_ticks: u64 = 0
+var g_pit_frequency: u32 = 0
+var g_pit_divisor: u32 = 0
+
+# ============================================================================
+# PIT Functions
+# ============================================================================
+
+fn _pit_set_divisor(divisor: u32):
+    """Set PIT channel 0 divisor for periodic mode (rate generator).
+
+    The divisor determines the interrupt frequency:
+    frequency = PIT_BASE_FREQUENCY / divisor
+    """
+    val div = if divisor > 65535: 65535 else: divisor as u16
+
+    # Send command: channel 0, lo/hi access, rate generator mode
+    port_outb(PIT_COMMAND, PIT_CMD_CHANNEL0_RATE)
+
+    # Send divisor (low byte first, then high byte)
+    port_outb(PIT_CHANNEL0, (div & 0xFF) as u8)
+    port_outb(PIT_CHANNEL0, ((div >> 8) & 0xFF) as u8)
+
+fn _pit_set_oneshot(count: u32):
+    """Set PIT channel 0 for one-shot mode.
+
+    The counter decrements from 'count' to 0, then fires IRQ 0 once.
+    """
+    val cnt = if count > 65535: 65535 else: count as u16
+
+    # Send command: channel 0, lo/hi access, one-shot mode
+    port_outb(PIT_COMMAND, PIT_CMD_CHANNEL0_ONESHOT)
+
+    # Send count (low byte first, then high byte)
+    port_outb(PIT_CHANNEL0, (cnt & 0xFF) as u8)
+    port_outb(PIT_CHANNEL0, ((cnt >> 8) & 0xFF) as u8)
+
+fn _pit_read_count() -> u16:
+    """Read the current count from PIT channel 0.
+
+    Sends a latch command (channel 0, latch count) then reads lo/hi bytes.
+    """
+    # Latch command for channel 0: bits 7-6=00 (ch0), bits 5-4=00 (latch)
+    port_outb(PIT_COMMAND, 0x00)
+
+    val lo = port_inb(PIT_CHANNEL0) as u16
+    val hi = port_inb(PIT_CHANNEL0) as u16
+    (hi << 8) | lo
+
+# ============================================================================
+# Timer IRQ Handler Support
+# ============================================================================
+
+fn pit_tick_handler():
+    """Called from IRQ 0 handler to increment tick count."""
+    g_pit_ticks = g_pit_ticks + 1
+
+fn pit_get_ticks() -> u64:
+    """Return current tick count since timer init."""
+    g_pit_ticks
+
+# ============================================================================
+# X86_32Timer
+# ============================================================================
+
+struct X86_32Timer:
+    """x86_32 timer management via PIT 8254.
+
+    Uses the legacy PIT channel 0 for periodic interrupts (IRQ 0).
+    Provides tick counting and frequency control for the scheduler.
+    """
+    pass_dn
+
+impl X86_32Timer:
+    fn init():
+        """Initialize PIT at default 100 Hz for preemption ticks."""
+        val default_hz: u32 = 100
+        val divisor = PIT_BASE_FREQUENCY / default_hz
+        _pit_set_divisor(divisor)
+        g_pit_divisor = divisor
+        g_pit_frequency = default_hz
+        g_pit_ticks = 0
+
+    fn set_periodic(frequency_hz: u32):
+        """Set timer to fire periodically at given frequency (Hz)."""
+        if frequency_hz == 0:
+            return
+        val divisor = PIT_BASE_FREQUENCY / frequency_hz
+        _pit_set_divisor(divisor)
+        g_pit_divisor = divisor
+        g_pit_frequency = frequency_hz
+
+    fn set_oneshot(delay_us: u64):
+        """Set timer for a one-shot firing after delay (microseconds).
+
+        Converts microseconds to PIT counts:
+        counts = delay_us * PIT_BASE_FREQUENCY / 1_000_000
+        """
+        val counts = ((delay_us * (PIT_BASE_FREQUENCY as u64)) / 1000000) as u32
+        _pit_set_oneshot(counts)
+
+    fn stop():
+        """Stop the PIT by setting maximum divisor (slowest rate)."""
+        _pit_set_divisor(65535)
+
+    fn current_ticks() -> u64:
+        """Read current tick count since timer init."""
+        g_pit_ticks
+
+    fn ticks_per_second() -> u64:
+        """Return timer tick frequency (ticks per second)."""
+        g_pit_frequency as u64
+
+    fn elapsed_us() -> u64:
+        """Return microseconds elapsed since timer init."""
+        if g_pit_frequency == 0:
+            return 0
+        (g_pit_ticks * 1000000) / (g_pit_frequency as u64)
+
+    fn frequency() -> u32:
+        """Return current configured frequency in Hz."""
+        g_pit_frequency

@@ -1,0 +1,189 @@
+@allow(primitive_api)
+# RISC-V 32-bit Semihosting Implementation
+#
+# Provides semihosting support for RV32 processors.
+# Uses EBREAK instruction with magic NOP sequence for detection.
+# Same semihosting protocol as RV64 but with 32-bit register widths.
+#
+# Supported debuggers:
+# - OpenOCD: `riscv semihosting enable`
+# - SEGGER Ozone: Native RISC-V semihosting
+# - Trace32: `SYStem.Option SemiHost ON`
+#
+# Reference: RISC-V Semihosting Specification
+# https://github.com/riscv/riscv-semihosting-spec
+
+@cfg("target_arch", "riscv32")
+
+
+# ============================================================================
+# RISC-V 32-bit Semihosting Call Implementation
+# ============================================================================
+
+# The RISC-V semihosting mechanism uses a special instruction sequence:
+#
+#   slli zero, zero, 0x1f   # Entry NOP (magic marker)
+#   ebreak                   # Breakpoint triggers debugger
+#   srai zero, zero, 0x7    # Exit NOP (magic marker)
+#
+# Register usage:
+#   a0 = operation number (input) / return value (output)
+#   a1 = parameter block pointer (32-bit on RV32)
+
+# Semihosting call with simple arguments
+@inline
+fn arch_semi_host_call_rv32(op: u32, arg0: u32, arg1: u32) -> u32:
+    """Semihosting call with two arguments (RV32)."""
+    var params: [u32; 2] = [arg0, arg1]
+    arch_semi_host_call_raw_rv32(op, params.as_ptr())
+
+# Semihosting call with parameter block
+@inline
+fn arch_semi_host_call_block_rv32(op: u32, block_ptr: u32) -> u32:
+    """Semihosting call with parameter block pointer (RV32)."""
+    arch_semi_host_call_raw_rv32(op, block_ptr as rawptr<u32>)
+
+# Raw semihosting call using inline assembly
+@inline
+fn arch_semi_host_call_raw_rv32(op: u32, params_ptr: rawptr<u32>) -> u32:
+    """Raw semihosting call via EBREAK magic sequence (RV32)."""
+    var result: u32 = 0
+
+    asm volatile(
+        ".option push",
+        ".option norvc",              # Disable compressed instructions
+        "mv a0, {op}",                # Operation number
+        "mv a1, {params}",            # Parameter block pointer (32-bit)
+        "slli zero, zero, 0x1f",      # Entry magic NOP
+        "ebreak",                      # Trigger semihosting
+        "srai zero, zero, 0x7",       # Exit magic NOP
+        "mv {result}, a0",            # Get return value
+        ".option pop",
+        op = in(reg) op,
+        params = in(reg) params_ptr,
+        result = out(reg) result,
+        clobber_abi("C")
+    )
+
+    result
+
+# ============================================================================
+# Semihosting Operations (RV32)
+# ============================================================================
+
+# SYS_OPEN (0x01) - Open a file
+fn semi_open_rv32(name_ptr: rawptr<u8>, mode: u32, name_len: u32) -> u32:
+    """Open a file via semihosting. Returns file handle or -1 on error."""
+    var params: [u32; 3] = [name_ptr as u32, mode, name_len]
+    arch_semi_host_call_raw_rv32(0x01, params.as_ptr())
+
+# SYS_CLOSE (0x02) - Close a file
+fn semi_close_rv32(handle: u32) -> u32:
+    """Close a file handle."""
+    var params: [u32; 1] = [handle]
+    arch_semi_host_call_raw_rv32(0x02, params.as_ptr())
+
+# SYS_WRITEC (0x03) - Write character
+@inline
+fn semi_writec_rv32(c: u8):
+    """Write single character via semihosting (RV32)."""
+    var ch: u8 = c
+    var params: [u32; 1] = [(&ch) as u32]
+    arch_semi_host_call_raw_rv32(0x03, params.as_ptr())
+
+# SYS_WRITE0 (0x04) - Write null-terminated string
+@inline
+fn semi_write0_rv32(s: rawptr<u8>):
+    """Write null-terminated string via semihosting (RV32)."""
+    var params: [u32; 1] = [s as u32]
+    arch_semi_host_call_raw_rv32(0x04, params.as_ptr())
+
+# SYS_WRITE (0x05) - Write to file
+fn semi_write_rv32(handle: u32, data_ptr: rawptr<u8>, length: u32) -> u32:
+    """Write data to file. Returns number of bytes NOT written (0 = success)."""
+    var params: [u32; 3] = [handle, data_ptr as u32, length]
+    arch_semi_host_call_raw_rv32(0x05, params.as_ptr())
+
+# SYS_READ (0x06) - Read from file
+fn semi_read_rv32(handle: u32, buf_ptr: rawptr<u8>, length: u32) -> u32:
+    """Read data from file. Returns number of bytes NOT read."""
+    var params: [u32; 3] = [handle, buf_ptr as u32, length]
+    arch_semi_host_call_raw_rv32(0x06, params.as_ptr())
+
+# SYS_EXIT (0x18) - Exit program
+fn semi_exit_rv32(reason: u32):
+    """Exit via semihosting with reason code."""
+    # ADP_Stopped_ApplicationExit = 0x20026
+    var params: [u32; 2] = [0x20026, reason]
+    arch_semi_host_call_raw_rv32(0x18, params.as_ptr())
+
+# ============================================================================
+# RISC-V 32-bit Interrupt Control for Semihosting
+# ============================================================================
+
+# Disable interrupts during semihosting call
+# Uses Machine Status Register (mstatus)
+@inline
+fn disable_interrupts_rv32() -> u32:
+    """Disable interrupts and return previous mstatus value (RV32)."""
+    var mstatus: u32 = 0
+    asm volatile(
+        "csrrci {mstatus}, mstatus, 0x8",  # Clear MIE bit (bit 3)
+        mstatus = out(reg) mstatus
+    )
+    mstatus
+
+# Restore interrupts after semihosting call
+@inline
+fn restore_interrupts_rv32(mstatus: u32):
+    """Restore interrupts from saved mstatus (RV32)."""
+    # Only restore MIE if it was previously set
+    if (mstatus & 0x8) != 0:
+        asm volatile(
+            "csrsi mstatus, 0x8"  # Set MIE bit
+        )
+
+# Interrupt-safe semihosting call wrapper
+fn semi_host_call_safe_rv32(op: u32, params_ptr: rawptr<u32>) -> u32:
+    """Semihosting call with interrupt disable/restore (RV32)."""
+    val saved = disable_interrupts_rv32()
+    val result = arch_semi_host_call_raw_rv32(op, params_ptr)
+    restore_interrupts_rv32(saved)
+    result
+
+# ============================================================================
+# RISC-V 32-bit CSR Helpers
+# ============================================================================
+
+# Read machine cycle counter (mcycle)
+# On RV32, mcycle is 32-bit; full 64-bit requires reading mcycleh too
+@inline
+fn read_mcycle_rv32() -> u64:
+    """Read 64-bit cycle counter on RV32 (reads mcycleh:mcycle atomically)."""
+    var lo: u32 = 0
+    var hi: u32 = 0
+    var hi2: u32 = 0
+
+    # Must read high, low, high again to avoid tearing
+    asm volatile(
+        "1:",
+        "csrr {hi}, mcycleh",
+        "csrr {lo}, mcycle",
+        "csrr {tmp}, mcycleh",
+        "bne {hi}, {tmp}, 1b",  # Retry if high bits changed
+        hi = out(reg) hi,
+        lo = out(reg) lo,
+        tmp = out(reg) hi2
+    )
+
+    (hi as u64 << 32) | lo as u64
+
+# ============================================================================
+# RISC-V 32-bit Platform Constants
+# ============================================================================
+
+# Common RISC-V platform memory addresses
+# These vary by platform - these are QEMU virt machine defaults
+const QEMU_VIRT_MTIME_ADDR: u32 = 0x0200BFF8
+const QEMU_VIRT_MTIMECMP_ADDR: u32 = 0x02004000
+const QEMU_VIRT_UART_ADDR: u32 = 0x10000000

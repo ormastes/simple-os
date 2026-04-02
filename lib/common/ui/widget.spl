@@ -1,0 +1,463 @@
+# UI Core Widget Types
+#
+# Platform-independent type definitions for the UI system.
+# All core enums and handle-based carriers: UIMode, UIEvent,
+# WidgetNode, UITree, WidgetRect, UIState.
+
+use common.ui.widget_store.{WidgetStore}
+
+enum UIMode:
+    Normal
+    Command
+    Insert
+    Menu
+
+enum UIEvent:
+    KeyPress(key: text)
+    Resize(width: i32, height: i32)
+    FileChanged
+    Quit
+    Action(name: text)
+    FocusNext
+    FocusPrev
+    CommandMode
+    NormalMode
+    InsertMode
+    TouchPress(x: i32, y: i32)
+    TouchMove(x: i32, y: i32)
+    TouchRelease(x: i32, y: i32)
+
+struct WidgetNode:
+    id: text
+
+struct WidgetRecord:
+    id: text
+    kind: text
+    layout: text
+    visible: bool
+    focused: bool
+
+struct WidgetProp:
+    node_id: text
+    key: text
+    value: text
+
+struct UITree:
+    root_id: text
+
+var _widget_registry: [WidgetRecord] = []
+var _widget_props_store: [WidgetProp] = []
+
+fn parse_widget_kind(name: text) -> text:
+    val kind = name.to_lower()
+    match kind:
+        "panel" => "panel"
+        "text" => "text"
+        "list" => "list"
+        "table" => "table"
+        "progress" => "progress"
+        "menubar" => "menubar"
+        "statusbar" => "statusbar"
+        "input" => "input"
+        "tabs" => "tabs"
+        "button" => "button"
+        "checkbox" => "checkbox"
+        "dropdown" => "dropdown"
+        "textfield" => "textfield"
+        "image" => "image"
+        "divider" => "divider"
+        "dialog" => "dialog"
+        "tooltip" => "tooltip"
+        "tree" => "tree"
+        "treenode" => "treenode"
+        "scroll" => "scroll"
+        "textarea" => "textarea"
+        "heading" => "heading"
+        "label" => "label"
+        # iOS widgets
+        "navigation_bar" => "navigation_bar"
+        "tab_bar" => "tab_bar"
+        "card" => "card"
+        "switch" => "switch"
+        "segmented_control" => "segmented_control"
+        "search_bar" => "search_bar"
+        _ => "panel"
+
+fn parse_layout_kind(name: text) -> text:
+    val layout = name.to_lower()
+    match layout:
+        "vbox" => "vbox"
+        "hbox" => "hbox"
+        "grid" => "grid"
+        "fixed" => "fixed"
+        _ => "vbox"
+
+fn default_widget_record(id: text, kind: text) -> WidgetRecord:
+    return WidgetRecord(
+        id: id,
+        kind: parse_widget_kind(kind),
+        layout: "vbox",
+        visible: true,
+        focused: false
+    )
+
+fn upsert_widget_record(record: WidgetRecord):
+    var updated: [WidgetRecord] = []
+    var replaced = false
+    for existing in _widget_registry:
+        if existing.id == record.id:
+            updated = updated.push(record)
+            replaced = true
+        else:
+            updated = updated.push(existing)
+    if not replaced:
+        updated = updated.push(record)
+    _widget_registry = updated
+
+fn get_widget_record(id: text) -> WidgetRecord?:
+    for record in _widget_registry:
+        if record.id == id:
+            return record
+    return nil
+
+fn require_widget_record(id: text) -> WidgetRecord:
+    val found = get_widget_record(id)
+    if found != nil:
+        return found
+    val fallback = default_widget_record(id, "panel")
+    upsert_widget_record(fallback)
+    return fallback
+
+fn get_widget(id: text) -> WidgetNode?:
+    val record = get_widget_record(id)
+    if record == nil:
+        return nil
+    return WidgetNode(id: id)
+
+fn get_widget_child_ids(id: text) -> [text]:
+    return decode_child_ids(get_internal_prop(id, "ui_children"))
+
+fn register_widget_child(parent_id: text, child_id: text):
+    val existing = decode_child_ids(get_internal_prop(parent_id, "ui_children"))
+    for current_id in existing:
+        if current_id == child_id:
+            return
+    val updated = existing + [child_id]
+    set_internal_prop(parent_id, "ui_children", encode_child_ids(updated))
+
+fn widget_props() -> [WidgetProp]:
+    return _widget_props_store
+
+fn set_widget_props(props: [WidgetProp]):
+    _widget_props_store = props
+
+fn get_internal_prop(node_id: text, key: text) -> text:
+    for prop in _widget_props_store:
+        if prop.node_id == node_id and prop.key == key:
+            return prop.value
+    return ""
+
+fn set_internal_prop(node_id: text, key: text, value: text):
+    var props: [WidgetProp] = []
+    var replaced = false
+    for prop in _widget_props_store:
+        if prop.node_id == node_id and prop.key == key:
+            props = props.push(WidgetProp(node_id: node_id, key: key, value: value))
+            replaced = true
+        else:
+            props = props.push(prop)
+    if not replaced:
+        props = props.push(WidgetProp(node_id: node_id, key: key, value: value))
+    _widget_props_store = props
+
+fn encode_child_ids(ids: [text]) -> text:
+    return ids.join(",")
+
+fn decode_child_ids(blob: text) -> [text]:
+    if blob == "":
+        return []
+    var ids: [text] = []
+    var current = ""
+    for ch in blob:
+        if ch == ",":
+            if current != "":
+                ids = ids.push(current)
+                current = ""
+        else:
+            current = "{current}{ch}"
+    if current != "":
+        ids = ids.push(current)
+    return ids
+
+impl WidgetNode:
+
+    static fn new(id: text, kind: text) -> WidgetNode:
+        val handle = WidgetNode(id: id)
+        upsert_widget_record(default_widget_record(id, kind))
+        return handle
+
+    fn kind_name() -> text:
+        return require_widget_record(self.id).kind
+
+    fn layout_name() -> text:
+        return require_widget_record(self.id).layout
+
+    fn is_visible() -> bool:
+        return require_widget_record(self.id).visible
+
+    fn is_focused() -> bool:
+        return require_widget_record(self.id).focused
+
+    fn kind() -> text: self.kind_name()
+    fn layout() -> text: self.layout_name()
+    fn visible() -> bool: self.is_visible()
+    fn focused() -> bool: self.is_focused()
+
+    fn set_prop(key: text, value: text) -> WidgetNode:
+        set_internal_prop(self.id, key, value)
+        return self
+
+    fn add_child(child: WidgetNode) -> WidgetNode:
+        register_widget_child(self.id, child.id)
+        return self
+
+    fn set_layout(layout: text) -> WidgetNode:
+        val record = require_widget_record(self.id)
+        upsert_widget_record(WidgetRecord(
+            id: self.id,
+            kind: record.kind,
+            layout: parse_layout_kind(layout),
+            visible: record.visible,
+            focused: record.focused
+        ))
+        return self
+
+    fn set_visible(visible: bool) -> WidgetNode:
+        val record = require_widget_record(self.id)
+        upsert_widget_record(WidgetRecord(
+            id: self.id,
+            kind: record.kind,
+            layout: record.layout,
+            visible: visible,
+            focused: record.focused
+        ))
+        return self
+
+    fn get_prop(key: text) -> text:
+        return get_internal_prop(self.id, key)
+
+    fn has_prop(key: text) -> bool:
+        for prop in _widget_props_store:
+            if prop.node_id == self.id and prop.key == key:
+                return true
+        return false
+
+    fn prop_keys() -> [text]:
+        var keys: [text] = []
+        for prop in _widget_props_store:
+            if prop.node_id == self.id:
+                keys = keys.push(prop.key)
+        return keys
+
+    fn children() -> [WidgetNode]:
+        var result: [WidgetNode] = []
+        val blob = get_internal_prop(self.id, "ui_children")
+        if blob == "":
+            return result
+        var current = ""
+        for ch in blob:
+            if ch == ",":
+                if current != "":
+                    val child = get_widget(current)
+                    if child != nil:
+                        result = result.push(child)
+                    current = ""
+            else:
+                current = "{current}{ch}"
+        if current != "":
+            val child = get_widget(current)
+            if child != nil:
+                result = result.push(child)
+        return result
+
+    fn child_count() -> i32:
+        val ids = decode_child_ids(get_internal_prop(self.id, "ui_children"))
+        var count: i32 = 0
+        for id in ids:
+            count = count + 1
+        return count
+
+    fn child_at(index: i32) -> WidgetNode?:
+        if index < 0:
+            return nil
+        val ids = decode_child_ids(get_internal_prop(self.id, "ui_children"))
+        var i: i32 = 0
+        for id in ids:
+            if i == index:
+                return get_widget(id)
+            i = i + 1
+        return nil
+
+    fn find_by_id(target_id: text) -> WidgetNode?:
+        if self.id == target_id:
+            return self
+        for child in self.children():
+            val found = child.find_by_id(target_id)
+            if found != nil:
+                return found
+        return nil
+
+    fn collect_ids() -> [text]:
+        var ids: [text] = [self.id]
+        for child in self.children():
+            val child_ids = child.collect_ids()
+            for cid in child_ids:
+                ids = ids.push(cid)
+        return ids
+
+    fn widget_summary() -> text:
+        return "{self.id} ({self.kind_name()})"
+
+    # -- Store-param overloads -----------------------------------------------
+
+    fn get_prop_from(store: WidgetStore, key: text) -> text:
+        return store.get_prop(self.id, key)
+
+    fn set_prop_in(store: WidgetStore, key: text, value: text) -> WidgetNode:
+        store.set_prop(self.id, key, value)
+        return self
+
+    fn has_prop_in(store: WidgetStore, key: text) -> bool:
+        return store.get_prop(self.id, key) != ""
+
+    fn prop_keys_from(store: WidgetStore) -> [text]:
+        var keys: [text] = []
+        for prop in store.all_props():
+            if prop.node_id == self.id:
+                keys = keys.push(prop.key)
+        return keys
+
+    fn children_from(store: WidgetStore) -> [WidgetNode]:
+        var result: [WidgetNode] = []
+        val ids = store.get_child_ids(self.id)
+        for id in ids:
+            val node = store.get_node(id)
+            if node != nil:
+                result = result.push(node)
+        return result
+
+    fn add_child_in(store: WidgetStore, child: WidgetNode) -> WidgetNode:
+        store.register_child(self.id, child.id)
+        return self
+
+    fn kind_name_from(store: WidgetStore) -> text:
+        return store.require_record(self.id).kind
+
+    fn layout_name_from(store: WidgetStore) -> text:
+        return store.require_record(self.id).layout
+
+    fn is_visible_from(store: WidgetStore) -> bool:
+        return store.require_record(self.id).visible
+
+    fn find_by_id_in(store: WidgetStore, target_id: text) -> WidgetNode?:
+        if self.id == target_id:
+            return self
+        for child in self.children_from(store):
+            val found = child.find_by_id_in(store, target_id)
+            if found != nil:
+                return found
+        return nil
+
+    fn collect_ids_from(store: WidgetStore) -> [text]:
+        var ids: [text] = [self.id]
+        for child in self.children_from(store):
+            val child_ids = child.collect_ids_from(store)
+            for cid in child_ids:
+                ids = ids.push(cid)
+        return ids
+
+impl UITree:
+
+    static fn new(root: WidgetNode) -> UITree:
+        return UITree(root_id: root.id)
+
+    fn root_node() -> WidgetNode:
+        return WidgetNode(id: self.root_id)
+
+    fn title_text() -> text:
+        val rn = self.root_node()
+        val title = rn.get_prop("ui_tree_title")
+        if title != "":
+            return title
+        return "Simple UI"
+
+    fn theme_name() -> text:
+        val rn = self.root_node()
+        val theme = rn.get_prop("ui_tree_theme")
+        if theme != "":
+            return theme
+        return "dark"
+
+    fn root() -> WidgetNode: self.root_node()
+    fn title() -> text: self.title_text()
+    fn theme() -> text: self.theme_name()
+
+    fn bindings() -> Dict<text, Dict<text, text>>:
+        return {}
+
+    fn with_title(title: text) -> UITree:
+        val rn = self.root_node()
+        val updated = rn.set_prop("ui_tree_title", title)
+        return UITree.new(updated)
+
+    fn with_theme(theme: text) -> UITree:
+        val rn = self.root_node()
+        val updated = rn.set_prop("ui_tree_theme", theme)
+        return UITree.new(updated)
+
+    fn with_keybindings(keybindings: Dict<text, Dict<text, text>>) -> UITree:
+        return self
+
+    fn find_widget(id: text) -> WidgetNode?:
+        val rn = self.root_node()
+        return rn.find_by_id(id)
+
+    fn all_widget_ids() -> [text]:
+        val rn = self.root_node()
+        return rn.collect_ids()
+
+struct WidgetRect:
+    id: text
+    x: i32
+    y: i32
+    w: i32
+    h: i32
+
+    static fn new(id: text, x: i32, y: i32, w: i32, h: i32) -> WidgetRect:
+        return WidgetRect(id: id, x: x, y: y, w: w, h: h)
+
+struct UIState:
+    tree: UITree
+    mode: UIMode
+    focused_id: text
+    command_buffer: text
+
+    static fn new(tree: UITree) -> UIState:
+        val ids = tree.all_widget_ids()
+        var initial_focus = ""
+        for id in ids:
+            if initial_focus == "":
+                initial_focus = id
+        return UIState(
+            tree: tree,
+            mode: UIMode.Normal,
+            focused_id: initial_focus,
+            command_buffer: ""
+        )
+
+    fn mode_name() -> text:
+        return match self.mode:
+            UIMode.Normal => "NORMAL"
+            UIMode.Command => "COMMAND"
+            UIMode.Insert => "INSERT"
+            UIMode.Menu => "MENU"

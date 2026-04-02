@@ -1,0 +1,288 @@
+# Desktop Shell
+#
+# The SimpleOS desktop environment built on the existing widget builder DSL.
+# Provides a taskbar (window list, clock, system tray), an app launcher,
+# and integration with the compositor for window management.
+#
+# The taskbar is itself a special compositor surface pinned to the bottom
+# of the screen.
+
+use common.ui.widget.{WidgetNode, UITree, UIState, UIEvent}
+use common.ui.session.{UISession, new_session}
+use common.ui.builder.{
+    column, row, panel, text_widget, button, label, statusbar,
+    build_tree, build_tree_with_title, with_height, with_width, with_flex
+}
+use os.compositor.compositor.{Compositor, WindowSurface}
+use os.drivers.framebuffer.fb_driver.{Color}
+use os.desktop.app_manifest.{AppManifest, load_app_manifests, search_apps}
+
+# ============================================================================
+# Desktop Shell Constants
+# ============================================================================
+
+val TASKBAR_HEIGHT: i32 = 32
+val APP_LAUNCHER_WIDTH: i32 = 200
+val APP_LAUNCHER_HEIGHT: i32 = 300
+val CLOCK_WIDTH: i32 = 80
+val SYSTEM_TRAY_WIDTH: i32 = 120
+
+# ============================================================================
+# Desktop Shell
+# ============================================================================
+
+class DesktopShell:
+    """Desktop environment providing taskbar, app launcher, and window list.
+
+    The shell operates by:
+      1. Reserving the bottom TASKBAR_HEIGHT pixels for a taskbar surface
+      2. Building the taskbar UI with the widget builder DSL
+      3. Updating the taskbar whenever windows change
+    """
+    compositor: Compositor
+    taskbar_id: u64
+    taskbar_session: UISession
+    launcher_visible: bool
+    launcher_id: u64
+    clock_text: text
+
+impl DesktopShell:
+
+    static fn new(compositor: Compositor) -> DesktopShell:
+        """Create a desktop shell wrapping the given compositor."""
+        val taskbar_tree = _build_taskbar_tree([], "00:00")
+        val session = new_session(taskbar_tree)
+
+        DesktopShell(
+            compositor: compositor,
+            taskbar_id: 0,
+            taskbar_session: session,
+            launcher_visible: false,
+            launcher_id: 0,
+            clock_text: "00:00"
+        )
+
+    me init():
+        """Initialize the desktop shell: create taskbar surface."""
+        val screen_w = self.compositor.screen_width
+        val screen_h = self.compositor.screen_height
+        val taskbar_y = screen_h - TASKBAR_HEIGHT
+
+        val taskbar_tree = _build_taskbar_tree([], self.clock_text)
+        self.taskbar_id = self.compositor.create_window_with_tree(
+            "Taskbar",
+            0, taskbar_y,
+            screen_w, TASKBAR_HEIGHT,
+            taskbar_tree
+        )
+
+    me update_taskbar():
+        """Refresh the taskbar with current window list and clock."""
+        val titles = self.compositor.window_titles()
+
+        # Filter out the taskbar itself and launcher from the title list
+        var app_titles: [text] = []
+        for title in titles:
+            if title != "Taskbar" and title != "App Launcher":
+                app_titles = app_titles.push(title)
+
+        val new_tree = _build_taskbar_tree(app_titles, self.clock_text)
+        self.taskbar_session.update_tree(new_tree)
+
+        # Update the compositor surface
+        val surface = self.compositor.get_surface(self.taskbar_id)
+        if surface != nil:
+            # Rebuild window with new tree
+            val screen_w = self.compositor.screen_width
+            val screen_h = self.compositor.screen_height
+            self.compositor.destroy_window(self.taskbar_id)
+            self.taskbar_id = self.compositor.create_window_with_tree(
+                "Taskbar",
+                0, screen_h - TASKBAR_HEIGHT,
+                screen_w, TASKBAR_HEIGHT,
+                new_tree
+            )
+
+    me set_clock(time_str: text):
+        """Update the clock display."""
+        self.clock_text = time_str
+        me update_taskbar()
+
+    me toggle_launcher():
+        """Toggle the app launcher panel."""
+        if self.launcher_visible:
+            me close_launcher()
+        else:
+            me open_launcher()
+
+    me open_launcher():
+        """Open the app launcher window."""
+        if self.launcher_visible:
+            return
+
+        val screen_h = self.compositor.screen_height
+        val launcher_x: i32 = 4
+        val launcher_y = screen_h - TASKBAR_HEIGHT - APP_LAUNCHER_HEIGHT
+
+        val tree = _build_launcher_tree()
+        self.launcher_id = self.compositor.create_window_with_tree(
+            "App Launcher",
+            launcher_x, launcher_y,
+            APP_LAUNCHER_WIDTH, APP_LAUNCHER_HEIGHT,
+            tree
+        )
+        self.launcher_visible = true
+
+    me close_launcher():
+        """Close the app launcher window."""
+        if not self.launcher_visible:
+            return
+        self.compositor.destroy_window(self.launcher_id)
+        self.launcher_id = 0
+        self.launcher_visible = false
+
+    me launch_app(name: text):
+        """Create a new window for an application.
+
+        Places the window in a cascading position.
+        """
+        # Calculate cascading position
+        val win_count = self.compositor.window_count()
+        val cascade_offset = (win_count - 1) * 30
+        val app_x = 50 + cascade_offset
+        val app_y = 50 + cascade_offset
+        val app_w = 400
+        val app_h = 300
+
+        # Build a default app tree
+        val tree = _build_app_tree(name)
+        self.compositor.create_window_with_tree(
+            name,
+            app_x, app_y,
+            app_w, app_h,
+            tree
+        )
+
+        # Close launcher if open
+        if self.launcher_visible:
+            me close_launcher()
+
+        me update_taskbar()
+
+    me handle_taskbar_action(action: text):
+        """Handle actions from the taskbar UI."""
+        if action == "launcher":
+            me toggle_launcher()
+        elif action.starts_with("focus_win_"):
+            # Focus the window by title
+            val title = action.slice(10, action.len())
+            # Find window with matching title
+            var idx: i32 = 0
+            for s in self.compositor.surfaces:
+                if s.title == title:
+                    self.compositor.focus_window(s.id)
+                    return
+                idx = idx + 1
+
+    me run():
+        """Main desktop shell loop.
+
+        Wraps the compositor loop but also updates taskbar.
+        """
+        self.compositor.running = true
+        while self.compositor.running:
+            self.compositor.handle_input()
+            me update_taskbar()
+            self.compositor.render_all()
+
+# ============================================================================
+# Taskbar Builder
+# ============================================================================
+
+fn _build_taskbar_tree(window_titles: [text], clock: text) -> UITree:
+    """Build the taskbar widget tree.
+
+    Layout: [App Button | Window List ... | Clock | System Tray]
+    """
+    # App launcher button
+    var launcher_btn = button("taskbar_launcher", "Apps", "launcher")
+    launcher_btn = with_width(launcher_btn, 60)
+
+    # Window list buttons
+    var window_buttons: [WidgetNode] = []
+    var win_idx: i32 = 0
+    for title in window_titles:
+        var win_btn = button("taskbar_win_{win_idx}", title, "focus_win_{title}")
+        win_btn = with_flex(win_btn, 1)
+        window_buttons = window_buttons.push(win_btn)
+        win_idx = win_idx + 1
+
+    # Window list container
+    var window_list_children: [WidgetNode] = []
+    for btn in window_buttons:
+        window_list_children = window_list_children.push(btn)
+    var window_list = row("taskbar_window_list", window_list_children)
+    window_list = with_flex(window_list, 1)
+
+    # Clock
+    var clock_label = label("taskbar_clock", clock)
+    clock_label = with_width(clock_label, CLOCK_WIDTH)
+
+    # System tray
+    var tray = row("taskbar_tray", [
+        label("taskbar_tray_cpu", "CPU"),
+        label("taskbar_tray_mem", "MEM")
+    ])
+    tray = with_width(tray, SYSTEM_TRAY_WIDTH)
+
+    # Assemble taskbar
+    val taskbar_row = row("taskbar_root", [
+        launcher_btn,
+        window_list,
+        clock_label,
+        tray
+    ])
+
+    build_tree_with_title(taskbar_row, "SimpleOS Taskbar", "dark")
+
+# ============================================================================
+# App Launcher Builder
+# ============================================================================
+
+fn _build_launcher_tree() -> UITree:
+    """Build the app launcher widget tree from app manifests."""
+    # Load app manifests dynamically
+    val manifests = load_app_manifests()
+
+    var app_buttons: [WidgetNode] = []
+    app_buttons = app_buttons.push(label("launcher_title", "Applications"))
+
+    # Group by category
+    var categories: [text] = ["System", "Utilities", "Development", "Settings"]
+    for category in categories:
+        var cat_apps: [AppManifest] = []
+        for m in manifests:
+            if m.category == category:
+                cat_apps = cat_apps.push(m)
+        if cat_apps.len() > 0:
+            app_buttons = app_buttons.push(label("launcher_cat_{category}", "-- {category} --"))
+            for app in cat_apps:
+                val action = "launch_{app.name}"
+                app_buttons = app_buttons.push(
+                    button("launcher_app_{app.name}", app.name, action)
+                )
+
+    val root = column("launcher_root", app_buttons)
+    build_tree_with_title(root, "App Launcher", "dark")
+
+# ============================================================================
+# Default App Tree Builder
+# ============================================================================
+
+fn _build_app_tree(name: text) -> UITree:
+    """Build a default widget tree for a new application window."""
+    val root = column("app_{name}_root", [
+        text_widget("app_{name}_content", "Welcome to {name}")
+    ])
+
+    build_tree_with_title(root, name, "dark")

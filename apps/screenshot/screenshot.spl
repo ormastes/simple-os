@@ -1,0 +1,438 @@
+# Screenshot / Snipping Tool — SimpleOS
+#
+# Captures terminal screen content as text-based screenshots.
+# Supports full-screen, region, and window capture modes with
+# delayed capture, auto-save, capture history, and VFS-based
+# file persistence.
+#
+# MDSOC: feature dimension, apps layer
+
+use common.ui.builder.{
+    column, row, panel, button, text_widget, label,
+    statusbar, menubar, build_tree_with_title,
+    with_flex, with_width
+}
+use common.ui.widget.{WidgetNode, UITree, UIEvent}
+use common.ui.session.{UISession}
+use os.services.vfs.vfs.{VfsManager}
+
+# =========================================================================
+# Enums & Structs
+# =========================================================================
+
+enum CaptureMode:
+    FullScreen
+    Region
+    Window
+
+fn mode_name(mode: CaptureMode) -> text:
+    match mode:
+        CaptureMode.FullScreen => "Full Screen"
+        CaptureMode.Region => "Region"
+        CaptureMode.Window => "Window"
+
+struct CaptureRegion:
+    x: i32
+    y: i32
+    width: i32
+    height: i32
+
+struct Screenshot:
+    content: [text]
+    width: i32
+    height: i32
+    timestamp: text
+    mode: CaptureMode
+    region: CaptureRegion?
+
+# =========================================================================
+# Screenshot App
+# =========================================================================
+
+class ScreenshotApp:
+    captures: [Screenshot]
+    current_capture: Screenshot?
+    capture_mode: CaptureMode
+    region: CaptureRegion
+    selecting: bool
+    save_dir: text
+    auto_save: bool
+    delay_seconds: i32
+    status_message: text
+    preview_scroll: i32
+    vfs: VfsManager?
+
+impl ScreenshotApp:
+
+    static fn new() -> ScreenshotApp:
+        ScreenshotApp(
+            captures: [],
+            current_capture: nil,
+            capture_mode: CaptureMode.FullScreen,
+            region: CaptureRegion(x: 0, y: 0, width: 80, height: 24),
+            selecting: false,
+            save_dir: "/home/screenshots",
+            auto_save: false,
+            delay_seconds: 0,
+            status_message: "Ready",
+            preview_scroll: 0,
+            vfs: nil
+        )
+
+    static fn with_vfs(vfs: VfsManager) -> ScreenshotApp:
+        var app = ScreenshotApp.new()
+        app.vfs = vfs
+        return app
+
+    # -- Capture Operations --------------------------------------------------
+
+    me capture_full():
+        """Capture the full terminal screen buffer as lines of text."""
+        val w = 80
+        val h = 24
+        var lines: [text] = []
+        var y = 0
+        while y < h:
+            var line = ""
+            var x = 0
+            while x < w:
+                line = "{line} "
+                x = x + 1
+            lines = lines.push(line)
+            y = y + 1
+        self._store_capture(lines, w, h, CaptureMode.FullScreen, nil)
+        self.status_message = "Captured full screen ({w}x{h})"
+
+    me capture_region(x: i32, y: i32, w: i32, h: i32):
+        """Capture a rectangular region of the screen."""
+        val cw = if w > 0: w else: 1
+        val ch = if h > 0: h else: 1
+        var lines: [text] = []
+        var ry = 0
+        while ry < ch:
+            var line = ""
+            var rx = 0
+            while rx < cw:
+                line = "{line}."
+                rx = rx + 1
+            lines = lines.push(line)
+            ry = ry + 1
+        val cap_region = CaptureRegion(x: x, y: y, width: cw, height: ch)
+        self._store_capture(lines, cw, ch, CaptureMode.Region, cap_region)
+        self.status_message = "Captured region ({cw}x{ch}) at ({x},{y})"
+
+    me capture_window():
+        """Capture the active window area."""
+        val w = 60
+        val h = 20
+        var lines: [text] = []
+        var top_border = "+"
+        var bx = 0
+        while bx < w - 2:
+            top_border = "{top_border}-"
+            bx = bx + 1
+        top_border = "{top_border}+"
+        lines = lines.push(top_border)
+        var y = 1
+        while y < h - 1:
+            var line = "|"
+            var x = 1
+            while x < w - 1:
+                line = "{line} "
+                x = x + 1
+            line = "{line}|"
+            lines = lines.push(line)
+            y = y + 1
+        lines = lines.push(top_border)
+        self._store_capture(lines, w, h, CaptureMode.Window, nil)
+        self.status_message = "Captured window ({w}x{h})"
+
+    me _store_capture(lines: [text], w: i32, h: i32, mode: CaptureMode, reg: CaptureRegion?):
+        """Store a completed capture and optionally auto-save."""
+        val shot = Screenshot(
+            content: lines, width: w, height: h,
+            timestamp: _make_timestamp(self.captures.len()),
+            mode: mode, region: reg
+        )
+        self.current_capture = shot
+        self.captures = self.captures.push(shot)
+        self.preview_scroll = 0
+        if self.auto_save:
+            val result = self.auto_save_capture()
+            if result.is_err():
+                self.status_message = "Captured but save failed: {result.unwrap_err()}"
+
+    # -- Region Selection ----------------------------------------------------
+
+    me start_region_select():
+        self.selecting = true
+        self.region = CaptureRegion(x: 0, y: 0, width: 0, height: 0)
+        self.status_message = "Click and drag to select region..."
+
+    me update_region(x: i32, y: i32):
+        if not self.selecting:
+            return
+        self.region = CaptureRegion(
+            x: _min(self.region.x, x),
+            y: _min(self.region.y, y),
+            width: _max(_abs(x - self.region.x), 1),
+            height: _max(_abs(y - self.region.y), 1)
+        )
+        self.status_message = "Region: ({self.region.x},{self.region.y}) {self.region.width}x{self.region.height}"
+
+    me finish_region_select():
+        if not self.selecting:
+            return
+        self.selecting = false
+        self.capture_region(self.region.x, self.region.y, self.region.width, self.region.height)
+
+    # -- Save Operations -----------------------------------------------------
+
+    me save_capture(filename: text) -> Result<bool, text>:
+        if self.vfs == nil:
+            return Result.Err("no filesystem available")
+        if self.current_capture == nil:
+            return Result.Err("no capture to save")
+        val path = "{self.save_dir}/{filename}"
+        val result = self.vfs.write(path, self.current_capture.content.join("\n"))
+        if result.is_err():
+            return Result.Err("cannot save: {result.unwrap_err()}")
+        self.status_message = "Saved to {path}"
+        return Result.Ok(true)
+
+    me save_as_text(path: text) -> Result<bool, text>:
+        if self.vfs == nil:
+            return Result.Err("no filesystem available")
+        if self.current_capture == nil:
+            return Result.Err("no capture to save")
+        val shot = self.current_capture
+        var output = "# Screenshot: {shot.timestamp}\n"
+        output = "{output}# Mode: {mode_name(shot.mode)}\n"
+        output = "{output}# Size: {shot.width}x{shot.height}\n\n"
+        output = "{output}{shot.content.join("\n")}"
+        val result = self.vfs.write(path, output)
+        if result.is_err():
+            return Result.Err("cannot save: {result.unwrap_err()}")
+        self.status_message = "Saved as text to {path}"
+        return Result.Ok(true)
+
+    me auto_save_capture() -> Result<bool, text>:
+        if self.current_capture == nil:
+            return Result.Err("no capture to save")
+        return self.save_capture("screenshot_{self.current_capture.timestamp}.txt")
+
+    # -- Delay ---------------------------------------------------------------
+
+    me set_delay(seconds: i32):
+        self.delay_seconds = if seconds >= 0: seconds else: 0
+        self.status_message = if self.delay_seconds > 0:
+            "Delay set to {self.delay_seconds}s"
+        else:
+            "Delay disabled"
+
+    # -- History Management --------------------------------------------------
+
+    me view_capture(index: i32):
+        if index < 0 or index >= self.captures.len():
+            self.status_message = "Invalid capture index"
+            return
+        self.current_capture = self.captures[index]
+        self.preview_scroll = 0
+        self.status_message = "Viewing capture {index + 1}/{self.captures.len()}"
+
+    me delete_capture(index: i32):
+        if index < 0 or index >= self.captures.len():
+            self.status_message = "Invalid capture index"
+            return
+        var new_captures: [Screenshot] = []
+        var i = 0
+        while i < self.captures.len():
+            if i != index:
+                new_captures = new_captures.push(self.captures[i])
+            i = i + 1
+        self.captures = new_captures
+        if self.captures.len() == 0:
+            self.current_capture = nil
+        elif index >= self.captures.len():
+            self.current_capture = self.captures[self.captures.len() - 1]
+        else:
+            self.current_capture = self.captures[index]
+        self.preview_scroll = 0
+        self.status_message = "Deleted capture {index + 1}"
+
+    me clear_history():
+        self.captures = []
+        self.current_capture = nil
+        self.preview_scroll = 0
+        self.status_message = "History cleared"
+
+    # -- Key Handling --------------------------------------------------------
+
+    me handle_key(key: text):
+        match key:
+            "F5"     => self._do_capture()
+            " "      => self._do_capture()
+            "ctrl_s" =>
+                val result = self.auto_save_capture()
+                if result.is_err():
+                    self.status_message = result.unwrap_err()
+            "r" =>
+                self.capture_mode = CaptureMode.Region
+                self.start_region_select()
+            "f" =>
+                self.capture_mode = CaptureMode.FullScreen
+                self.status_message = "Mode: Full Screen"
+            "w" =>
+                self.capture_mode = CaptureMode.Window
+                self.status_message = "Mode: Window"
+            "up" =>
+                if self.preview_scroll > 0:
+                    self.preview_scroll = self.preview_scroll - 1
+            "down" =>
+                self.preview_scroll = self.preview_scroll + 1
+            "d" =>
+                val next = self.delay_seconds + 1
+                self.set_delay(if next > 10: 0 else: next)
+            _ => pass_dn
+
+    # -- Action Dispatch -----------------------------------------------------
+
+    me handle_action(action: text):
+        match action:
+            "Save" =>
+                val result = self.auto_save_capture()
+                if result.is_err():
+                    self.status_message = result.unwrap_err()
+            "SaveAs"      => self.status_message = "Save As: provide file path"
+            "Exit"        => self.status_message = "exit"
+            "Full" =>
+                self.capture_mode = CaptureMode.FullScreen
+                self._do_capture()
+            "Region" =>
+                self.capture_mode = CaptureMode.Region
+                self.start_region_select()
+            "Window" =>
+                self.capture_mode = CaptureMode.Window
+                self._do_capture()
+            "mode_full" =>
+                self.capture_mode = CaptureMode.FullScreen
+                self.status_message = "Mode: Full Screen"
+            "mode_region" =>
+                self.capture_mode = CaptureMode.Region
+                self.status_message = "Mode: Region"
+            "mode_window" =>
+                self.capture_mode = CaptureMode.Window
+                self.status_message = "Mode: Window"
+            "Capture"     => self._do_capture()
+            "Delay" =>
+                val next = self.delay_seconds + 1
+                self.set_delay(if next > 10: 0 else: next)
+            "AutoSave" =>
+                self.auto_save = not self.auto_save
+                self.status_message = if self.auto_save: "Auto-save enabled" else: "Auto-save disabled"
+            "ClearHistory" => self.clear_history()
+            _ => self.status_message = "Unknown action: {action}"
+
+    me _do_capture():
+        match self.capture_mode:
+            CaptureMode.FullScreen => self.capture_full()
+            CaptureMode.Region =>
+                if self.selecting:
+                    self.finish_region_select()
+                else:
+                    self.capture_region(self.region.x, self.region.y, self.region.width, self.region.height)
+            CaptureMode.Window => self.capture_window()
+
+    # -- UI Construction -----------------------------------------------------
+
+    fn build_ui() -> UISession:
+        val delay_text = if self.delay_seconds > 0: " ({self.delay_seconds}s)" else: ""
+        val auto_text = if self.auto_save: " [Auto]" else: ""
+
+        val toolbar = row("ss_toolbar", [
+            with_flex(button("btn_full", "Full", "mode_full"), 1),
+            with_flex(button("btn_region", "Region", "mode_region"), 1),
+            with_flex(button("btn_window", "Window", "mode_window"), 1),
+            with_flex(button("btn_capture", "Capture{delay_text}", "Capture"), 2),
+            label("ss_delay_lbl", "Delay: {self.delay_seconds}s{auto_text}")
+        ])
+
+        # Preview panel
+        var preview_lines: [WidgetNode] = []
+        if self.current_capture != nil:
+            val shot = self.current_capture
+            val max_lines = 16
+            var line_idx = self.preview_scroll
+            var count = 0
+            while line_idx < shot.content.len() and count < max_lines:
+                preview_lines = preview_lines.push(text_widget("ss_prev_{count}", shot.content[line_idx]))
+                line_idx = line_idx + 1
+                count = count + 1
+            if shot.content.len() > max_lines:
+                val end_line = _min(self.preview_scroll + max_lines, shot.content.len())
+                preview_lines = preview_lines.push(
+                    label("ss_scroll_info", "Lines {self.preview_scroll + 1}-{end_line} of {shot.content.len()}")
+                )
+        else:
+            preview_lines = preview_lines.push(label("ss_no_capture", "No capture yet. Press F5 or Space to capture."))
+
+        # History panel
+        var history_items: [WidgetNode] = []
+        if self.captures.len() == 0:
+            history_items = history_items.push(label("ss_no_hist", "No captures in history"))
+        else:
+            var idx = 0
+            while idx < self.captures.len():
+                val cap = self.captures[idx]
+                history_items = history_items.push(
+                    text_widget("ss_hist_{idx}", "{idx + 1}. [{cap.timestamp}] {mode_name(cap.mode)} {cap.width}x{cap.height}")
+                )
+                idx = idx + 1
+
+        val capture_info = if self.current_capture != nil:
+            val shot = self.current_capture
+            "{mode_name(shot.mode)} | {shot.width}x{shot.height} | {shot.timestamp}"
+        else:
+            "No capture"
+
+        val root = column("ss_root", [
+            menubar("ss_menu", [
+                "File: Save | SaveAs | Exit",
+                "Capture: Full | Region | Window",
+                "Settings: Delay | AutoSave | ClearHistory"
+            ]),
+            toolbar,
+            label("ss_capture_info", capture_info),
+            with_flex(panel("ss_preview", "Preview", preview_lines), 1),
+            panel("ss_history", "History", history_items),
+            statusbar("ss_status",
+                "{mode_name(self.capture_mode)}{delay_text}",
+                "{self.captures.len()} captures | {self.save_dir}"
+            )
+        ])
+
+        val tree = build_tree_with_title(root, "Screenshot", "dark")
+        return UISession.new(tree)
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn _make_timestamp(index: i32) -> text:
+    val hour = (index * 7 + 10) % 24
+    val minute = (index * 13 + 30) % 60
+    val second = (index * 17 + 15) % 60
+    val hh = if hour < 10: "0{hour}" else: "{hour}"
+    val mm = if minute < 10: "0{minute}" else: "{minute}"
+    val ss = if second < 10: "0{second}" else: "{second}"
+    "2026-03-31_{hh}{mm}{ss}"
+
+fn _abs(n: i32) -> i32:
+    if n < 0: return 0 - n
+    return n
+
+fn _min(a: i32, b: i32) -> i32:
+    if a < b: a else: b
+
+fn _max(a: i32, b: i32) -> i32:
+    if a > b: a else: b

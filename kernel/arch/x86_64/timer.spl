@@ -1,0 +1,52 @@
+# x86_64 Timer HAL — APIC Timer / PIT Stub
+#
+# Stub implementation for the x86_64 timer subsystem.
+# x86_64 provides multiple timer sources:
+#   - Local APIC timer (preferred, per-CPU)
+#   - PIT (8254, legacy fallback)
+#   - HPET (high precision, if available)
+#   - TSC (timestamp counter, for fine-grained measurement)
+#
+# This file provides a HAL-compatible wrapper that will be filled in
+# when the timer subsystem is implemented.
+
+# ============================================================================
+# X86Timer
+# ============================================================================
+
+struct X86Timer:
+    """x86_64 timer management (APIC timer / PIT / HPET).
+
+    Stub — will implement APIC timer as primary, PIT as calibration
+    source, and optionally HPET for high-precision timing.
+    """
+    pass_dn
+
+impl X86Timer:
+    fn init():
+        """Initialize timer hardware (calibrate APIC timer via PIT)."""
+        pass_todo("calibrate APIC timer using PIT channel 2")
+
+    fn set_periodic(interval_us: u64):
+        """Set timer to fire periodically at given interval (microseconds)."""
+        pass_todo("configure APIC timer periodic mode")
+
+    fn set_oneshot(delay_us: u64):
+        """Set timer for a one-shot firing after delay (microseconds)."""
+        pass_todo("configure APIC timer one-shot mode")
+
+    fn stop():
+        """Stop the current timer."""
+        pass_todo("disable APIC timer")
+
+    fn current_ticks() -> u64:
+        """Read current tick count (TSC or APIC timer counter)."""
+        pass_todo("read TSC via RDTSC instruction")
+
+    fn ticks_per_second() -> u64:
+        """Return timer tick frequency (ticks per second)."""
+        pass_todo("return calibrated frequency")
+
+    fn elapsed_us() -> u64:
+        """Return microseconds elapsed since timer init."""
+        pass_todo("compute from TSC and calibrated frequency")

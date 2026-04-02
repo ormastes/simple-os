@@ -1,0 +1,314 @@
+# Physical Memory Manager — Memory Layer (Layer 1)
+#
+# Bitmap-based page frame allocator.
+# Each bit represents one 4KB physical page frame.
+# 1 = allocated, 0 = free.
+#
+# Initialized from BootOutputPort memory map.
+# Provides pmm_alloc_page / pmm_free_page for the VMM and upper layers.
+
+use os.kernel.types.memory_types.{PhysAddr, PageFrame}
+use os.kernel.boot.ports.{BootOutputPort, BootMemoryRegion, MemoryRegionKind}
+use os.kernel.boot.mmio.{mmio_read8, mmio_write8, mmio_read64, mmio_write64}
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+val PAGE_SIZE: u64 = 4096
+val BITS_PER_BYTE: u64 = 8
+
+# Maximum physical memory supported: 4GB = 1,048,576 pages = 128KB bitmap
+val MAX_PHYS_PAGES: u64 = 1048576
+val BITMAP_SIZE_BYTES: u64 = 131072      # MAX_PHYS_PAGES / 8
+
+# ============================================================================
+# Physical Memory Manager
+# ============================================================================
+
+struct PhysMemManager:
+    """Bitmap-based physical page frame allocator.
+
+    Each bit in the bitmap represents one 4KB page.
+    Bit = 1 means allocated, bit = 0 means free.
+    """
+    bitmap_addr: u64        # Virtual address of the bitmap
+    total_pages: u64        # Total tracked page frames
+    free_pages: u64         # Number of free page frames
+    last_alloc_index: u64   # Hint for next-fit search optimization
+
+impl PhysMemManager:
+    fn total_memory() -> u64:
+        """Total tracked physical memory in bytes."""
+        self.total_pages * PAGE_SIZE
+
+    fn free_memory() -> u64:
+        """Free physical memory in bytes."""
+        self.free_pages * PAGE_SIZE
+
+    fn used_pages() -> u64:
+        """Number of allocated page frames."""
+        self.total_pages - self.free_pages
+
+# ============================================================================
+# Bitmap Helpers
+# ============================================================================
+
+fn _bitmap_set(manager: PhysMemManager, page_index: u64):
+    """Mark a page as allocated (set bit to 1)."""
+    val byte_index = page_index / BITS_PER_BYTE
+    val bit_offset = page_index % BITS_PER_BYTE
+    val addr = manager.bitmap_addr + byte_index
+    val current = mmio_read8(addr)
+    val mask = (1 as u8) << (bit_offset as u8)
+    mmio_write8(addr, current | mask)
+
+fn _bitmap_clear(manager: PhysMemManager, page_index: u64):
+    """Mark a page as free (clear bit to 0)."""
+    val byte_index = page_index / BITS_PER_BYTE
+    val bit_offset = page_index % BITS_PER_BYTE
+    val addr = manager.bitmap_addr + byte_index
+    val current = mmio_read8(addr)
+    val mask = (1 as u8) << (bit_offset as u8)
+    mmio_write8(addr, current & (~mask))
+
+fn _bitmap_test(manager: PhysMemManager, page_index: u64) -> bool:
+    """Test if a page is allocated (bit is 1)."""
+    val byte_index = page_index / BITS_PER_BYTE
+    val bit_offset = page_index % BITS_PER_BYTE
+    val addr = manager.bitmap_addr + byte_index
+    val current = mmio_read8(addr)
+    val mask = (1 as u8) << (bit_offset as u8)
+    (current & mask) != 0
+
+fn _bitmap_clear_all(bitmap_addr: u64, size_bytes: u64):
+    """Clear entire bitmap (mark all pages as allocated initially)."""
+    var i: u64 = 0
+    while i < size_bytes:
+        mmio_write8(bitmap_addr + i, 0xFF)  # All allocated
+        i = i + 1
+
+# ============================================================================
+# PMM Initialization
+# ============================================================================
+
+# Global PMM instance
+var g_pmm: PhysMemManager = PhysMemManager(
+    bitmap_addr: 0,
+    total_pages: 0,
+    free_pages: 0,
+    last_alloc_index: 0
+)
+
+# Forward declaration for serial debug
+extern fn serial_println(msg: text)
+
+fn pmm_init(boot_info: BootOutputPort):
+    """Initialize PMM from boot memory map.
+
+    1. Find a usable region large enough for the bitmap
+    2. Place bitmap there and mark it as allocated
+    3. Walk memory map marking usable pages as free
+    4. Mark kernel, bootloader, and reserved regions as allocated
+    """
+    serial_println("[PMM] Initializing physical memory manager...")
+
+    # Step 1: Determine total physical memory extent
+    var max_addr: u64 = 0
+    for region in boot_info.memory_map:
+        val region_end = region.base.addr + region.size
+        if region_end > max_addr:
+            max_addr = region_end
+
+    val total_pages = max_addr / PAGE_SIZE
+    val bitmap_bytes = (total_pages + 7) / BITS_PER_BYTE
+
+    serial_println("[PMM] Physical memory extent: 0x{max_addr}")
+    serial_println("[PMM] Total pages: {total_pages}")
+    serial_println("[PMM] Bitmap size: {bitmap_bytes} bytes")
+
+    # Step 2: Find a usable region for the bitmap
+    # We need a usable region that can hold the bitmap and is not the kernel
+    var bitmap_addr: u64 = 0
+    for region in boot_info.memory_map:
+        val is_usable = match region.kind:
+            MemoryRegionKind.Usable: true
+            _: false
+        if is_usable:
+            if region.size >= bitmap_bytes:
+                # Use start of this region for bitmap
+                bitmap_addr = region.base.addr
+                break
+
+    if bitmap_addr == 0:
+        serial_println("[PMM] FATAL: No suitable region for bitmap")
+        return
+
+    serial_println("[PMM] Bitmap placed at physical 0x{bitmap_addr}")
+
+    # Step 3: Initialize the bitmap — mark everything as allocated first
+    _bitmap_clear_all(bitmap_addr, bitmap_bytes)
+
+    # Initialize global PMM
+    g_pmm = PhysMemManager(
+        bitmap_addr: bitmap_addr,
+        total_pages: total_pages,
+        free_pages: 0,
+        last_alloc_index: 0
+    )
+
+    # Step 4: Walk memory map, mark usable regions as free
+    for region in boot_info.memory_map:
+        val is_usable = match region.kind:
+            MemoryRegionKind.Usable: true
+            _: false
+        if is_usable:
+            val start_page = region.base.addr / PAGE_SIZE
+            val page_count = region.size / PAGE_SIZE
+            var p: u64 = 0
+            while p < page_count:
+                _bitmap_clear(g_pmm, start_page + p)
+                g_pmm.free_pages = g_pmm.free_pages + 1
+                p = p + 1
+
+    # Step 5: Re-mark the bitmap region itself as allocated
+    val bitmap_start_page = bitmap_addr / PAGE_SIZE
+    val bitmap_page_count = (bitmap_bytes + PAGE_SIZE - 1) / PAGE_SIZE
+    var bp: u64 = 0
+    while bp < bitmap_page_count:
+        val page_idx = bitmap_start_page + bp
+        if not _bitmap_test(g_pmm, page_idx):
+            _bitmap_set(g_pmm, page_idx)
+            g_pmm.free_pages = g_pmm.free_pages - 1
+        bp = bp + 1
+
+    # Step 6: Mark kernel region as allocated
+    val kernel_start_page = boot_info.kernel_phys_base.addr / PAGE_SIZE
+    val kernel_page_count = (boot_info.kernel_size + PAGE_SIZE - 1) / PAGE_SIZE
+    var kp: u64 = 0
+    while kp < kernel_page_count:
+        val page_idx = kernel_start_page + kp
+        if not _bitmap_test(g_pmm, page_idx):
+            _bitmap_set(g_pmm, page_idx)
+            g_pmm.free_pages = g_pmm.free_pages - 1
+        kp = kp + 1
+
+    # Step 7: Always reserve the first 1MB (real mode, BIOS, legacy)
+    var low_page: u64 = 0
+    while low_page < 256:  # 256 pages = 1MB
+        if not _bitmap_test(g_pmm, low_page):
+            _bitmap_set(g_pmm, low_page)
+            g_pmm.free_pages = g_pmm.free_pages - 1
+        low_page = low_page + 1
+
+    serial_println("[PMM] Initialization complete")
+    serial_println("[PMM] Free pages: {g_pmm.free_pages} ({g_pmm.free_memory() / 1024}KB)")
+    serial_println("[PMM] Used pages: {g_pmm.used_pages()}")
+
+# ============================================================================
+# Page Allocation
+# ============================================================================
+
+fn pmm_alloc_page() -> PageFrame?:
+    """Allocate a single 4KB page frame.
+
+    Uses next-fit search starting from last allocation index.
+    Returns nil if no free pages available.
+    """
+    if g_pmm.free_pages == 0:
+        return nil
+
+    # Next-fit search: start from last allocation hint
+    var index = g_pmm.last_alloc_index
+    var checked: u64 = 0
+
+    while checked < g_pmm.total_pages:
+        if not _bitmap_test(g_pmm, index):
+            # Found free page
+            _bitmap_set(g_pmm, index)
+            g_pmm.free_pages = g_pmm.free_pages - 1
+            g_pmm.last_alloc_index = index + 1
+            if g_pmm.last_alloc_index >= g_pmm.total_pages:
+                g_pmm.last_alloc_index = 0
+            return PageFrame(pfn: index)
+
+        index = index + 1
+        if index >= g_pmm.total_pages:
+            index = 0
+        checked = checked + 1
+
+    # No free page found (should not happen if free_pages > 0)
+    nil
+
+fn pmm_free_page(frame: PageFrame):
+    """Free a single 4KB page frame.
+
+    Marks the page as available. Double-free is silently ignored.
+    """
+    val index = frame.pfn
+    if index >= g_pmm.total_pages:
+        return  # Out of range
+
+    if _bitmap_test(g_pmm, index):
+        _bitmap_clear(g_pmm, index)
+        g_pmm.free_pages = g_pmm.free_pages + 1
+
+fn pmm_alloc_pages(count: u64) -> PhysAddr?:
+    """Allocate contiguous physical pages.
+
+    Searches for a run of 'count' consecutive free pages.
+    Returns physical address of the first page, or nil if not available.
+    """
+    if count == 0:
+        return nil
+    if g_pmm.free_pages < count:
+        return nil
+
+    # Linear scan for contiguous free run
+    var start: u64 = 0
+    while start + count <= g_pmm.total_pages:
+        var found = true
+        var offset: u64 = 0
+        while offset < count:
+            if _bitmap_test(g_pmm, start + offset):
+                # Page is allocated, skip past it
+                start = start + offset + 1
+                found = false
+                break
+            offset = offset + 1
+
+        if found:
+            # Mark all pages as allocated
+            var i: u64 = 0
+            while i < count:
+                _bitmap_set(g_pmm, start + i)
+                i = i + 1
+            g_pmm.free_pages = g_pmm.free_pages - count
+            return PhysAddr(addr: start * PAGE_SIZE)
+
+    # No contiguous run found
+    nil
+
+# ============================================================================
+# PMM Query Interface
+# ============================================================================
+
+fn pmm_get_manager() -> PhysMemManager:
+    """Get reference to the global PMM (for VMM init)."""
+    g_pmm
+
+fn pmm_total_pages() -> u64:
+    """Total number of tracked page frames."""
+    g_pmm.total_pages
+
+fn pmm_free_pages() -> u64:
+    """Number of free page frames."""
+    g_pmm.free_pages
+
+fn pmm_total_memory() -> u64:
+    """Total tracked physical memory in bytes."""
+    g_pmm.total_memory()
+
+fn pmm_free_memory() -> u64:
+    """Free physical memory in bytes."""
+    g_pmm.free_memory()

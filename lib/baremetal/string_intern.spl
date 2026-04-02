@@ -1,0 +1,209 @@
+# StringIntern SMF Section Support
+#
+# Implements the StringIntern section (type 0x10) for SMF files.
+# Stores interned print strings with handles and format metadata.
+#
+# This module provides:
+# - FormatType: Enum for parameter format types
+# - StringInternEntry: Individual interned string entry
+# - StringInternTable: Collection of interned strings with lookup
+# - Writer/Reader for SMF StringIntern section
+
+# SMF section type for string interning
+val SMF_SECTION_STRING_INTERN: i32 = 0x10
+
+# ============================================================================
+# Format Type Enum
+# ============================================================================
+
+enum FormatType:
+    Void
+    Int8
+    Int16
+    Int32
+    Int64
+    UInt8
+    UInt16
+    UInt32
+    UInt64
+    Float32
+    Float64
+    Bool
+    Char
+    Hex8
+    Hex16
+    Hex32
+    Hex64
+    Binary
+    Pointer
+    Text
+
+# ============================================================================
+# StringIntern Entry Structure
+# ============================================================================
+
+# Represents a single interned string entry
+class StringInternEntry:
+    handle: i32               # Unique handle ID
+    text: text                # The format string (with {} placeholders)
+    format_types: [FormatType]  # Format types for each parameter
+    param_count: i32          # Number of parameters
+    source_file: text         # Source file where string originated
+    source_line: i32          # Source line number
+
+impl StringInternEntry:
+    # Create a new entry
+    static fn create(h: i32, fmt: text, params: i32) -> StringInternEntry:
+        StringInternEntry(
+            handle: h,
+            text: fmt,
+            format_types: [],
+            param_count: params,
+            source_file: "",
+            source_line: 0
+        )
+
+    # Create entry with source location
+    static fn with_source(h: i32, fmt: text, params: i32, file: text, line: i32) -> StringInternEntry:
+        StringInternEntry(
+            handle: h,
+            text: fmt,
+            format_types: [],
+            param_count: params,
+            source_file: file,
+            source_line: line
+        )
+
+    # Create entry with format types
+    static fn with_formats(h: i32, fmt: text, types: [FormatType]) -> StringInternEntry:
+        StringInternEntry(
+            handle: h,
+            text: fmt,
+            format_types: types,
+            param_count: types.len() as i32,
+            source_file: "",
+            source_line: 0
+        )
+
+# ============================================================================
+# StringIntern Table
+# ============================================================================
+
+# Collection of interned strings with array-backed storage
+class StringInternTable:
+    entries: [StringInternEntry]
+    next_handle: i32
+
+impl StringInternTable:
+    # Create a new empty table
+    static fn create() -> StringInternTable:
+        StringInternTable(
+            entries: [],
+            next_handle: 1
+        )
+
+    # Create empty table (alias used by reader)
+    static fn with_test_handles() -> StringInternTable:
+        StringInternTable(
+            entries: [],
+            next_handle: 1
+        )
+
+    # Add a string and get its handle (auto-assigned)
+    me add(format_text: text, param_count: i32) -> i32:
+        val h = self.next_handle
+        self.next_handle = self.next_handle + 1
+        val entry = StringInternEntry(
+            handle: h,
+            text: format_text,
+            format_types: [],
+            param_count: param_count,
+            source_file: "",
+            source_line: 0
+        )
+        self.entries.push(entry)
+        h
+
+    # Add a reserved entry with specific handle
+    me add_reserved(handle: i32, format_text: text, types: [FormatType]):
+        val entry = StringInternEntry(
+            handle: handle,
+            text: format_text,
+            format_types: types,
+            param_count: types.len() as i32,
+            source_file: "",
+            source_line: 0
+        )
+        self.entries.push(entry)
+        # Keep next_handle above any reserved handle
+        if handle >= self.next_handle:
+            self.next_handle = handle + 1
+
+    # Get entry by handle (linear scan)
+    fn get(handle: i32) -> StringInternEntry?:
+        var i = 0
+        while i < self.entries.len():
+            val entry = self.entries[i]
+            if entry.handle == handle:
+                return entry
+            i = i + 1
+        nil
+
+    # Get all entries
+    fn all_entries() -> [StringInternEntry]:
+        self.entries
+
+    # Get entry count
+    fn count() -> i32:
+        self.entries.len() as i32
+
+    # Check if table has entries
+    fn has_entries() -> bool:
+        self.entries.len() > 0
+
+# ============================================================================
+# Binary Format Writer (Stub)
+# ============================================================================
+
+# Binary section format:
+#   [u32] entry_count
+#   For each entry:
+#     [u32] handle
+#     [u16] text_len
+#     [bytes] text (UTF-8)
+#     [u8] param_count
+#     [u8 * param_count] format_types
+#     [u16] source_file_len (0 if none)
+#     [bytes] source_file (if len > 0)
+#     [u32] source_line
+
+fn write_string_intern_section(table: StringInternTable) -> bool:
+    # Stub: would write binary section data
+    print "[STRING_INTERN] Writing {table.count()} entries"
+    true
+
+fn read_string_intern_section(data: [u8]) -> Result<StringInternTable, text>:
+    # Stub: would read binary section data from bytes
+    # For now returns empty table
+    Ok(StringInternTable.create())
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+# Count placeholders in format string
+fn count_placeholders(format_text: text) -> i32:
+    var count = 0
+    var i = 0
+    while i < format_text.len() - 1:
+        if format_text[i] == "{" and format_text[i + 1] == "}":
+            count = count + 1
+            i = i + 2
+        else:
+            i = i + 1
+    count
+
+# Validate format string
+fn validate_format_string(format_text: text) -> bool:
+    # Check for balanced braces, valid escape sequences, etc.
+    true

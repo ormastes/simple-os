@@ -1,0 +1,265 @@
+# UI Layout Engine
+#
+# Computes WidgetRect positions for a WidgetNode tree.
+# Supports VBox (vertical stack), HBox (horizontal split),
+# Grid, and Fixed layout modes with flex sizing.
+
+use common.ui.widget.{WidgetNode, WidgetRect}
+
+# =========================================================================
+# Layout Computation
+# =========================================================================
+
+fn compute_layout(node: WidgetNode, x: i32, y: i32, w: i32, h: i32) -> [WidgetRect]:
+    """Compute layout rectangles for a widget tree."""
+    var rects: [WidgetRect] = []
+
+    # Add rect for this node
+    rects = rects.push(WidgetRect(id: node.id, x: x, y: y, w: w, h: h))
+
+    if not node.is_visible():
+        return rects
+
+    # Compute inner area (account for borders on panels)
+    var inner_x = x
+    var inner_y = y
+    var inner_w = w
+    var inner_h = h
+
+    if node.kind_name() == "panel":
+        # Panel has a 1-char border
+        inner_x = x + 1
+        inner_y = y + 1
+        inner_w = w - 2
+        inner_h = h - 2
+
+    # Scroll container clips inner height to max_height
+    if node.kind_name() == "scroll":
+        val max_h_str = node.get_prop("max_height")
+        if max_h_str != "":
+            val max_h = max_h_str.to_int()
+            if max_h > 0 and inner_h > max_h:
+                inner_h = max_h
+
+    if inner_w <= 0 or inner_h <= 0:
+        return rects
+
+    val visible_children = get_visible_children(node)
+    if visible_children.len() == 0:
+        return rects
+
+    # Layout children based on layout kind
+    if node.layout_name() == "vbox":
+        val child_rects = layout_vbox(visible_children, inner_x, inner_y, inner_w, inner_h)
+        for cr in child_rects:
+            rects = rects.push(cr)
+    elif node.layout_name() == "hbox":
+        val child_rects = layout_hbox(visible_children, inner_x, inner_y, inner_w, inner_h)
+        for cr in child_rects:
+            rects = rects.push(cr)
+    elif node.layout_name() == "grid":
+        val child_rects = layout_grid(visible_children, inner_x, inner_y, inner_w, inner_h)
+        for cr in child_rects:
+            rects = rects.push(cr)
+    else:
+        val child_rects = layout_fixed(visible_children, inner_x, inner_y, inner_w, inner_h)
+        for cr in child_rects:
+            rects = rects.push(cr)
+
+    return rects
+
+fn get_visible_children(node: WidgetNode) -> [WidgetNode]:
+    var result: [WidgetNode] = []
+    for child in node.children():
+        if child.is_visible():
+            result = result.push(child)
+    return result
+
+# =========================================================================
+# VBox Layout (vertical stacking)
+# =========================================================================
+
+fn layout_vbox(children: [WidgetNode], x: i32, y: i32, w: i32, h: i32) -> [WidgetRect]:
+    var rects: [WidgetRect] = []
+    val count = children.len()
+    if count == 0:
+        return rects
+
+    # Calculate sizes: fixed-height items first, then distribute remaining
+    var total_fixed: i32 = 0
+    var flex_count: i32 = 0
+
+    for child in children:
+        val fixed_h = get_fixed_height(child)
+        if fixed_h > 0:
+            total_fixed = total_fixed + fixed_h
+        else:
+            flex_count = flex_count + 1
+
+    val remaining = h - total_fixed
+    val flex_h = if flex_count > 0: remaining / flex_count else: 0
+    val flex_remainder = if flex_count > 0: remaining - flex_h * flex_count else: 0
+
+    var cur_y = y
+    var flex_idx: i32 = 0
+    for child in children:
+        val child_h = get_fixed_height(child)
+        var actual_h: i32 = 0
+        if child_h > 0:
+            actual_h = child_h
+        else:
+            flex_idx = flex_idx + 1
+            if flex_idx == flex_count:
+                actual_h = flex_h + flex_remainder
+            else:
+                actual_h = flex_h
+
+        if actual_h > 0:
+            val child_rects = compute_layout(child, x, cur_y, w, actual_h)
+            for cr in child_rects:
+                rects = rects.push(cr)
+            cur_y = cur_y + actual_h
+
+    return rects
+
+# =========================================================================
+# HBox Layout (horizontal stacking)
+# =========================================================================
+
+fn layout_hbox(children: [WidgetNode], x: i32, y: i32, w: i32, h: i32) -> [WidgetRect]:
+    var rects: [WidgetRect] = []
+    val count = children.len()
+    if count == 0:
+        return rects
+
+    # Calculate sizes: fixed-width items first, then distribute remaining
+    var total_fixed: i32 = 0
+    var total_flex: i32 = 0
+
+    for child in children:
+        val fixed_w = get_fixed_width(child)
+        if fixed_w > 0:
+            total_fixed = total_fixed + fixed_w
+        else:
+            val flex = get_flex(child)
+            total_flex = total_flex + flex
+
+    val remaining = w - total_fixed
+    val flex_unit = if total_flex > 0: remaining / total_flex else: 0
+    val flex_remainder = if total_flex > 0: remaining - flex_unit * total_flex else: 0
+
+    var cur_x = x
+    var flex_idx: i32 = 0
+    for child in children:
+        val fixed_w = get_fixed_width(child)
+        var actual_w: i32 = 0
+        if fixed_w > 0:
+            actual_w = fixed_w
+        else:
+            val flex = get_flex(child)
+            flex_idx = flex_idx + flex
+            if flex_idx >= total_flex:
+                actual_w = flex * flex_unit + flex_remainder
+            else:
+                actual_w = flex * flex_unit
+
+        if actual_w > 0:
+            val child_rects = compute_layout(child, cur_x, y, actual_w, h)
+            for cr in child_rects:
+                rects = rects.push(cr)
+            cur_x = cur_x + actual_w
+
+    return rects
+
+# =========================================================================
+# Grid Layout
+# =========================================================================
+
+fn layout_grid(children: [WidgetNode], x: i32, y: i32, w: i32, h: i32) -> [WidgetRect]:
+    var rects: [WidgetRect] = []
+    val count = children.len()
+    if count == 0:
+        return rects
+
+    # Auto-calculate columns (square-ish grid)
+    var cols = 1
+    while cols * cols < count:
+        cols = cols + 1
+    val rows = (count + cols - 1) / cols
+
+    val cell_w = w / cols
+    val cell_h = h / rows
+
+    var idx = 0
+    for child in children:
+        val grid_row = idx / cols
+        val grid_col = idx - (grid_row * cols)
+        val cell_x = x + (grid_col * cell_w)
+        val cell_y = y + (grid_row * cell_h)
+
+        val child_rects = compute_layout(child, cell_x, cell_y, cell_w, cell_h)
+        for cr in child_rects:
+            rects = rects.push(cr)
+        idx = idx + 1
+
+    return rects
+
+# =========================================================================
+# Fixed Layout (absolute positioning)
+# =========================================================================
+
+fn layout_fixed(children: [WidgetNode], x: i32, y: i32, w: i32, h: i32) -> [WidgetRect]:
+    var rects: [WidgetRect] = []
+    for child in children:
+        # Fixed layout uses the full parent area for each child
+        val child_w = get_fixed_width(child)
+        val child_h = get_fixed_height(child)
+        val actual_w = if child_w > 0: child_w else: w
+        val actual_h = if child_h > 0: child_h else: h
+        val child_rects = compute_layout(child, x, y, actual_w, actual_h)
+        for cr in child_rects:
+            rects = rects.push(cr)
+    return rects
+
+# =========================================================================
+# Property Helpers
+# =========================================================================
+
+fn get_fixed_width(node: WidgetNode) -> i32:
+    val w = node.get_prop("width")
+    if w != "":
+        return w.to_int()
+    return 0
+
+fn get_fixed_height(node: WidgetNode) -> i32:
+    val h = node.get_prop("height")
+    if h != "":
+        return h.to_int()
+    val kind = node.kind_name()
+    if kind == "statusbar" or kind == "menubar":
+        return 1
+    if kind == "scroll":
+        val max_h = node.get_prop("max_height")
+        if max_h != "":
+            return max_h.to_int()
+    if kind == "textarea":
+        val rows = node.get_prop("rows")
+        if rows != "":
+            return rows.to_int()
+    return 0
+
+fn get_flex(node: WidgetNode) -> i32:
+    val f = node.get_prop("flex")
+    if f != "":
+        return f.to_int()
+    return 1
+
+# =========================================================================
+# Layout Lookup
+# =========================================================================
+
+fn find_rect(rects: [WidgetRect], id: text) -> WidgetRect?:
+    for rect in rects:
+        if rect.id == id:
+            return rect
+    return nil

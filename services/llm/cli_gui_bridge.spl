@@ -1,0 +1,195 @@
+# CLI-GUI Bridge — Unified Rendering for UISession
+#
+# Bridges CLI and GUI rendering of the same UISession.
+#
+# When an LLM generates a widget tree:
+#   1. Widget tree stored in UISession
+#   2. RenderBackend renders it as pixels in a window (if attached)
+#   3. CLIObserver renders it as formatted text for terminal (if attached)
+#   4. LLM can read either representation via MCP tools
+#
+# This means the same UI description works for:
+#   - GUI desktop users (see rendered windows)
+#   - CLI/SSH users (see text representation)
+#   - LLMs (read/write widget trees via MCP tools)
+
+use common.ui.session.{UISession, new_session}
+use common.ui.widget.{UITree, WidgetNode, UIState}
+use common.ui.builder.{build_tree}
+
+# =========================================================================
+# RenderBackend Trait (duck-typed via struct)
+# =========================================================================
+
+struct RenderBackend:
+    """Backend that can render a UITree to pixels (framebuffer, etc.).
+
+    In SimpleOS, this is implemented by the compositor's FramebufferBackend.
+    The struct wraps function references for render dispatch."""
+    name: text
+    render_fn: text         # Function name for rendering dispatch
+    active: bool
+
+# =========================================================================
+# CliGuiBridge
+# =========================================================================
+
+class CliGuiBridge:
+    """Bridges CLI and GUI rendering of the same UISession.
+
+    The session is the single source of truth. Multiple backends
+    can observe and render the same state simultaneously."""
+    session: UISession
+    gui_backend: RenderBackend?
+    cli_active: bool
+    cli_max_lines: i32
+
+impl CliGuiBridge:
+
+    static fn new(session: UISession) -> CliGuiBridge:
+        """Create a bridge with the given session. No backends attached yet."""
+        return CliGuiBridge(
+            session: session,
+            gui_backend: nil,
+            cli_active: false,
+            cli_max_lines: 40
+        )
+
+    static fn new_headless() -> CliGuiBridge:
+        """Create a headless bridge (no session tree, for testing)."""
+        val root = WidgetNode.new("root", "panel")
+        val tree = build_tree(root)
+        val session = new_session(tree)
+        return CliGuiBridge(
+            session: session,
+            gui_backend: nil,
+            cli_active: false,
+            cli_max_lines: 40
+        )
+
+    # =================================================================
+    # Backend Attachment
+    # =================================================================
+
+    me attach_gui(backend: RenderBackend):
+        """Attach a GUI rendering backend (framebuffer, etc.)."""
+        self.gui_backend = backend
+        self.session.set_active_backend(backend.name)
+
+    me detach_gui():
+        """Detach the GUI backend."""
+        self.gui_backend = nil
+
+    me attach_cli(max_lines: i32):
+        """Enable CLI text rendering with the given line budget."""
+        self.cli_active = true
+        self.cli_max_lines = max_lines
+
+    me detach_cli():
+        """Disable CLI text rendering."""
+        self.cli_active = false
+
+    # =================================================================
+    # Rendering
+    # =================================================================
+
+    me render():
+        """Render to all attached backends.
+
+        GUI backend receives a render signal.
+        CLI output is generated on demand via to_text()."""
+        if self.gui_backend != nil:
+            # GUI rendering is handled by the compositor's render loop
+            # which reads from the session's surface manager.
+            # We just ensure the session state is consistent.
+            pass_dn
+
+        # CLI rendering happens lazily via to_text() when requested
+        # by MCP tool_widget_read or screenshot.
+
+    # =================================================================
+    # DSL Update
+    # =================================================================
+
+    me update_from_dsl(dsl: text) -> Result<bool, text>:
+        """Parse DSL, update session, render to all backends.
+
+        Convenience method that combines evaluation and rendering."""
+        use os.services.llm.widget_eval.{WidgetDslEvaluator}
+
+        var evaluator = WidgetDslEvaluator.new()
+        val result = evaluator.evaluate_into(dsl, self.session)
+        match result:
+            Ok(_):
+                self.render()
+                return Ok(true)
+            Err(e):
+                return Err(e)
+
+    # =================================================================
+    # Text Output
+    # =================================================================
+
+    fn to_text() -> text:
+        """Get text representation of current UI state.
+
+        Returns a formatted text description suitable for:
+        - LLM reading (via MCP tools)
+        - CLI/SSH terminal display
+        - Logging and debugging"""
+        val tree = self.session.current_tree()
+        val root = tree.root_node()
+        var out = "=== UI State ===\n"
+        out = "{out}Mode: {self.session.current_mode()}\n"
+        out = "{out}Surfaces: {self.session.surface_count()}\n"
+        out = "{out}Backend: {self.session.active_backend()}\n"
+        out = "{out}\n"
+        out = "{out}{_render_tree_text(root, 0)}"
+
+        # Include recent changes
+        val changes = self.session.recent_changes(5)
+        if changes.len() > 0:
+            out = "{out}\n--- Recent Changes ---\n"
+            for change in changes:
+                out = "{out}  {change}\n"
+
+        return out
+
+    fn to_summary() -> text:
+        """Get a brief summary of the UI state."""
+        val tree = self.session.current_tree()
+        val count = _count_widgets(tree.root_node())
+        return "UISession: {count} widgets, {self.session.surface_count()} surfaces, mode={self.session.current_mode()}"
+
+    fn has_gui() -> bool:
+        """Check if a GUI backend is attached."""
+        return self.gui_backend != nil
+
+    fn has_cli() -> bool:
+        """Check if CLI rendering is active."""
+        return self.cli_active
+
+# =========================================================================
+# Module-level Helpers
+# =========================================================================
+
+fn _render_tree_text(node: WidgetNode, depth: i32) -> text:
+    """Render a widget tree as indented text."""
+    var indent = ""
+    var i = 0
+    while i < depth:
+        indent = "{indent}  "
+        i = i + 1
+    var out = "{indent}{node.widget_summary()}\n"
+    val children = node.children()
+    for child in children:
+        out = "{out}{_render_tree_text(child, depth + 1)}"
+    return out
+
+fn _count_widgets(node: WidgetNode) -> i32:
+    """Count total widgets in a tree."""
+    var count = 1
+    val children = node.children()
+    for child in children:
+        count = count + _count_widgets(child)
+    return count

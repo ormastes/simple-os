@@ -1,0 +1,55 @@
+# x86_64 Interrupt HAL — IDT, APIC, PIC Stub
+#
+# Stub implementation for the x86_64 interrupt subsystem.
+# The full IDT setup, APIC configuration, and PIC masking live in
+# src/os/kernel/interrupts/ (idt.spl, apic.spl, pic.spl).
+#
+# This file provides a HAL-compatible wrapper that will eventually
+# delegate to those existing implementations.
+
+# ============================================================================
+# X86Interrupt
+# ============================================================================
+
+struct X86Interrupt:
+    """x86_64 interrupt management (IDT + APIC/PIC).
+
+    Stub — delegates to existing interrupts/ directory code.
+    See: src/os/kernel/interrupts/idt.spl
+         src/os/kernel/interrupts/apic.spl
+         src/os/kernel/interrupts/pic.spl
+    """
+    pass_dn
+
+impl X86Interrupt:
+    fn init():
+        """Initialize IDT, remap PIC, configure APIC."""
+        pass_todo("delegate to existing interrupts/idt.spl init")
+
+    fn enable():
+        """Enable interrupts (STI)."""
+        pass_todo("call rt_sti()")
+
+    fn disable():
+        """Disable interrupts (CLI)."""
+        pass_todo("call rt_cli()")
+
+    fn register_handler(vector: u64, handler_addr: u64):
+        """Register an interrupt handler for a given vector number."""
+        pass_todo("write IDT entry for vector")
+
+    fn unregister_handler(vector: u64):
+        """Remove interrupt handler for a given vector number."""
+        pass_todo("clear IDT entry for vector")
+
+    fn send_eoi(vector: u64):
+        """Send End-Of-Interrupt for given vector."""
+        pass_todo("APIC EOI or PIC EOI depending on vector")
+
+    fn set_irq_mask(irq: u64, masked: bool):
+        """Mask or unmask a hardware IRQ line."""
+        pass_todo("PIC/IOAPIC mask control")
+
+    fn acknowledge():
+        """Acknowledge the current interrupt (generic EOI)."""
+        pass_todo("send EOI to LAPIC")

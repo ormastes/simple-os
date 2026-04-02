@@ -1,0 +1,47 @@
+# x86_64 GDT — Global Descriptor Table (x86-specific)
+#
+# The GDT is an x86-specific hardware structure that defines memory
+# segments and privilege levels. In long mode (64-bit), segmentation
+# is mostly vestigial, but the GDT is still required for:
+#   - Kernel/user code and data segment selectors
+#   - Task State Segment (TSS) for interrupt stack switching
+#   - Syscall/sysret segment configuration
+#
+# The full GDT implementation lives in:
+#   src/os/kernel/interrupts/gdt.spl
+#
+# This file serves as the arch/x86_64/ reference point, noting that
+# GDT setup is inherently x86-specific and has no equivalent on
+# other architectures (RISC-V and ARM64 use flat address spaces).
+#
+# Other architectures handle privilege levels differently:
+#   - RISC-V: Machine/Supervisor/User mode via mstatus/sstatus CSRs
+#   - ARM64: Exception levels (EL0-EL3) via SPSR/SCR registers
+
+# Re-export from the existing GDT implementation location.
+# When the interrupts/ directory is refactored into arch/x86_64/,
+# the GDT code will move here.
+
+# ============================================================================
+# GDT Segment Selectors (x86_64 standard layout)
+# ============================================================================
+
+val GDT_NULL: u16 = 0x00           # Null descriptor (required)
+val GDT_KERNEL_CODE: u16 = 0x08    # Ring 0 code segment
+val GDT_KERNEL_DATA: u16 = 0x10    # Ring 0 data segment
+val GDT_USER_CODE: u16 = 0x18      # Ring 3 code segment
+val GDT_USER_DATA: u16 = 0x20      # Ring 3 data segment
+val GDT_TSS: u16 = 0x28            # Task State Segment
+
+# ============================================================================
+# Notes
+# ============================================================================
+
+# The GDT is loaded via the LGDT instruction (see cpu.spl: lgdt()).
+# After loading, segment registers must be reloaded:
+#   - CS via a far return or far jump
+#   - DS, ES, SS, FS, GS via MOV instructions
+#
+# TSS is loaded via LTR instruction (see cpu.spl: ltr()).
+# The TSS provides the IST (Interrupt Stack Table) entries for
+# stack switching on interrupt/exception in long mode.

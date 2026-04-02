@@ -1,0 +1,180 @@
+# Virtual Filesystem — Userspace VFS Service
+#
+# MDSOC: feature dimension, vfs layer
+# Provides unified file access across multiple filesystems.
+# Runs as a userspace service, receives requests via kernel IPC.
+#
+# Port contract: VFS receives open/read/write/close/stat/mkdir/readdir
+# from applications and routes to the appropriate filesystem driver.
+
+use os.kernel.types.fs_types.{FileDescriptor, FileFlags, MountPoint, FsNode, FsNodeKind, DirEntry}
+
+# ============================================================================
+# VFS Trait — Filesystem Interface
+# ============================================================================
+
+trait Filesystem:
+    """Interface that all filesystem drivers must implement."""
+    fn fs_name() -> text
+    fn mount(device: text, options: text) -> Result<bool, text>
+    fn unmount() -> Result<bool, text>
+
+    # File operations
+    fn open(path: text, flags: FileFlags) -> Result<u64, text>
+    fn read(handle: u64, size: u64) -> Result<[u8], text>
+    fn write(handle: u64, data: [u8]) -> Result<u64, text>
+    fn close(handle: u64) -> Result<bool, text>
+    fn seek(handle: u64, offset: i64, whence: SeekWhence) -> Result<u64, text>
+
+    # Metadata
+    fn stat(path: text) -> Result<FsNode, text>
+    fn chmod(path: text, mode: u16) -> Result<bool, text>
+
+    # Directory operations
+    fn mkdir(path: text) -> Result<bool, text>
+    fn rmdir(path: text) -> Result<bool, text>
+    fn readdir(path: text) -> Result<[DirEntry], text>
+
+    # File management
+    fn unlink(path: text) -> Result<bool, text>
+    fn rename(old_path: text, new_path: text) -> Result<bool, text>
+
+enum SeekWhence:
+    Set     # From beginning
+    Cur     # From current position
+    End     # From end
+
+# ============================================================================
+# Mount Table
+# ============================================================================
+
+val MAX_MOUNTS: i32 = 32
+
+struct MountEntry:
+    """Active mount point."""
+    point: MountPoint
+    fs: Filesystem      # Filesystem driver instance
+
+# ============================================================================
+# VFS Manager
+# ============================================================================
+
+class VfsManager:
+    """Virtual filesystem multiplexer.
+
+    Routes file operations to the correct filesystem based on path prefix.
+    Manages mount table and file descriptor table.
+    """
+    mounts: [MountEntry]
+    next_fd: i32
+
+impl VfsManager:
+    static fn new() -> VfsManager:
+        VfsManager(mounts: [], next_fd: 3)  # 0=stdin, 1=stdout, 2=stderr
+
+    me mount(path: text, fs_type: text, device: text, read_only: bool, fs: Filesystem) -> Result<bool, text>:
+        """Mount a filesystem at the given path."""
+        if self.mounts.len() >= MAX_MOUNTS:
+            return Result.Err("too many mount points")
+
+        val result = fs.mount(device, "")
+        if result.is_err():
+            return result
+
+        val point = MountPoint(
+            path: path,
+            fs_type: fs_type,
+            device: device,
+            read_only: read_only
+        )
+        self.mounts.push(MountEntry(point: point, fs: fs))
+        Result.Ok(true)
+
+    me unmount(path: text) -> Result<bool, text>:
+        """Unmount filesystem at path."""
+        var i = 0
+        while i < self.mounts.len():
+            if self.mounts[i].point.path == path:
+                val result = self.mounts[i].fs.unmount()
+                if result.is_ok():
+                    self.mounts.remove(i)
+                return result
+            i = i + 1
+        Result.Err("mount point not found: {path}")
+
+    fn resolve_mount(path: text) -> MountEntry?:
+        """Find the filesystem responsible for a path.
+
+        Longest prefix match: /mnt/usb matches before /mnt.
+        """
+        var best: MountEntry? = nil
+        var best_len: i32 = 0
+
+        for entry in self.mounts:
+            val prefix = entry.point.path
+            if path.starts_with(prefix) and prefix.len() > best_len:
+                best = entry
+                best_len = prefix.len()
+        best
+
+    fn strip_mount_prefix(path: text, mount_path: text) -> text:
+        """Remove mount prefix from path to get fs-relative path."""
+        if mount_path == "/":
+            return path
+        val relative = path.slice(mount_path.len())
+        if relative.len() == 0:
+            "/"
+        else:
+            relative
+
+    # === File Operations ===
+
+    me open(path: text, flags: FileFlags) -> Result<FileDescriptor, text>:
+        """Open a file, returning a file descriptor."""
+        val mount = self.resolve_mount(path)
+        if mount.?:
+            val entry = mount.unwrap()
+            val relative = self.strip_mount_prefix(path, entry.point.path)
+            val result = entry.fs.open(relative, flags)
+            if result.is_ok():
+                val handle = result.unwrap()
+                val fd = FileDescriptor(
+                    fd: self.next_fd,
+                    node: handle,
+                    offset: 0,
+                    flags: flags
+                )
+                self.next_fd = self.next_fd + 1
+                return Result.Ok(fd)
+            else:
+                return Result.Err(result.unwrap_err())
+        Result.Err("no filesystem mounted for path: {path}")
+
+    fn stat(path: text) -> Result<FsNode, text>:
+        """Get file/directory metadata."""
+        val mount = self.resolve_mount(path)
+        if mount.?:
+            val entry = mount.unwrap()
+            val relative = self.strip_mount_prefix(path, entry.point.path)
+            return entry.fs.stat(relative)
+        Result.Err("no filesystem mounted for path: {path}")
+
+    fn readdir(path: text) -> Result<[DirEntry], text>:
+        """List directory contents."""
+        val mount = self.resolve_mount(path)
+        if mount.?:
+            val entry = mount.unwrap()
+            val relative = self.strip_mount_prefix(path, entry.point.path)
+            return entry.fs.readdir(relative)
+        Result.Err("no filesystem mounted for path: {path}")
+
+    fn mkdir(path: text) -> Result<bool, text>:
+        """Create directory."""
+        val mount = self.resolve_mount(path)
+        if mount.?:
+            val entry = mount.unwrap()
+            if entry.point.read_only:
+                return Result.Err("filesystem is read-only")
+            val relative = self.strip_mount_prefix(path, entry.point.path)
+            return entry.fs.mkdir(relative)
+        Result.Err("no filesystem mounted for path: {path}")

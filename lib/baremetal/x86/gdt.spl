@@ -1,0 +1,108 @@
+# x86 Global Descriptor Table (GDT)
+#
+# Sets up the GDT for protected mode operation.
+# Required for proper memory segmentation in x86.
+#
+# Note: This is a stub file. Real implementation requires:
+#   - @repr(C) for struct layout control
+#   - @packed attribute
+#   - Inline assembly for lgdt instruction
+
+# GDT Entry structure (8 bytes each)
+# Real implementation would use:
+#   @repr(C)
+#   @packed
+#   struct GdtEntry:
+#       limit_low: u16
+#       base_low: u16
+#       base_middle: u8
+#       access: u8
+#       granularity: u8
+#       base_high: u8
+
+# GDT Pointer structure
+# Real implementation would use:
+#   @repr(C)
+#   @packed
+#   struct GdtPtr:
+#       limit: u16
+#       base: u32
+
+# Access byte flags
+val GDT_ACCESS_PRESENT: i32 = 0x80      # Segment is present
+val GDT_ACCESS_RING0: i32 = 0x00        # Ring 0 (kernel)
+val GDT_ACCESS_RING3: i32 = 0x60        # Ring 3 (user)
+val GDT_ACCESS_SYSTEM: i32 = 0x00       # System segment
+val GDT_ACCESS_CODE_DATA: i32 = 0x10    # Code or data segment
+val GDT_ACCESS_EXECUTABLE: i32 = 0x08   # Executable (code segment)
+val GDT_ACCESS_DIRECTION: i32 = 0x04    # Direction/Conforming
+val GDT_ACCESS_RW: i32 = 0x02           # Readable (code) / Writable (data)
+val GDT_ACCESS_ACCESSED: i32 = 0x01     # CPU sets this when accessed
+
+# Granularity byte flags
+val GDT_GRAN_4K: i32 = 0x80             # 4KB granularity (limit * 4096)
+val GDT_GRAN_32BIT: i32 = 0x40          # 32-bit protected mode
+val GDT_GRAN_64BIT: i32 = 0x20          # 64-bit long mode
+
+# Segment selectors (offset into GDT, in bytes)
+val GDT_NULL_SELECTOR: i32 = 0x00       # Null descriptor (required)
+val GDT_CODE_SELECTOR: i32 = 0x08       # Kernel code segment
+val GDT_DATA_SELECTOR: i32 = 0x10       # Kernel data segment
+val GDT_USER_CODE_SELECTOR: i32 = 0x18  # User code segment
+val GDT_USER_DATA_SELECTOR: i32 = 0x1B  # User data segment (with RPL=3)
+val GDT_TSS_SELECTOR: i32 = 0x28        # Task State Segment
+
+# GDT storage (would be array of 8-byte entries)
+# Real implementation: val gdt_entries: [GdtEntry; 6]
+
+# Initialize GDT with flat memory model
+fn gdt_init():
+    # Set up null descriptor (index 0)
+    # gdt_set_entry(0, 0, 0, 0, 0)
+
+    # Kernel code segment (index 1)
+    # Base=0, Limit=0xFFFFFFFF, 4KB granularity, 32-bit
+    # Access: Present | Code/Data | Executable | Readable
+    # gdt_set_entry(1, 0, 0xFFFFFFFF, 0x9A, 0xCF)
+
+    # Kernel data segment (index 2)
+    # Base=0, Limit=0xFFFFFFFF, 4KB granularity, 32-bit
+    # Access: Present | Code/Data | Writable
+    # gdt_set_entry(2, 0, 0xFFFFFFFF, 0x92, 0xCF)
+
+    # User code segment (index 3)
+    # gdt_set_entry(3, 0, 0xFFFFFFFF, 0xFA, 0xCF)
+
+    # User data segment (index 4)
+    # gdt_set_entry(4, 0, 0xFFFFFFFF, 0xF2, 0xCF)
+
+    # TSS (index 5) - set up later
+    # gdt_set_entry(5, tss_addr, sizeof(TSS), 0x89, 0x00)
+
+    # Load GDT
+    # gdt_load()
+    print "[GDT] Initialized (stub)"
+
+# Set a GDT entry
+fn gdt_set_entry(index: i32, base: i32, limit: i32, access: i32, gran: i32):
+    # Would set fields in gdt_entries[index]
+    pass
+
+# Load the GDT register
+fn gdt_load():
+    # Real implementation:
+    # asm:
+    #     "lgdt [gdt_ptr]"
+    #     "mov ax, GDT_DATA_SELECTOR"
+    #     "mov ds, ax"
+    #     "mov es, ax"
+    #     "mov fs, ax"
+    #     "mov gs, ax"
+    #     "mov ss, ax"
+    #     "jmp GDT_CODE_SELECTOR:flush"
+    #     "flush:"
+    pass
+
+# Reload segment registers after GDT update
+fn gdt_flush():
+    gdt_load()

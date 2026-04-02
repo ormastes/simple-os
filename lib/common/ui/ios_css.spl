@@ -1,0 +1,290 @@
+# iOS CSS Generation
+#
+# Generates comprehensive CSS for iOS-styled widgets.
+# Produces CSS custom properties from design tokens and
+# component-level styles for all 22+ widget types with iOS polish.
+
+use common.ui.design_tokens.{IOSDesignTokens, IOSTextStyle}
+use common.ui.ios_theme.{ios_design_tokens, is_ios_theme}
+
+# =========================================================================
+# Token CSS Variables
+# =========================================================================
+
+fn ios_tokens_to_css(tokens: IOSDesignTokens) -> text:
+    """Generate CSS custom properties from iOS design tokens."""
+    val c = tokens.colors
+    val t = tokens.typography
+    val r = tokens.radius
+    val sh = tokens.shadows
+    val sp = tokens.spacing
+    val a = tokens.animation
+    val o = tokens.opacity
+
+    var css = "  /* iOS Color Tokens */\n"
+    css = "{css}  --ios-system-blue: {c.system_blue};\n"
+    css = "{css}  --ios-system-green: {c.system_green};\n"
+    css = "{css}  --ios-system-indigo: {c.system_indigo};\n"
+    css = "{css}  --ios-system-orange: {c.system_orange};\n"
+    css = "{css}  --ios-system-pink: {c.system_pink};\n"
+    css = "{css}  --ios-system-purple: {c.system_purple};\n"
+    css = "{css}  --ios-system-red: {c.system_red};\n"
+    css = "{css}  --ios-system-teal: {c.system_teal};\n"
+    css = "{css}  --ios-system-yellow: {c.system_yellow};\n"
+    css = "{css}  --ios-bg-primary: {c.bg_primary};\n"
+    css = "{css}  --ios-bg-secondary: {c.bg_secondary};\n"
+    css = "{css}  --ios-bg-tertiary: {c.bg_tertiary};\n"
+    css = "{css}  --ios-bg-grouped: {c.bg_grouped};\n"
+    css = "{css}  --ios-bg-grouped-secondary: {c.bg_grouped_secondary};\n"
+    css = "{css}  --ios-fill-primary: {c.fill_primary};\n"
+    css = "{css}  --ios-fill-secondary: {c.fill_secondary};\n"
+    css = "{css}  --ios-fill-tertiary: {c.fill_tertiary};\n"
+    css = "{css}  --ios-fill-quaternary: {c.fill_quaternary};\n"
+    css = "{css}  --ios-label-primary: {c.label_primary};\n"
+    css = "{css}  --ios-label-secondary: {c.label_secondary};\n"
+    css = "{css}  --ios-label-tertiary: {c.label_tertiary};\n"
+    css = "{css}  --ios-label-quaternary: {c.label_quaternary};\n"
+    css = "{css}  --ios-separator: {c.separator};\n"
+    css = "{css}  --ios-separator-opaque: {c.separator_opaque};\n"
+
+    css = "{css}  /* iOS Typography */\n"
+    css = "{css}  --ios-font-large-title: {t.large_title.size}px;\n"
+    css = "{css}  --ios-font-title1: {t.title1.size}px;\n"
+    css = "{css}  --ios-font-title2: {t.title2.size}px;\n"
+    css = "{css}  --ios-font-title3: {t.title3.size}px;\n"
+    css = "{css}  --ios-font-headline: {t.headline.size}px;\n"
+    css = "{css}  --ios-font-body: {t.body.size}px;\n"
+    css = "{css}  --ios-font-callout: {t.callout.size}px;\n"
+    css = "{css}  --ios-font-subheadline: {t.subheadline.size}px;\n"
+    css = "{css}  --ios-font-footnote: {t.footnote.size}px;\n"
+    css = "{css}  --ios-font-caption1: {t.caption1.size}px;\n"
+    css = "{css}  --ios-font-caption2: {t.caption2.size}px;\n"
+
+    css = "{css}  /* iOS Radius */\n"
+    css = "{css}  --ios-radius-none: {r.none}px;\n"
+    css = "{css}  --ios-radius-sm: {r.sm}px;\n"
+    css = "{css}  --ios-radius-md: {r.md}px;\n"
+    css = "{css}  --ios-radius-lg: {r.lg}px;\n"
+    css = "{css}  --ios-radius-xl: {r.xl}px;\n"
+    css = "{css}  --ios-radius-full: {r.full}px;\n"
+
+    css = "{css}  /* iOS Shadows */\n"
+    css = "{css}  --ios-shadow-sm: {sh.sm};\n"
+    css = "{css}  --ios-shadow-md: {sh.md};\n"
+    css = "{css}  --ios-shadow-lg: {sh.lg};\n"
+    css = "{css}  --ios-shadow-xl: {sh.xl};\n"
+
+    css = "{css}  /* iOS Spacing */\n"
+    css = "{css}  --ios-space-0: {sp.s0}px;\n"
+    css = "{css}  --ios-space-1: {sp.s1}px;\n"
+    css = "{css}  --ios-space-2: {sp.s2}px;\n"
+    css = "{css}  --ios-space-3: {sp.s3}px;\n"
+    css = "{css}  --ios-space-4: {sp.s4}px;\n"
+    css = "{css}  --ios-space-5: {sp.s5}px;\n"
+    css = "{css}  --ios-space-6: {sp.s6}px;\n"
+    css = "{css}  --ios-space-8: {sp.s8}px;\n"
+    css = "{css}  --ios-space-10: {sp.s10}px;\n"
+    css = "{css}  --ios-space-12: {sp.s12}px;\n"
+
+    css = "{css}  /* iOS Animation */\n"
+    css = "{css}  --ios-duration-fast: {a.duration_fast}ms;\n"
+    css = "{css}  --ios-duration-normal: {a.duration_normal}ms;\n"
+    css = "{css}  --ios-duration-slow: {a.duration_slow}ms;\n"
+    css = "{css}  --ios-easing: {a.easing_default};\n"
+    css = "{css}  --ios-easing-spring: {a.easing_spring};\n"
+
+    css = "{css}  /* iOS Opacity */\n"
+    css = "{css}  --ios-opacity-disabled: {o.disabled};\n"
+    css = "{css}  --ios-opacity-secondary: {o.secondary};\n"
+    css = "{css}  --ios-opacity-tertiary: {o.tertiary};\n"
+    css = "{css}  --ios-opacity-overlay: {o.overlay};\n"
+
+    return css
+
+# =========================================================================
+# iOS Component Overrides
+# =========================================================================
+
+fn ios_component_css(theme_name: text) -> text:
+    """Generate iOS-styled component CSS overrides for all existing widgets."""
+    val tokens = ios_design_tokens(theme_name)
+    val c = tokens.colors
+    val is_dark = theme_name == "ios_dark"
+
+    var css = ""
+
+    # ── Base overrides ──
+    css = "{css}body { font-family: var(--ui-font-family); font-size: var(--ios-font-body); -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }\n"
+
+    # ── Panel: rounded cards ──
+    css = "{css}.widget-panel { border: none; border-radius: var(--ios-radius-md); background: var(--ui-panel-bg); box-shadow: var(--ios-shadow-sm); overflow: hidden; }\n"
+    css = "{css}.widget-panel.focused { box-shadow: 0 0 0 2px var(--ui-accent); }\n"
+    css = "{css}.panel-title { padding: var(--ios-space-3) var(--ios-space-4); font-weight: 600; font-size: var(--ios-font-subheadline); border-bottom: 1px solid var(--ios-separator); background: transparent; text-transform: none; letter-spacing: normal; color: var(--ios-label-secondary); }\n"
+    css = "{css}.panel-content { padding: var(--ios-space-4); gap: var(--ios-space-2); }\n"
+
+    # ── Text ──
+    css = "{css}.widget-text { padding: var(--ios-space-1) var(--ios-space-2); font-size: var(--ios-font-body); line-height: 1.29; }\n"
+
+    # ── Heading ──
+    css = "{css}.widget-heading { padding: var(--ios-space-2) var(--ios-space-4); font-weight: 700; border-bottom: none; margin-bottom: var(--ios-space-2); }\n"
+    css = "{css}h1.widget-heading { font-size: var(--ios-font-large-title); }\n"
+    css = "{css}h2.widget-heading { font-size: var(--ios-font-title1); }\n"
+    css = "{css}h3.widget-heading { font-size: var(--ios-font-title2); }\n"
+
+    # ── Button: iOS rounded pill ──
+    css = "{css}.widget-button { padding: var(--ios-space-2) var(--ios-space-5); background: var(--ui-accent); color: #FFFFFF; border: none; border-radius: var(--ios-radius-md); font-size: var(--ios-font-body); font-weight: 600; cursor: pointer; transition: all var(--ios-duration-fast) var(--ios-easing); }\n"
+    css = "{css}.widget-button:hover { opacity: 0.85; transform: none; }\n"
+    css = "{css}.widget-button:active { opacity: 0.7; transform: scale(0.98); }\n"
+    css = "{css}.widget-button.focused { box-shadow: 0 0 0 3px var(--ui-accent), 0 0 0 5px rgba(0,122,255,0.3); }\n"
+
+    # ── Input: iOS rounded fields ──
+    css = "{css}.widget-input { padding: var(--ios-space-3) var(--ios-space-4); background: var(--ios-fill-quaternary); border: none; border-bottom: none; border-radius: var(--ios-radius-md); font-size: var(--ios-font-body); transition: all var(--ios-duration-fast) var(--ios-easing); }\n"
+    css = "{css}.widget-input:focus { outline: none; box-shadow: 0 0 0 3px rgba(0,122,255,0.3); }\n"
+    css = "{css}.widget-input.error { box-shadow: 0 0 0 2px var(--ui-error); }\n"
+
+    # ── Textfield ──
+    css = "{css}.widget-textfield { padding: var(--ios-space-3) var(--ios-space-4); background: var(--ios-fill-quaternary); border: none; border-radius: var(--ios-radius-md); font-size: var(--ios-font-body); transition: all var(--ios-duration-fast) var(--ios-easing); }\n"
+    css = "{css}.widget-textfield:focus { outline: none; box-shadow: 0 0 0 3px rgba(0,122,255,0.3); }\n"
+
+    # ── Textarea ──
+    css = "{css}.widget-textarea { padding: var(--ios-space-3) var(--ios-space-4); background: var(--ios-fill-quaternary); border: none; border-radius: var(--ios-radius-md); font-size: var(--ios-font-body); transition: all var(--ios-duration-fast) var(--ios-easing); }\n"
+    css = "{css}.widget-textarea:focus { outline: none; box-shadow: 0 0 0 3px rgba(0,122,255,0.3); }\n"
+
+    # ── Checkbox: iOS-style ──
+    css = "{css}.widget-checkbox { padding: var(--ios-space-3) var(--ios-space-4); border-radius: var(--ios-radius-md); gap: var(--ios-space-3); }\n"
+    css = "{css}.widget-checkbox:hover { background: var(--ios-fill-quaternary); }\n"
+    css = "{css}.widget-checkbox .check-box { width: 22px; height: 22px; border-radius: 6px; border: 2px solid var(--ios-separator-opaque); }\n"
+    css = "{css}.widget-checkbox.checked .check-box { background: var(--ui-accent); border-color: var(--ui-accent); }\n"
+
+    # ── Dropdown ──
+    css = "{css}.widget-dropdown { padding: var(--ios-space-3) var(--ios-space-4); background: var(--ios-fill-quaternary); border: none; border-radius: var(--ios-radius-md); font-size: var(--ios-font-body); }\n"
+
+    # ── List: iOS grouped style ──
+    css = "{css}.widget-list { background: var(--ui-panel-bg); border-radius: var(--ios-radius-md); overflow: hidden; box-shadow: var(--ios-shadow-sm); }\n"
+    css = "{css}.widget-list li.list-item { padding: var(--ios-space-3) var(--ios-space-4); border-left: none; border-bottom: 1px solid var(--ios-separator); font-size: var(--ios-font-body); transition: background var(--ios-duration-fast) var(--ios-easing); }\n"
+    css = "{css}.widget-list li.list-item:last-child { border-bottom: none; }\n"
+    css = "{css}.widget-list li.list-item:hover { background: var(--ios-fill-quaternary); }\n"
+    css = "{css}.widget-list li.list-item.selected { background: var(--ios-fill-tertiary); border-left: none; color: var(--ui-accent); font-weight: 600; }\n"
+
+    # ── Table: clean iOS table ──
+    css = "{css}.widget-table { border-collapse: separate; border-spacing: 0; }\n"
+    css = "{css}.widget-table th { padding: var(--ios-space-2) var(--ios-space-4); font-size: var(--ios-font-footnote); font-weight: 600; color: var(--ios-label-secondary); text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--ios-separator); }\n"
+    css = "{css}.widget-table td { padding: var(--ios-space-3) var(--ios-space-4); font-size: var(--ios-font-body); border-bottom: 1px solid var(--ios-separator); }\n"
+    css = "{css}.widget-table tr:hover td { background: var(--ios-fill-quaternary); }\n"
+
+    # ── Tabs: iOS segmented-like ──
+    css = "{css}.widget-tabs { border-bottom: 1px solid var(--ios-separator); gap: 0; }\n"
+    css = "{css}.tab-item { padding: var(--ios-space-2) var(--ios-space-5); font-size: var(--ios-font-subheadline); font-weight: 400; transition: all var(--ios-duration-fast) var(--ios-easing); }\n"
+    css = "{css}.tab-item.active { color: var(--ui-accent); font-weight: 600; border-bottom-color: var(--ui-accent); }\n"
+
+    # ── MenuBar: translucent iOS nav ──
+    css = "{css}.widget-menubar { padding: var(--ios-space-2) var(--ios-space-4); background: var(--ios-bg-grouped-secondary); border-bottom: 1px solid var(--ios-separator); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); }\n"
+    css = "{css}.menu-item { padding: var(--ios-space-2) var(--ios-space-3); border-radius: var(--ios-radius-sm); font-size: var(--ios-font-body); }\n"
+
+    # ── StatusBar: iOS bottom bar ──
+    css = "{css}.widget-statusbar { padding: var(--ios-space-2) var(--ios-space-4); background: var(--ios-bg-grouped-secondary); color: var(--ios-label-secondary); font-weight: 400; font-size: var(--ios-font-footnote); border-top: 1px solid var(--ios-separator); }\n"
+
+    # ── Progress: iOS tinted bar ──
+    css = "{css}.widget-progress .progress-track { height: 4px; background: var(--ios-fill-tertiary); border-radius: 2px; }\n"
+    css = "{css}.widget-progress .progress-bar { background: var(--ui-accent); border-radius: 2px; }\n"
+
+    # ── Dialog: iOS alert style ──
+    css = "{css}.widget-dialog { border: none; border-radius: var(--ios-radius-lg); box-shadow: var(--ios-shadow-xl); background: var(--ui-panel-bg); }\n"
+    css = "{css}.dialog-title { padding: var(--ios-space-5) var(--ios-space-5) var(--ios-space-2); font-size: var(--ios-font-headline); font-weight: 600; text-align: center; color: var(--ios-label-primary); border-bottom: none; }\n"
+    css = "{css}.dialog-content { padding: var(--ios-space-2) var(--ios-space-5) var(--ios-space-5); text-align: center; }\n"
+
+    # ── Tooltip: iOS popover ──
+    css = "{css}.tooltip-content { background: var(--ui-panel-bg); border: none; border-radius: var(--ios-radius-sm); box-shadow: var(--ios-shadow-md); font-size: var(--ios-font-footnote); }\n"
+
+    # ── Tree: iOS outline ──
+    css = "{css}.tree-label { padding: var(--ios-space-1) var(--ios-space-2); border-radius: var(--ios-radius-sm); font-size: var(--ios-font-body); }\n"
+    css = "{css}.tree-label:hover { background: var(--ios-fill-quaternary); }\n"
+
+    # ── Scroll: thin scrollbar ──
+    css = "{css}.widget-scroll::-webkit-scrollbar { width: 4px; }\n"
+    css = "{css}.widget-scroll::-webkit-scrollbar-thumb { background: var(--ios-fill-secondary); border-radius: 2px; }\n"
+
+    # ── Divider ──
+    css = "{css}.widget-divider { border-top: 1px solid var(--ios-separator); margin: var(--ios-space-2) 0; }\n"
+
+    # ── Image ──
+    css = "{css}.widget-image { border-radius: var(--ios-radius-md); }\n"
+
+    # ── Layout gap overrides ──
+    css = "{css}.layout-vbox { gap: var(--ios-space-2); }\n"
+    css = "{css}.layout-hbox { gap: var(--ios-space-2); }\n"
+    css = "{css}.layout-grid { gap: var(--ios-space-4); }\n"
+
+    # ── Focus ring: iOS-style ──
+    css = "{css}[data-focused=true] { outline: none; box-shadow: 0 0 0 3px rgba(0,122,255,0.3); border-radius: var(--ios-radius-md); }\n"
+
+    # ── Disabled ──
+    css = "{css}[disabled], .disabled { opacity: var(--ios-opacity-disabled); cursor: not-allowed; }\n"
+
+    # ── NavigationBar ──
+    css = "{css}.widget-navigation-bar { display: flex; align-items: center; padding: var(--ios-space-3) var(--ios-space-4); background: var(--ios-bg-grouped-secondary); border-bottom: 1px solid var(--ios-separator); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); position: sticky; top: 0; z-index: 50; min-height: 44px; }\n"
+    css = "{css}.nav-left { display: flex; align-items: center; gap: var(--ios-space-2); min-width: 80px; }\n"
+    css = "{css}.nav-title { flex: 1; text-align: center; font-size: var(--ios-font-headline); font-weight: 600; }\n"
+    css = "{css}.nav-title-large { font-size: var(--ios-font-large-title); font-weight: 700; text-align: left; }\n"
+    css = "{css}.nav-right { display: flex; align-items: center; gap: var(--ios-space-2); min-width: 80px; justify-content: flex-end; }\n"
+
+    # ── TabBar (Bottom) ──
+    css = "{css}.widget-tab-bar { display: flex; justify-content: space-around; padding: var(--ios-space-2) 0 var(--ios-space-3); background: var(--ios-bg-grouped-secondary); border-top: 1px solid var(--ios-separator); position: sticky; bottom: 0; z-index: 50; }\n"
+    css = "{css}.tab-bar-item { display: flex; flex-direction: column; align-items: center; gap: 2px; cursor: pointer; padding: var(--ios-space-1) var(--ios-space-3); color: var(--ios-label-secondary); transition: color var(--ios-duration-fast) var(--ios-easing); min-width: 44px; }\n"
+    css = "{css}.tab-bar-item-active { color: var(--ui-accent); }\n"
+    css = "{css}.tab-bar-item:hover { color: var(--ui-accent); }\n"
+    css = "{css}.tab-bar-icon { font-size: 22px; position: relative; }\n"
+    css = "{css}.tab-bar-label { font-size: var(--ios-font-caption2); font-weight: 500; }\n"
+    css = "{css}.tab-bar-badge { position: absolute; top: -4px; right: -8px; background: var(--ios-system-red); color: #FFFFFF; font-size: 10px; font-weight: 600; min-width: 16px; height: 16px; border-radius: 8px; display: flex; align-items: center; justify-content: center; padding: 0 4px; }\n"
+
+    # ── Card ──
+    css = "{css}.widget-card { background: var(--ui-panel-bg); border-radius: var(--ios-radius-md); box-shadow: var(--ios-shadow-sm); overflow: hidden; }\n"
+    css = "{css}.widget-card.focused { box-shadow: 0 0 0 2px var(--ui-accent), var(--ios-shadow-sm); }\n"
+    css = "{css}.card-header { padding: var(--ios-space-4) var(--ios-space-4) var(--ios-space-2); }\n"
+    css = "{css}.card-title { font-size: var(--ios-font-headline); font-weight: 600; }\n"
+    css = "{css}.card-subtitle { font-size: var(--ios-font-subheadline); color: var(--ios-label-secondary); margin-top: 2px; }\n"
+    css = "{css}.card-content { padding: var(--ios-space-2) var(--ios-space-4) var(--ios-space-4); }\n"
+
+    # ── Switch/Toggle ──
+    css = "{css}.widget-switch { display: flex; align-items: center; justify-content: space-between; padding: var(--ios-space-3) var(--ios-space-4); cursor: pointer; min-height: 44px; }\n"
+    css = "{css}.widget-switch:hover { background: var(--ios-fill-quaternary); border-radius: var(--ios-radius-md); }\n"
+    css = "{css}.switch-label { font-size: var(--ios-font-body); }\n"
+    css = "{css}.switch-track { width: 51px; height: 31px; border-radius: 16px; background: var(--ios-fill-primary); position: relative; transition: background var(--ios-duration-fast) var(--ios-easing); flex-shrink: 0; }\n"
+    css = "{css}.switch-thumb { width: 27px; height: 27px; border-radius: 14px; background: #FFFFFF; position: absolute; top: 2px; left: 2px; box-shadow: 0 1px 3px rgba(0,0,0,0.2); transition: transform var(--ios-duration-fast) var(--ios-easing); }\n"
+    css = "{css}.widget-switch.switch-on .switch-track { background: var(--ios-system-green); }\n"
+    css = "{css}.widget-switch.switch-on .switch-thumb { transform: translateX(20px); }\n"
+    css = "{css}.widget-switch.disabled { opacity: var(--ios-opacity-disabled); cursor: not-allowed; }\n"
+
+    # ── SegmentedControl ──
+    css = "{css}.widget-segmented-control { display: flex; background: var(--ios-fill-tertiary); border-radius: var(--ios-radius-sm); padding: 2px; gap: 0; }\n"
+    css = "{css}.segment-item { flex: 1; text-align: center; padding: var(--ios-space-2) var(--ios-space-3); font-size: var(--ios-font-subheadline); font-weight: 500; cursor: pointer; border-radius: 6px; transition: all var(--ios-duration-fast) var(--ios-easing); color: var(--ios-label-primary); }\n"
+    css = "{css}.segment-item:hover { background: var(--ios-fill-quaternary); }\n"
+    css = "{css}.segment-active { background: var(--ui-panel-bg); box-shadow: 0 1px 3px rgba(0,0,0,0.12); font-weight: 600; }\n"
+    css = "{css}.segment-active:hover { background: var(--ui-panel-bg); }\n"
+
+    # ── SearchBar ──
+    css = "{css}.widget-search-bar { display: flex; align-items: center; padding: var(--ios-space-2) var(--ios-space-3); background: var(--ios-fill-tertiary); border-radius: var(--ios-radius-md); gap: var(--ios-space-2); }\n"
+    css = "{css}.search-icon { color: var(--ios-label-tertiary); font-size: 16px; flex-shrink: 0; }\n"
+    css = "{css}.search-input { flex: 1; background: transparent; border: none; outline: none; font-size: var(--ios-font-body); color: var(--ios-label-primary); font-family: inherit; }\n"
+    css = "{css}.search-input::placeholder { color: var(--ios-label-tertiary); }\n"
+    css = "{css}.search-cancel { background: none; border: none; color: var(--ui-accent); font-size: var(--ios-font-body); cursor: pointer; padding: var(--ios-space-1) var(--ios-space-2); }\n"
+
+    return css
+
+# =========================================================================
+# Combined iOS CSS
+# =========================================================================
+
+fn generate_ios_css(theme_name: text) -> text:
+    """Generate the complete iOS CSS block including tokens and component overrides.
+    Returns empty string for non-iOS themes."""
+    if not is_ios_theme(theme_name):
+        return ""
+
+    val tokens = ios_design_tokens(theme_name)
+    var css = "\n/* ── iOS Design System ── */\n"
+    css = "{css}:root {\n"
+    css = "{css}{ios_tokens_to_css(tokens)}"
+    css = "{css}}\n\n"
+    css = "{css}{ios_component_css(theme_name)}\n"
+    return css

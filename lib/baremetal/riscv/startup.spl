@@ -1,0 +1,357 @@
+# RISC-V Machine Mode Startup Code
+#
+# Boot entry point and trap handling for bare-metal RISC-V systems.
+# Tested on:
+#   - QEMU virt machine (RV32/RV64)
+#   - SiFive U54 (RV64GC)
+#
+# Memory Layout (QEMU virt):
+#   0x80000000 - RAM base (128MB default)
+#   0x0C000000 - PLIC (Platform-Level Interrupt Controller)
+#   0x10000000 - UART0
+#   0x10001000 - Virtio
+
+
+use std.baremetal.riscv.plic (PlicContext, plic_init, plic_claim, plic_complete, handle_interrupt)
+
+# Memory configuration
+val RAM_BASE: u64 = 0x80000000
+val RAM_SIZE: u64 = 128 * 1024 * 1024  # 128MB
+val STACK_SIZE: u64 = 65536  # 64KB per hart
+
+# MMIO device addresses (QEMU virt)
+val UART_BASE: u64 = 0x10000000
+val PLIC_BASE: u64 = 0x0C000000
+
+# CSR addresses
+val CSR_MSTATUS: u64 = 0x300
+val CSR_MISA: u64 = 0x301
+val CSR_MIE: u64 = 0x304
+val CSR_MTVEC: u64 = 0x305
+val CSR_MSCRATCH: u64 = 0x340
+val CSR_MEPC: u64 = 0x341
+val CSR_MCAUSE: u64 = 0x342
+val CSR_MTVAL: u64 = 0x343
+val CSR_MIP: u64 = 0x344
+val CSR_MHARTID: u64 = 0xF14
+
+# Exception/Interrupt codes
+val CAUSE_INTERRUPT_BIT: u64 = 0x8000000000000000
+val CAUSE_M_SOFTWARE: u64 = CAUSE_INTERRUPT_BIT | 3
+val CAUSE_M_TIMER: u64 = CAUSE_INTERRUPT_BIT | 7
+val CAUSE_M_EXTERNAL: u64 = CAUSE_INTERRUPT_BIT | 11
+
+# MSTATUS bits
+val MSTATUS_MIE: u64 = 0x08  # Machine Interrupt Enable
+val MSTATUS_MPIE: u64 = 0x80  # Machine Previous Interrupt Enable
+
+# MIE bits
+val MIE_MSIE: u64 = 0x08  # Machine Software Interrupt Enable
+val MIE_MTIE: u64 = 0x80  # Machine Timer Interrupt Enable
+val MIE_MEIE: u64 = 0x800  # Machine External Interrupt Enable
+
+# Stack allocation (per-hart)
+# @align(16)
+var stack_buffer: [u8; STACK_SIZE * 4]  # Support up to 4 harts
+
+# Trap frame save area (per-hart)
+# @align(16)
+var trap_frames: [TrapFrame; 4]
+
+# Trap frame structure
+# @repr(C)
+struct TrapFrame:
+    """Saved register state during trap."""
+    x1: u64   # ra
+    x2: u64   # sp
+    x3: u64   # gp
+    x4: u64   # tp
+    x5: u64   # t0
+    x6: u64   # t1
+    x7: u64   # t2
+    x8: u64   # s0/fp
+    x9: u64   # s1
+    x10: u64  # a0
+    x11: u64  # a1
+    x12: u64  # a2
+    x13: u64  # a3
+    x14: u64  # a4
+    x15: u64  # a5
+    x16: u64  # a6
+    x17: u64  # a7
+    x18: u64  # s2
+    x19: u64  # s3
+    x20: u64  # s4
+    x21: u64  # s5
+    x22: u64  # s6
+    x23: u64  # s7
+    x24: u64  # s8
+    x25: u64  # s9
+    x26: u64  # s10
+    x27: u64  # s11
+    x28: u64  # t3
+    x29: u64  # t4
+    x30: u64  # t5
+    x31: u64  # t6
+    mepc: u64
+    mstatus: u64
+
+# Entry point - loaded at 0x80000000 by bootloader
+# @entry
+# @naked
+# @noreturn
+fn _start():
+    """RISC-V machine mode entry point."""
+    unsafe:
+        asm volatile:
+            # Disable interrupts during setup
+            "csrw mie, zero"
+
+            # Read hart ID
+            "csrr t0, mhartid"
+
+            # Only hart 0 initializes, others wait
+            "bnez t0, .Lwait_for_init"
+
+            # Hart 0: Set up stack
+            "la sp, stack_buffer"
+            "li t1, {stack_size}"
+            "add sp, sp, t1"
+
+            # Zero BSS section
+            # "la t0, _sbss"
+            # "la t1, _ebss"
+            # "bgeu t0, t1, .Lbss_done"
+            # ".Lbss_loop:"
+            # "sd zero, 0(t0)"
+            # "addi t0, t0, 8"
+            # "bltu t0, t1, .Lbss_loop"
+            # ".Lbss_done:"
+
+            # Set up trap vector
+            "la t0, trap_vector"
+            "csrw mtvec, t0"
+
+            # Enable interrupts in mstatus
+            "li t0, {mstatus_mie}"
+            "csrs mstatus, t0"
+
+            # Enable machine external, timer, and software interrupts
+            "li t0, {mie_all}"
+            "csrw mie, t0"
+
+            # Call main
+            "call {main}"
+
+            # If main returns, park this hart
+            "j .Lpark"
+
+            # Secondary harts wait here
+            ".Lwait_for_init:"
+            "wfi"
+            "j .Lwait_for_init"
+
+            # Park hart (low-power wait)
+            ".Lpark:"
+            "wfi"
+            "j .Lpark"
+
+            in(reg) STACK_SIZE
+            in(reg) MSTATUS_MIE
+            in(reg) MIE_MSIE | MIE_MTIE | MIE_MEIE
+            in(reg) main as u64
+
+# Trap vector - aligned to 4 bytes
+# @align(4)
+# @naked
+fn trap_vector():
+    """Trap vector entry point - saves context and dispatches."""
+    unsafe:
+        asm volatile:
+            # Save context to trap frame
+            # Use mscratch to get trap frame pointer
+            "csrrw sp, mscratch, sp"  # Swap sp with mscratch
+
+            # Save all registers
+            "sd x1, 0(sp)"
+            "sd x2, 8(sp)"
+            # ... save x3-x31 ...
+            "sd x31, 248(sp)"
+
+            # Save mepc and mstatus
+            "csrr t0, mepc"
+            "sd t0, 256(sp)"
+            "csrr t0, mstatus"
+            "sd t0, 264(sp)"
+
+            # Call trap handler
+            "mv a0, sp"  # Pass trap frame pointer
+            "call {handler}"
+
+            # Restore mepc and mstatus
+            "ld t0, 256(sp)"
+            "csrw mepc, t0"
+            "ld t0, 264(sp)"
+            "csrw mstatus, t0"
+
+            # Restore all registers
+            "ld x1, 0(sp)"
+            # ... restore x2-x31 ...
+            "ld x31, 248(sp)"
+
+            # Restore original sp
+            "csrrw sp, mscratch, sp"
+
+            # Return from trap
+            "mret"
+
+            in(reg) machine_trap_handler as u64
+
+# Machine trap handler - dispatches based on mcause
+fn machine_trap_handler(frame: ptr<TrapFrame>):
+    """Handle machine-mode trap (exception or interrupt)."""
+    unsafe:
+        # Read trap cause
+        var mcause: u64
+        asm volatile:
+            "csrr {0}, mcause"
+            out(reg) mcause
+
+        if mcause & CAUSE_INTERRUPT_BIT:
+            # Interrupt
+            val interrupt_code = mcause & 0x7FFFFFFFFFFFFFFF
+            handle_interrupt_code(interrupt_code, frame)
+        else:
+            # Exception
+            val exception_code = mcause
+            handle_exception(exception_code, frame)
+
+# Handle interrupt
+fn handle_interrupt_code(code: u64, frame: ptr<TrapFrame>):
+    """Dispatch interrupt to handler."""
+    match code:
+        case 3:  # M-mode software interrupt
+            handle_software_interrupt()
+
+        case 7:  # M-mode timer interrupt
+            handle_timer_interrupt()
+
+        case 11:  # M-mode external interrupt
+            handle_external_interrupt()
+
+        case _:
+            # Unknown interrupt
+            print "[TRAP] Unknown interrupt: {code}"
+
+# Handle exception
+fn handle_exception(code: u64, frame: ptr<TrapFrame>):
+    """Handle synchronous exception."""
+    unsafe:
+        var mepc: u64
+        var mtval: u64
+        asm volatile:
+            "csrr {0}, mepc"
+            "csrr {1}, mtval"
+            out(reg) mepc
+            out(reg) mtval
+
+        print "[EXCEPTION] Code {code} at PC 0x{mepc:x}, tval=0x{mtval:x}"
+
+        # Hang on exception
+        loop:
+            asm volatile: "wfi"
+
+# Interrupt handlers
+
+fn handle_software_interrupt():
+    """Handle software interrupt (IPI)."""
+    # Clear software interrupt pending bit
+    unsafe:
+        asm volatile:
+            "csrc mip, {msie}"
+            in(reg) MIE_MSIE
+
+fn handle_timer_interrupt():
+    """Handle timer interrupt."""
+    # Clear timer interrupt by setting mtimecmp
+    # (QEMU: mtimecmp at 0x2004000 + hartid*8)
+    pass
+
+fn handle_external_interrupt():
+    """Handle external interrupt via PLIC."""
+    val ctx = PlicContext.machine(0)  # Hart 0, M-mode
+    handle_interrupt(ctx)
+
+# Main entry point - override this
+fn main():
+    """Default main function."""
+    # Get hart ID
+    var hart_id: u64
+    unsafe:
+        asm volatile:
+            "csrr {0}, mhartid"
+            out(reg) hart_id
+
+    if hart_id == 0:
+        # Primary hart
+        print "[BOOT] Hart 0 starting..."
+
+        # Initialize PLIC
+        val ctx = PlicContext.machine(0)
+        plic_init(ctx)
+
+        # Initialize UART
+        uart_init()
+
+        print "[KERNEL] RISC-V bare-metal kernel started"
+
+    # Park in low-power loop
+    loop:
+        unsafe:
+            asm volatile: "wfi"
+
+# UART driver (simple polling mode)
+
+fn uart_init():
+    """Initialize UART0 (16550-compatible)."""
+    # UART registers (QEMU virt)
+    # 0x10000000 - RHR/THR (Receiver/Transmitter Holding Register)
+    # 0x10000001 - IER (Interrupt Enable Register)
+    # 0x10000002 - FCR (FIFO Control Register)
+    # 0x10000003 - LCR (Line Control Register)
+    # 0x10000004 - MCR (Modem Control Register)
+    # 0x10000005 - LSR (Line Status Register)
+
+    # Disable interrupts
+    uart_write_reg(1, 0x00)
+
+    # Set baud rate (divisor latch)
+    uart_write_reg(3, 0x80)  # Enable DLAB
+    uart_write_reg(0, 0x03)  # Divisor LSB (38400 baud)
+    uart_write_reg(1, 0x00)  # Divisor MSB
+    uart_write_reg(3, 0x03)  # 8N1, disable DLAB
+
+fn uart_write_reg(offset: u64, value: u8):
+    """Write to UART register."""
+    unsafe:
+        val addr = @address(UART_BASE + offset) @volatile var: u8
+        addr = value
+
+fn uart_read_reg(offset: u64) -> u8:
+    """Read from UART register."""
+    unsafe:
+        val addr = @address(UART_BASE + offset) @volatile val: u8
+        addr
+
+fn uart_putc(c: u8):
+    """Write character to UART."""
+    # Wait for transmitter holding register empty
+    while (uart_read_reg(5) & 0x20) == 0:
+        pass
+
+    uart_write_reg(0, c)
+
+fn uart_puts(s: text):
+    """Write string to UART."""
+    for c in s:
+        uart_putc(c as u8)

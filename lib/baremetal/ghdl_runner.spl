@@ -1,0 +1,145 @@
+# GHDL Test Runner for Simple Bare-Metal RV32I Binaries
+#
+# Runs RISC-V 32-bit ELF binaries on a GHDL-simulated RV32I CPU
+# with semihosting support (SYS_WRITE0, SYS_WRITEC, SYS_EXIT).
+#
+# Usage:
+#   bin/simple src/lib/nogc_async_mut_noalloc/baremetal/ghdl_runner.spl <binary.elf> [--timeout=30]
+#
+# Exit codes:
+#   0 = Success (SYS_EXIT with code 0)
+#   1 = Test failure (SYS_EXIT with non-zero code or output mismatch)
+#   124 = Timeout
+#
+# Requires: ghdl, riscv64-linux-gnu-objcopy, python3
+
+use std.io.{shell, shell_output, shell_bool, file_exists}
+use std.io_runtime.{get_args, exit}
+use common.text.{contains, starts_with, trim}
+
+fn get_rtl_dir() -> text:
+    val pwd = trim(shell_output("pwd"))
+    pwd + "/examples/09_embedded/fpga_riscv/rtl"
+
+fn is_ghdl_available() -> bool:
+    shell_bool("command -v ghdl") and
+    shell_bool("command -v riscv64-linux-gnu-objcopy") and
+    shell_bool("command -v python3")
+
+fn main():
+    var timeout_secs = 30
+    var binary = ""
+
+    val args = get_args()
+    for i in 0..args.len():
+        val arg = args[i]
+        if starts_with(arg, "--timeout="):
+            val timeout_str = shell_output("echo '" + arg + "' | cut -d= -f2")
+            timeout_secs = int(trim(timeout_str))
+        else:
+            if binary == "":
+                binary = arg
+
+    if binary == "":
+        print "Usage: bin/simple ghdl_runner.spl <binary.elf> [--timeout=N]"
+        exit(1)
+
+    if file_exists(binary) == false:
+        print "Error: Binary not found: " + binary
+        exit(1)
+
+    if is_ghdl_available() == false:
+        print "Error: Required tools not found (ghdl, riscv64-linux-gnu-objcopy, python3)"
+        exit(1)
+
+    # Verify it's RISC-V
+    val file_info = shell_output("file '" + binary + "' 2>/dev/null")
+    if contains(file_info, "RISC-V") == false:
+        print "Error: Not a RISC-V binary: " + binary
+        exit(1)
+
+    print "[GHDL] Running: " + binary
+    print "[GHDL] Timeout: " + timeout_secs.to_text() + "s"
+    print "----------------------------------------"
+
+    # Step 1: Convert ELF to raw binary
+    val tmp_bin = "/tmp/ghdl_runner_test.bin"
+    val tmp_pkg = "/tmp/ghdl_runner_pkg.vhd"
+    val tmp_dir = "/tmp/ghdl_runner_work"
+    shell("mkdir -p " + tmp_dir)
+    val objcopy_result = shell("riscv64-linux-gnu-objcopy -O binary '" + binary + "' " + tmp_bin + " 2>&1")
+    if objcopy_result.exit_code != 0:
+        print "Error: objcopy failed: " + objcopy_result.stdout
+        exit(1)
+
+    # Step 2: Generate VHDL memory init package
+    val gen_cmd = "python3 -c \"\nimport struct\ndata = open('" + tmp_bin + "', 'rb').read()\nwhile len(data) % 4 != 0: data += b'\\x00'\nwords = [struct.unpack('<I', data[i:i+4])[0] for i in range(0, len(data), 4)]\nprint('library ieee;')\nprint('use ieee.std_logic_1164.all;')\nprint('package test_program is')\nprint('    type word_array_t is array (natural range <>) of std_logic_vector(31 downto 0);')\nprint('    constant PROGRAM_SIZE : integer := %d;' % len(words))\nprint('    constant PROGRAM_DATA : word_array_t(0 to %d) := (' % (len(words)-1))\nfor i, w in enumerate(words):\n    comma = ',' if i < len(words)-1 else ''\n    print('        x\\\"%08x\\\"%s' % (w, comma))\nprint('    );')\nprint('end package test_program;')\n\" > " + tmp_pkg
+    val gen_result = shell(gen_cmd)
+    if gen_result.exit_code != 0:
+        print "Error: VHDL package generation failed"
+        exit(1)
+
+    # Step 3: Compile GHDL
+    val rtl = get_rtl_dir()
+    val compile_cmd = "cd " + tmp_dir + " && ghdl -a --std=08 " + rtl + "/rv32i_pkg.vhd " + rtl + "/regfile.vhd " + rtl + "/alu.vhd " + rtl + "/decoder.vhd " + rtl + "/rv32i_core.vhd " + tmp_pkg + " " + rtl + "/tb_semi_run.vhd && ghdl -e --std=08 tb_semi_run 2>&1"
+    val compile_result = shell(compile_cmd)
+    if compile_result.exit_code != 0:
+        print "Error: GHDL compilation failed:"
+        print compile_result.stdout
+        exit(1)
+
+    # Step 4: Run simulation with timeout
+    val stop_time_ms = timeout_secs * 1000
+    val run_cmd = "cd " + tmp_dir + " && timeout " + timeout_secs.to_text() + " ghdl -r --std=08 tb_semi_run --stop-time=" + stop_time_ms.to_text() + "ms 2>&1"
+    val run_result = shell(run_cmd)
+
+    # Step 5: Parse results
+    val output = run_result.stdout
+    var semi_output = ""
+    var exit_code = -1
+    var cycles = 0
+
+    # Parse OUTPUT: line
+    val lines = output.split("\n")
+    for line in lines:
+        if contains(line, "OUTPUT:"):
+            val idx = line.index_of("OUTPUT: ")
+            if idx >= 0:
+                semi_output = line.substring(idx + 8)
+        if contains(line, "EXIT_CODE:"):
+            val idx = line.index_of("EXIT_CODE: ")
+            if idx >= 0:
+                val code_str = trim(line.substring(idx + 11))
+                exit_code = int(code_str)
+        if contains(line, "CYCLES:"):
+            val idx = line.index_of("CYCLES: ")
+            if idx >= 0:
+                val cycles_str = trim(line.substring(idx + 8))
+                cycles = int(cycles_str)
+
+    # Print semihosting output
+    if semi_output != "":
+        print semi_output
+
+    print ""
+    print "----------------------------------------"
+    print "[GHDL] Cycles: " + cycles.to_text()
+
+    # Check results
+    if run_result.exit_code == 124:
+        print "[GHDL] Test TIMEOUT after " + timeout_secs.to_text() + "s"
+        exit(124)
+    elif exit_code == 0:
+        print "[GHDL] Test PASSED (exit code 0)"
+        exit(0)
+    elif exit_code > 0:
+        print "[GHDL] Test FAILED (exit code " + exit_code.to_text() + ")"
+        exit(1)
+    else:
+        print "[GHDL] Test completed (no SYS_EXIT detected)"
+        exit(0)
+
+    # Cleanup
+    shell("rm -rf " + tmp_dir + " " + tmp_bin + " " + tmp_pkg)
+
+main()

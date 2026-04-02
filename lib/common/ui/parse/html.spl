@@ -1,0 +1,175 @@
+# HTML-like UI Description Parser
+#
+# Parses HTML-like markup into WidgetNode trees.
+# Uses the existing lib/common/html/ parser for DOM construction,
+# then maps HTML elements to UI widget types.
+#
+# Supported tags:
+#   <panel title="Title">      → WidgetKind.Panel
+#   <text>content</text>       → WidgetKind.Text
+#   <button action="x">Label</button> → WidgetKind.Button
+#   <input placeholder="..."/> → WidgetKind.Input
+#   <list>                     → WidgetKind.List
+#   <table>                    → WidgetKind.Table
+#   <progress value="50"/>     → WidgetKind.Progress
+#   <menubar>                  → WidgetKind.MenuBar
+#   <statusbar left="" right=""/> → WidgetKind.StatusBar
+#   <tabs>                     → WidgetKind.Tabs
+#   <checkbox label="" checked="true"/> → WidgetKind.Checkbox
+#   <dropdown>                 → WidgetKind.Dropdown
+#   <textfield value="" placeholder=""/> → WidgetKind.TextField
+#   <image src="" alt=""/>     → WidgetKind.Image
+#   <divider/>                 → WidgetKind.Divider
+#   <dialog title="">          → WidgetKind.Dialog
+#   <tooltip content="" target=""/> → WidgetKind.Tooltip
+#   <row>                      → Panel with HBox layout
+#   <column>                   → Panel with VBox layout
+#   <grid>                     → Panel with Grid layout
+
+use common.html.parser.{parse_html}
+use common.html.dom.{node_tag, node_children, get_element_attr, get_text_content, node_type}
+use common.ui.widget.{WidgetNode, UITree}
+
+# =========================================================================
+# HTML String → UITree
+# =========================================================================
+
+fn parse_ui_html(html_str: text) -> Result<UITree, text>:
+    """Parse an HTML-like string into a UITree."""
+    val doc = parse_html(html_str)
+
+    val children = node_children(doc)
+    if children.len() == 0:
+        return Err("Empty HTML document")
+
+    # Find the first element child as the root
+    var root: WidgetNode? = nil
+    for child in children:
+        val tag = node_tag(child)
+        if tag != "":
+            root = convert_node(child, "root")
+            break
+
+    if root == nil:
+        return Err("No root element found")
+
+    return Ok(UITree.new(root))
+
+fn parse_ui_html_file(path: text) -> Result<UITree, text>:
+    """Parse an HTML-like file into a UITree."""
+    val content = file_read(path)
+    if content == "":
+        return Err("Failed to read file: {path}")
+    return parse_ui_html(content)
+
+extern fn file_read(path: text) -> text
+
+# =========================================================================
+# DOM Node → WidgetNode Conversion
+# =========================================================================
+
+fn convert_node(html_node: tuple, default_id: text) -> WidgetNode:
+    """Convert an HTML DOM tuple to a WidgetNode."""
+    val tag = node_tag(html_node)
+    val id = get_attr_or(html_node, "id", default_id)
+
+    # Map tag to widget kind and layout
+    val kind = tag_to_widget_kind(tag)
+    val layout = tag_to_layout_kind(tag)
+
+    var node = WidgetNode.new(id, kind)
+    node = node.set_layout(layout)
+
+    # Map attributes to props
+    node = apply_attributes(node, html_node)
+
+    # Convert children
+    val children = node_children(html_node)
+    var child_idx = 0
+    for child in children:
+        val child_tag = node_tag(child)
+        if child_tag != "":
+            val child_id = get_attr_or(child, "id", "{id}_{child_idx}")
+            val child_node = convert_node(child, child_id)
+            node = node.add_child(child_node)
+            child_idx = child_idx + 1
+        else:
+            # Text node — set as content if this widget supports it
+            val text_content = get_text_content(child)
+            if text_content.trim() != "":
+                if kind == "text" or kind == "button":
+                    node = node.set_prop("content", text_content.trim())
+
+    return node
+
+# =========================================================================
+# Tag Mapping
+# =========================================================================
+
+fn tag_to_widget_kind(tag: text) -> text:
+    """Map an HTML tag name to a widget kind string."""
+    match tag:
+        "panel" | "div" | "section" => "panel"
+        "text" | "span" | "p" | "label" => "text"
+        "button" => "button"
+        "input" => "input"
+        "list" | "ul" | "ol" => "list"
+        "table" => "table"
+        "progress" => "progress"
+        "menubar" | "nav" => "menubar"
+        "statusbar" | "footer" => "statusbar"
+        "tabs" => "tabs"
+        "checkbox" => "checkbox"
+        "dropdown" | "select" => "dropdown"
+        "textfield" | "textarea" => "textfield"
+        "image" | "img" => "image"
+        "divider" | "hr" => "divider"
+        "dialog" | "modal" => "dialog"
+        "tooltip" => "tooltip"
+        "row" => "panel"
+        "column" | "col" => "panel"
+        "grid" => "panel"
+        _ => "panel"
+
+fn tag_to_layout_kind(tag: text) -> text:
+    """Map an HTML tag to a layout kind string."""
+    match tag:
+        "row" => "hbox"
+        "grid" => "grid"
+        _ => "vbox"
+
+# =========================================================================
+# Attribute Mapping
+# =========================================================================
+
+fn apply_attributes(node: WidgetNode, html_node: tuple) -> WidgetNode:
+    """Apply HTML attributes as widget props."""
+    var result = node
+
+    # Common attributes
+    val prop_names = ["title", "content", "label", "width", "height",
+        "flex", "left", "right", "action", "placeholder", "value",
+        "src", "alt", "checked", "target"]
+
+    for prop_name in prop_names:
+        val attr_val = get_element_attr(html_node, prop_name)
+        if attr_val != "" and attr_val != nil:
+            result = result.set_prop(prop_name, "{attr_val}")
+
+    # Map standard HTML attributes to widget props
+    val class_attr = get_element_attr(html_node, "class")
+    if class_attr != "" and class_attr != nil:
+        result = result.set_prop("class", "{class_attr}")
+
+    val style_attr = get_element_attr(html_node, "style")
+    if style_attr != "" and style_attr != nil:
+        result = result.set_prop("style", "{style_attr}")
+
+    return result
+
+fn get_attr_or(html_node: tuple, attr: text, default: text) -> text:
+    """Get an attribute value or return default."""
+    val val_result = get_element_attr(html_node, attr)
+    if val_result != "" and val_result != nil:
+        return "{val_result}"
+    return default

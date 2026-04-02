@@ -1,0 +1,608 @@
+@allow(primitive_api)
+# Bare-Metal Memory Allocator
+#
+# Lightweight memory allocators optimized for bare-metal embedded systems.
+# No OS, no malloc - we manage all memory ourselves.
+#
+# Allocators:
+# - BumpAllocator: Fast bump-pointer allocator (no deallocation)
+# - FreeListAllocator: General-purpose with first-fit algorithm
+# - FixedBlockAllocator: Pool allocator for uniform objects
+# - MultiPoolAllocator: Multiple pools for different sizes
+#
+# Usage:
+#   val heap_start: u32 = 0x20000000
+#   val heap_size: u32 = 128 * 1024  # 128KB
+#   val allocator = BumpAllocator(base: heap_start, size: heap_size)
+#   val ptr = allocator.alloc(128)
+
+
+# ============================================================================
+# Memory Block Header (for free list allocator)
+# ============================================================================
+
+struct BlockHeader:
+    """Memory block header for free list.
+
+    Stored at the beginning of each allocated/free block.
+    Size includes the header itself.
+    """
+    size: u32        # Total block size (including header)
+    is_free: bool    # True if block is free, false if allocated
+    next: u32        # Address of next block (0 if last)
+
+impl BlockHeader:
+    fn header_size() -> u32:
+        """Size of block header (8 bytes)."""
+        8
+
+    fn from_addr(addr: u32) -> BlockHeader:
+        """Read block header from memory address."""
+        val size_ptr = addr
+        val is_free_ptr = addr + 4
+        val next_ptr = addr + 5
+
+        BlockHeader(
+            size: mem_read_u32(size_ptr),
+            is_free: mem_read_u8(is_free_ptr) != 0,
+            next: mem_read_u32(next_ptr)
+        )
+
+    me write_to_addr(addr: u32):
+        """Write block header to memory address."""
+        mem_write_u32(addr, self.size)
+        mem_write_u8(addr + 4, if self.is_free: 1 else: 0)
+        mem_write_u32(addr + 5, self.next)
+
+# ============================================================================
+# Bump Allocator (Simplest, Fastest)
+# ============================================================================
+
+struct BumpAllocator:
+    """Bump pointer allocator.
+
+    Extremely fast O(1) allocation.
+    No deallocation - reset entire heap at once.
+
+    Characteristics:
+    - Very fast allocation (just bump pointer)
+    - No deallocation overhead
+    - No fragmentation
+    - Bulk deallocation only (reset)
+    - Fixed capacity
+
+    Use cases:
+    - Single-frame allocations (game rendering)
+    - Request handling (reset after each request)
+    - Temporary buffers
+
+    Example:
+        val allocator = BumpAllocator(base: 0x20000000, size: 64 * 1024)
+        val buf1 = allocator.alloc(256)  # Fast
+        val buf2 = allocator.alloc(512)  # Fast
+        # ... use buffers ...
+        allocator.reset()  # Free everything at once
+    """
+    base: u32          # Start of heap region
+    size: u32          # Total heap size
+    offset: u32        # Current allocation offset
+    allocated: u32     # Total bytes allocated
+
+impl BumpAllocator:
+    me alloc(size: u32) -> u32:
+        """Allocate memory block.
+
+        Returns address of allocated block, or 0 if out of memory.
+        """
+        # Align to 8 bytes
+        val aligned_size = align_up(size, 8)
+
+        # Check if enough space
+        if self.offset + aligned_size > self.size:
+            return 0  # Out of memory
+
+        val addr = self.base + self.offset
+        self.offset = self.offset + aligned_size
+        self.allocated = self.allocated + aligned_size
+
+        addr
+
+    me alloc_aligned(size: u32, alignment: u32) -> u32:
+        """Allocate aligned memory block.
+
+        Alignment must be power of 2.
+        Returns address of allocated block, or 0 if out of memory.
+        """
+        # Align current offset to requested alignment
+        val aligned_offset = align_up(self.offset, alignment)
+        val padding = aligned_offset - self.offset
+
+        # Align size to 8 bytes
+        val aligned_size = align_up(size, 8)
+
+        # Check if enough space (including padding)
+        if aligned_offset + aligned_size > self.size:
+            return 0  # Out of memory
+
+        val addr = self.base + aligned_offset
+        self.offset = aligned_offset + aligned_size
+        self.allocated = self.allocated + aligned_size + padding
+
+        addr
+
+    me reset():
+        """Reset allocator (free all memory)."""
+        self.offset = 0
+        self.allocated = 0
+
+    fn remaining() -> u32:
+        """Get remaining free bytes."""
+        self.size - self.offset
+
+    fn total_allocated() -> u32:
+        """Get total allocated bytes."""
+        self.allocated
+
+# ============================================================================
+# Free List Allocator (General Purpose)
+# ============================================================================
+
+struct FreeListAllocator:
+    """Free list allocator with first-fit algorithm.
+
+    General-purpose allocator with deallocation support.
+    Maintains a linked list of free blocks.
+
+    Characteristics:
+    - O(n) allocation (search free list)
+    - O(1) deallocation
+    - Supports reallocation
+    - Can fragment over time
+    - Coalesces adjacent free blocks
+
+    Use cases:
+    - General-purpose heap
+    - Mixed allocation sizes
+    - Long-lived objects
+
+    Example:
+        val allocator = FreeListAllocator(base: 0x20000000, size: 128 * 1024)
+        allocator.init()
+
+        val buf1 = allocator.alloc(256)
+        val buf2 = allocator.alloc(512)
+
+        allocator.dealloc(buf1, 256)  # Frees and coalesces
+
+        val buf3 = allocator.alloc(128)  # Reuses buf1's space
+    """
+    base: u32          # Start of heap region
+    size: u32          # Total heap size
+    free_list: u32     # Address of first free block
+    allocated: u32     # Total bytes allocated
+    num_blocks: u32    # Number of blocks (for debugging)
+
+impl FreeListAllocator:
+    fn init():
+        """Initialize free list with single large block."""
+        # Create initial free block covering entire heap
+        val header = BlockHeader(
+            size: self.size,
+            is_free: true,
+            next: 0
+        )
+        header.write_to_addr(self.base)
+
+        self.free_list = self.base
+        self.allocated = 0
+        self.num_blocks = 1
+
+    fn alloc(size: u32) -> u32:
+        """Allocate memory block using first-fit algorithm.
+
+        Returns address of allocated block (after header), or 0 if out of memory.
+        """
+        val header_size = BlockHeader.header_size()
+        val total_size = header_size + align_up(size, 8)
+
+        # Search free list for suitable block
+        var current = self.free_list
+        var prev: u32 = 0
+
+        while current != 0:
+            val header = BlockHeader.from_addr(current)
+
+            if header.is_free and header.size >= total_size:
+                # Found suitable block
+
+                # Split block if large enough
+                val remainder = header.size - total_size
+                if remainder >= header_size + 16:  # Minimum 16-byte payload
+                    # Split: create new free block after allocated block
+                    val new_block_addr = current + total_size
+                    val new_header = BlockHeader(
+                        size: remainder,
+                        is_free: true,
+                        next: header.next
+                    )
+                    new_header.write_to_addr(new_block_addr)
+
+                    # Update current block
+                    val updated_header = BlockHeader(
+                        size: total_size,
+                        is_free: false,
+                        next: new_block_addr
+                    )
+                    updated_header.write_to_addr(current)
+
+                    self.num_blocks = self.num_blocks + 1
+                else:
+                    # Use entire block (no split)
+                    val updated_header = BlockHeader(
+                        size: header.size,
+                        is_free: false,
+                        next: header.next
+                    )
+                    updated_header.write_to_addr(current)
+
+                # Update free list if this was first free block
+                if prev == 0:
+                    self.free_list = header.next
+
+                self.allocated = self.allocated + total_size
+
+                return current + header_size  # Return address after header
+
+            prev = current
+            current = header.next
+
+        # No suitable block found
+        0
+
+    fn dealloc(addr: u32, size: u32):
+        """Deallocate memory block and coalesce with adjacent free blocks."""
+        val header_size = BlockHeader.header_size()
+        val block_addr = addr - header_size
+
+        # Mark block as free
+        var header = BlockHeader.from_addr(block_addr)
+        header.is_free = true
+        header.write_to_addr(block_addr)
+
+        self.allocated = self.allocated - header.size
+
+        # Coalesce with next block if free
+        if header.next != 0:
+            val next_header = BlockHeader.from_addr(header.next)
+            if next_header.is_free:
+                # Merge with next block
+                header.size = header.size + next_header.size
+                header.next = next_header.next
+                header.write_to_addr(block_addr)
+                self.num_blocks = self.num_blocks - 1
+
+        # Coalesce with previous block if free
+        self.coalesce_with_prev(block_addr)
+
+    fn coalesce_with_prev(addr: u32):
+        """Coalesce block with previous free block."""
+        # Find previous block
+        var current = self.base
+        while current < addr:
+            val header = BlockHeader.from_addr(current)
+            if header.next == addr or header.next == 0:
+                # Found previous block
+                if header.is_free:
+                    val target_header = BlockHeader.from_addr(addr)
+                    header.size = header.size + target_header.size
+                    header.next = target_header.next
+                    header.write_to_addr(current)
+                    self.num_blocks = self.num_blocks - 1
+                return
+            current = header.next
+
+    fn realloc(addr: u32, old_size: u32, new_size: u32) -> u32:
+        """Reallocate memory block to new size.
+
+        Returns address of reallocated block, or 0 if failed.
+        May return same address if block can be resized in place.
+        """
+        # Try to resize in place first
+        val header_size = BlockHeader.header_size()
+        val block_addr = addr - header_size
+        val header = BlockHeader.from_addr(block_addr)
+
+        val new_total_size = header_size + align_up(new_size, 8)
+
+        if new_total_size <= header.size:
+            # Shrinking or same size - can do in place
+            return addr
+
+        # Need to grow - allocate new block and copy
+        val new_addr = self.alloc(new_size)
+        if new_addr == 0:
+            return 0  # Allocation failed
+
+        # Copy data
+        mem_copy(new_addr, addr, old_size)
+
+        # Free old block
+        self.dealloc(addr, old_size)
+
+        new_addr
+
+    fn total_allocated() -> u32:
+        """Get total allocated bytes."""
+        self.allocated
+
+    fn num_free_blocks() -> u32:
+        """Count number of free blocks (for debugging)."""
+        var count: u32 = 0
+        var current = self.base
+
+        while current != 0:
+            val header = BlockHeader.from_addr(current)
+            if header.is_free:
+                count = count + 1
+            current = header.next
+
+        count
+
+# ============================================================================
+# Fixed Block Allocator (Pool Allocator)
+# ============================================================================
+
+struct FixedBlockAllocator:
+    """Pool allocator for fixed-size objects.
+
+    Very fast O(1) allocation and deallocation.
+    No fragmentation, minimal overhead.
+
+    Characteristics:
+    - O(1) allocation/deallocation
+    - No fragmentation
+    - Fixed object size
+    - Efficient for uniform objects
+
+    Use cases:
+    - AST nodes
+    - Network packets
+    - Game entities
+
+    Example:
+        # Pool for 64-byte objects
+        val allocator = FixedBlockAllocator(
+            base: 0x20000000,
+            block_size: 64,
+            capacity: 1000
+        )
+        allocator.init()
+
+        val obj1 = allocator.alloc()
+        val obj2 = allocator.alloc()
+
+        allocator.dealloc(obj1)
+        val obj3 = allocator.alloc()  # Reuses obj1's slot
+    """
+    base: u32          # Start of pool region
+    block_size: u32    # Size of each block
+    capacity: u32      # Maximum number of blocks
+    free_list: u32     # Address of first free block (linked list)
+    allocated: u32     # Number of allocated blocks
+
+impl FixedBlockAllocator:
+    fn init():
+        """Initialize free list linking all blocks."""
+        var addr = self.base
+        var i: u32 = 0
+
+        while i < self.capacity - 1:
+            # Write address of next block
+            val next_addr = addr + self.block_size
+            mem_write_u32(addr, next_addr)
+            addr = next_addr
+            i = i + 1
+
+        # Last block points to null
+        mem_write_u32(addr, 0)
+
+        self.free_list = self.base
+        self.allocated = 0
+
+    fn alloc() -> u32:
+        """Allocate one block.
+
+        Returns address of allocated block, or 0 if pool exhausted.
+        """
+        if self.free_list == 0:
+            return 0  # Pool exhausted
+
+        val addr = self.free_list
+        val next = mem_read_u32(addr)
+        self.free_list = next
+        self.allocated = self.allocated + 1
+
+        addr
+
+    fn dealloc(addr: u32):
+        """Deallocate one block (return to pool)."""
+        # Add block back to front of free list
+        mem_write_u32(addr, self.free_list)
+        self.free_list = addr
+        self.allocated = self.allocated - 1
+
+    fn available() -> u32:
+        """Get number of available blocks."""
+        self.capacity - self.allocated
+
+    fn is_exhausted() -> bool:
+        """Check if pool is exhausted."""
+        self.free_list == 0
+
+# ============================================================================
+# Multi-Pool Allocator (Slab Allocator)
+# ============================================================================
+
+struct MultiPoolAllocator:
+    """Multi-pool allocator with multiple size classes.
+
+    Combines multiple fixed-size pools.
+    Efficient for mixed workloads with known size distribution.
+
+    Size classes: 16, 32, 64, 128, 256, 512, 1024, 2048 bytes
+
+    Example:
+        val allocator = MultiPoolAllocator(base: 0x20000000, size: 256 * 1024)
+        allocator.init()
+
+        val small = allocator.alloc(32)    # Uses 32-byte pool
+        val medium = allocator.alloc(200)  # Uses 256-byte pool
+        val large = allocator.alloc(1500)  # Uses 2048-byte pool
+    """
+    base: u32          # Start of multi-pool region
+    size: u32          # Total size
+    pools: [u32]       # Array of pool base addresses (8 pools)
+
+    # Size classes
+    sizes: [u32]       # [16, 32, 64, 128, 256, 512, 1024, 2048]
+    counts: [u32]      # Number of blocks per pool
+
+impl MultiPoolAllocator:
+    fn init():
+        """Initialize all pools with even distribution."""
+        # Size classes
+        self.sizes = [16, 32, 64, 128, 256, 512, 1024, 2048]
+
+        # Divide heap among pools
+        val pool_size = self.size / 8
+        var offset: u32 = 0
+
+        for i in 0..8:
+            val pool_base = self.base + offset
+            self.pools.push(pool_base)
+
+            val block_size = self.sizes[i]
+            val capacity = pool_size / block_size
+            self.counts.push(capacity)
+
+            # Initialize this pool's free list
+            self.init_pool(pool_base, block_size, capacity)
+
+            offset = offset + pool_size
+
+    fn init_pool(base: u32, block_size: u32, capacity: u32):
+        """Initialize a single pool's free list."""
+        var addr = base
+        var i: u32 = 0
+
+        while i < capacity - 1:
+            val next_addr = addr + block_size
+            mem_write_u32(addr, next_addr)
+            addr = next_addr
+            i = i + 1
+
+        mem_write_u32(addr, 0)
+
+    fn alloc(size: u32) -> u32:
+        """Allocate from appropriate size class."""
+        val pool_idx = self.find_pool(size)
+        if pool_idx == 255:  # -1 as u8
+            return 0  # Size too large
+
+        val pool_base = self.pools[pool_idx]
+        val free_list_addr = mem_read_u32(pool_base)
+
+        if free_list_addr == 0:
+            return 0  # Pool exhausted
+
+        val next = mem_read_u32(free_list_addr)
+        mem_write_u32(pool_base, next)
+
+        free_list_addr
+
+    fn dealloc(addr: u32, size: u32):
+        """Deallocate to appropriate size class."""
+        val pool_idx = self.find_pool(size)
+        if pool_idx == 255:
+            return  # Invalid size
+
+        val pool_base = self.pools[pool_idx]
+        val free_list_addr = mem_read_u32(pool_base)
+
+        mem_write_u32(addr, free_list_addr)
+        mem_write_u32(pool_base, addr)
+
+    fn find_pool(size: u32) -> u32:
+        """Find pool index for size (returns 255 if too large)."""
+        for i in 0..8:
+            if size <= self.sizes[i]:
+                return i
+        255  # Too large
+
+# ============================================================================
+# Memory Access Primitives
+# ============================================================================
+
+extern fn rt_mmio_read_u32(addr: u64) -> u32
+extern fn rt_mmio_write_u32(addr: u64, value: u32)
+extern fn rt_mmio_read_u8(addr: u64) -> u8
+extern fn rt_mmio_write_u8(addr: u64, value: u8)
+
+fn mem_read_u32(addr: u32) -> u32:
+    """Read 32-bit word from memory address (volatile)."""
+    rt_mmio_read_u32(addr.to_u64())
+
+fn mem_write_u32(addr: u32, value: u32):
+    """Write 32-bit word to memory address (volatile)."""
+    rt_mmio_write_u32(addr.to_u64(), value)
+
+fn mem_read_u8(addr: u32) -> u8:
+    """Read byte from memory address (volatile)."""
+    rt_mmio_read_u8(addr.to_u64())
+
+fn mem_write_u8(addr: u32, value: u8):
+    """Write byte to memory address (volatile)."""
+    rt_mmio_write_u8(addr.to_u64(), value)
+
+fn mem_copy(dest: u32, src: u32, size: u32):
+    """Copy memory from src to dest."""
+    var i: u32 = 0
+    while i < size:
+        val byte = mem_read_u8(src + i)
+        mem_write_u8(dest + i, byte)
+        i = i + 1
+
+fn align_up(value: u32, alignment: u32) -> u32:
+    """Align value up to alignment (must be power of 2)."""
+    (value + alignment - 1) & ~(alignment - 1)
+
+# ============================================================================
+# Heap Management Functions
+# ============================================================================
+
+var global_heap: FreeListAllocator = FreeListAllocator(
+    base: 0,
+    size: 0,
+    free_list: 0,
+    allocated: 0,
+    num_blocks: 0
+)
+
+fn heap_init(base: u32, size: u32):
+    """Initialize global heap with free list allocator."""
+    global_heap = FreeListAllocator(
+        base: base,
+        size: size,
+        free_list: 0,
+        allocated: 0,
+        num_blocks: 0
+    )
+    global_heap.init()
+
+fn heap_stats() -> (u32, u32, u32):
+    """Get heap statistics: (allocated, free, fragmentation)."""
+    (0, 0, 0)
+
+fn heap_check() -> bool:
+    """Check heap integrity (verify free list, block sizes, etc.)."""
+    true

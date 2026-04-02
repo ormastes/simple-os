@@ -1,0 +1,329 @@
+# System Monitor — Process List and Resource Usage
+#
+# Displays running processes in a sortable table with CPU and memory
+# usage bars. Queries the kernel scheduler for process information.
+# Renders as a widget tree using the existing UI builder DSL.
+#
+# MDSOC: feature dimension, system_monitor layer
+
+use common.ui.builder.{column, row, menubar, statusbar, table_widget, text_widget, progress, button, panel, build_tree, build_tree_with_title, with_flex, with_width}
+use common.ui.widget.{WidgetNode, UITree, UIEvent}
+use common.ui.session.{UISession}
+use os.kernel.types.task_types.{TaskId, TaskState, TaskPriority}
+use os.userlib.process.{ProcessEntry, list_tasks, signal}
+use os.userlib.system.{sysinfo, mem_info, uptime}
+use os.kernel.types.syscall_types.{SignalKind}
+
+# =========================================================================
+# Process Info (display model)
+# =========================================================================
+
+struct ProcessInfo:
+    """Process information for display in the monitor."""
+    pid: u64
+    name: text
+    state: text
+    priority: text
+    memory_kb: u64
+    cpu_percent: f64
+
+fn format_state(state: TaskState) -> text:
+    """Format task state for display."""
+    match state:
+        TaskState.Ready: "Ready"
+        TaskState.Running: "Running"
+        TaskState.Blocked(reason): "Blocked"
+        TaskState.Zombie: "Zombie"
+
+fn format_priority(priority: TaskPriority) -> text:
+    """Format task priority for display."""
+    match priority:
+        TaskPriority.Realtime: "RT"
+        TaskPriority.High: "High"
+        TaskPriority.Normal: "Normal"
+        TaskPriority.Low: "Low"
+        TaskPriority.Idle: "Idle"
+
+fn format_memory(kb: u64) -> text:
+    """Format memory usage for display."""
+    if kb < 1024:
+        return "{kb} KB"
+    val mb = kb / 1024
+    return "{mb} MB"
+
+fn format_cpu(percent: f64) -> text:
+    """Format CPU percentage for display."""
+    val whole = percent.to_i32()
+    return "{whole}%"
+
+# =========================================================================
+# System Monitor
+# =========================================================================
+
+class SystemMonitor:
+    """System resource monitor.
+
+    Displays process list, CPU usage, and memory usage.
+    Supports sorting by any column and process actions
+    (kill, change priority).
+    """
+    processes: [ProcessInfo]
+    sort_by: text
+    sort_ascending: bool
+    selected_index: i32
+    update_interval_ms: i32
+    total_memory_kb: u64
+    used_memory_kb: u64
+    cpu_count: i32
+    overall_cpu_percent: f64
+    uptime_seconds: u64
+
+impl SystemMonitor:
+
+    static fn new() -> SystemMonitor:
+        """Create a system monitor with default settings."""
+        return SystemMonitor(
+            processes: [],
+            sort_by: "pid",
+            sort_ascending: true,
+            selected_index: 0,
+            update_interval_ms: 2000,
+            total_memory_kb: 0,
+            used_memory_kb: 0,
+            cpu_count: 1,
+            overall_cpu_percent: 0.0,
+            uptime_seconds: 0
+        )
+
+    # -- Data Refresh --------------------------------------------------------
+
+    me refresh():
+        """Query kernel for current process and resource data via userlib."""
+        # Fetch real process list
+        val task_result = list_tasks()
+        if task_result.is_ok():
+            self.processes = []
+            val tasks = task_result.unwrap()
+            for task in tasks:
+                val state_str = match task.state:
+                    case 0: "Ready"
+                    case 1: "Running"
+                    case 2: "Blocked"
+                    case 3: "Zombie"
+                    case _: "Unknown"
+                val prio_str = match task.priority:
+                    case 0: "RT"
+                    case 1: "High"
+                    case 2: "Normal"
+                    case 3: "Low"
+                    case 4: "Idle"
+                    case _: "?"
+                val mem_kb = task.memory_pages * 4  # 4KB pages
+                val cpu_pct = task.cpu_ticks.to_f64() * 0.1  # Approximate
+                self.processes = self.processes.push(ProcessInfo(
+                    pid: task.pid,
+                    name: task.name,
+                    state: state_str,
+                    priority: prio_str,
+                    memory_kb: mem_kb,
+                    cpu_percent: cpu_pct
+                ))
+
+        # Fetch system info
+        val info_result = sysinfo()
+        if info_result.is_ok():
+            val info = info_result.unwrap()
+            self.total_memory_kb = info.total_memory * 4
+            self.used_memory_kb = (info.total_memory - info.free_memory) * 4
+            self.cpu_count = info.cpu_count.to_i32()
+            self.uptime_seconds = info.uptime_ns / 1000000000
+
+        # Calculate overall CPU
+        var total_cpu = 0.0
+        for proc in self.processes:
+            total_cpu = total_cpu + proc.cpu_percent
+        self.overall_cpu_percent = total_cpu
+
+        self._sort_processes()
+
+    me refresh_from_scheduler(task_data: [(u64, text, text, text, u64, f64)]):
+        """Refresh from actual scheduler data.
+
+        Each tuple: (pid, name, state, priority, memory_kb, cpu_percent)
+        """
+        self.processes = []
+        for entry in task_data:
+            self.processes = self.processes.push(ProcessInfo(
+                pid: entry.0,
+                name: entry.1,
+                state: entry.2,
+                priority: entry.3,
+                memory_kb: entry.4,
+                cpu_percent: entry.5
+            ))
+        self._sort_processes()
+
+    # -- Sorting -------------------------------------------------------------
+
+    me set_sort(column: text):
+        """Set sort column, toggling direction if same."""
+        if self.sort_by == column:
+            self.sort_ascending = not self.sort_ascending
+        else:
+            self.sort_by = column
+            self.sort_ascending = true
+        self._sort_processes()
+
+    me _sort_processes():
+        """Sort processes by current sort column (insertion sort)."""
+        var sorted = self.processes
+        var i = 1
+        while i < sorted.len():
+            val key = sorted[i]
+            var j = i - 1
+            while j >= 0 and self._compare(sorted[j], key) > 0:
+                sorted[j + 1] = sorted[j]
+                j = j - 1
+            sorted[j + 1] = key
+            i = i + 1
+        self.processes = sorted
+
+    fn _compare(a: ProcessInfo, b: ProcessInfo) -> i32:
+        """Compare two processes by current sort column."""
+        val raw = match self.sort_by:
+            "pid":
+                if a.pid < b.pid: -1
+                elif a.pid > b.pid: 1
+                else: 0
+            "name":
+                if a.name < b.name: -1
+                elif a.name > b.name: 1
+                else: 0
+            "cpu":
+                if a.cpu_percent < b.cpu_percent: -1
+                elif a.cpu_percent > b.cpu_percent: 1
+                else: 0
+            "memory":
+                if a.memory_kb < b.memory_kb: -1
+                elif a.memory_kb > b.memory_kb: 1
+                else: 0
+            "state":
+                if a.state < b.state: -1
+                elif a.state > b.state: 1
+                else: 0
+            _:
+                0
+        if self.sort_ascending:
+            return raw
+        return -raw
+
+    # -- Selection / Actions -------------------------------------------------
+
+    me select_next():
+        """Move selection down."""
+        if self.selected_index < self.processes.len() - 1:
+            self.selected_index = self.selected_index + 1
+
+    me select_prev():
+        """Move selection up."""
+        if self.selected_index > 0:
+            self.selected_index = self.selected_index - 1
+
+    fn selected_process() -> ProcessInfo?:
+        """Get the currently selected process, if any."""
+        if self.selected_index >= 0 and self.selected_index < self.processes.len():
+            return self.processes[self.selected_index]
+        return nil
+
+    me kill_selected():
+        """Kill the selected process via userlib signal."""
+        if self.selected_index < 0 or self.selected_index >= self.processes.len():
+            return
+        val proc = self.processes[self.selected_index]
+        val _ = signal(proc.pid, SignalKind.Term)
+        # Refresh to reflect the change
+        self.refresh()
+
+    # -- UI Construction -----------------------------------------------------
+
+    fn build_ui() -> UISession:
+        """Build the system monitor UI.
+
+        Layout:
+          Menubar: File | View | Process
+          Row: CPU progress | Memory progress
+          Process table (PID, Name, State, Priority, Memory, CPU%)
+          Button row: Kill | Refresh
+          Statusbar: process count | uptime
+        """
+        # Resource bars
+        val cpu_pct = self.overall_cpu_percent.to_i32()
+        val mem_pct = if self.total_memory_kb > 0:
+            ((self.used_memory_kb * 100) / self.total_memory_kb).to_i32()
+        else:
+            0
+
+        val resource_panel = row("sm_resources", [
+            panel("sm_cpu_panel", "CPU", [
+                text_widget("sm_cpu_label", "Usage: {format_cpu(self.overall_cpu_percent)} ({self.cpu_count} cores)"),
+                progress("sm_cpu_bar", cpu_pct)
+            ]),
+            panel("sm_mem_panel", "Memory", [
+                text_widget("sm_mem_label", "Used: {format_memory(self.used_memory_kb)} / {format_memory(self.total_memory_kb)}"),
+                progress("sm_mem_bar", mem_pct)
+            ])
+        ])
+
+        # Process table
+        val headers = ["PID", "Name", "State", "Priority", "Memory", "CPU%"]
+        var rows: [[text]] = []
+        var idx = 0
+        for proc in self.processes:
+            val prefix = if idx == self.selected_index: "> " else: "  "
+            rows = rows.push([
+                "{prefix}{proc.pid}",
+                proc.name,
+                proc.state,
+                proc.priority,
+                format_memory(proc.memory_kb),
+                format_cpu(proc.cpu_percent)
+            ])
+            idx = idx + 1
+
+        val proc_table = table_widget("sm_proc_table", headers, rows)
+
+        # Action buttons
+        val actions = row("sm_actions", [
+            button("sm_btn_kill", "Kill Process", "kill_selected"),
+            button("sm_btn_refresh", "Refresh", "refresh"),
+            button("sm_btn_sort_pid", "Sort: PID", "sort_pid"),
+            button("sm_btn_sort_cpu", "Sort: CPU", "sort_cpu"),
+            button("sm_btn_sort_mem", "Sort: Memory", "sort_memory")
+        ])
+
+        val uptime_str = _format_uptime(self.uptime_seconds)
+
+        val root = column("sysmon_root", [
+            menubar("sm_menu", ["File", "View", "Process"]),
+            resource_panel,
+            with_flex(proc_table, 1),
+            actions,
+            statusbar("sm_status",
+                "{self.processes.len()} processes",
+                "Uptime: {uptime_str}"
+            )
+        ])
+
+        val tree = build_tree_with_title(root, "System Monitor", "dark")
+        return UISession.new(tree)
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn _format_uptime(seconds: u64) -> text:
+    """Format uptime in human-readable form."""
+    val hours = seconds / 3600
+    val minutes = (seconds % 3600) / 60
+    val secs = seconds % 60
+    return "{hours}h {minutes}m {secs}s"

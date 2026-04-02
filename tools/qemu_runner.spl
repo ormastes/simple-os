@@ -1,0 +1,366 @@
+# SimpleOS QEMU Runner — Multi-Architecture Boot & Test
+#
+# Provides build + run + test functionality for all 6 architectures.
+# Usage:
+#   bin/simple os build --arch=x86_64
+#   bin/simple os run --arch=riscv64
+#   bin/simple os test --arch=all
+
+use os.kernel.arch.arch_context.{Architecture}
+
+extern fn rt_process_run_timeout(cmd: text, args: [text], timeout_ms: i64) -> (text, text, i32)
+extern fn rt_file_exists(path: text) -> bool
+
+fn is_qemu_success(target: OsTarget, exit_code: i32) -> bool:
+    """Interpret QEMU exit code based on architecture.
+
+    x86/x86_64 with isa-debug-exit: guest writes 0 -> QEMU exits with (0 << 1) | 1 = 1
+    ARM64/RISC-V with semihosting: exit code 0 = success
+    """
+    match target.arch:
+        Architecture.X86_64: exit_code == 1
+        Architecture.X86: exit_code == 1
+        _: exit_code == 0
+
+# ===========================================================================
+# OS Target Configuration
+# ===========================================================================
+
+class OsTarget:
+    """Build and QEMU configuration for a single OS architecture target."""
+    arch: Architecture
+    entry: text
+    linker_script: text
+    target_triple: text
+    output: text
+    qemu_system: text
+    qemu_machine: text
+    qemu_cpu: text
+    qemu_memory: text
+    qemu_bios: text
+    qemu_extra: [text]
+
+# ===========================================================================
+# Hardcoded Target Definitions
+# ===========================================================================
+
+fn get_target(arch: Architecture) -> OsTarget:
+    """Returns hardcoded target config for the given architecture."""
+    match arch:
+        Architecture.X86_64:
+            OsTarget(
+                arch: Architecture.X86_64,
+                entry: "src/os/kernel/arch/x86_64/boot.spl",
+                linker_script: "src/os/kernel/arch/x86_64/linker.ld",
+                target_triple: "x86_64-unknown-none",
+                output: "build/os/simpleos_x86_64.elf",
+                qemu_system: "qemu-system-x86_64",
+                qemu_machine: "q35",
+                qemu_cpu: "qemu64",
+                qemu_memory: "128M",
+                qemu_bios: "",
+                qemu_extra: ["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]
+            )
+        Architecture.Riscv64:
+            OsTarget(
+                arch: Architecture.Riscv64,
+                entry: "src/os/kernel/arch/riscv64/boot.spl",
+                linker_script: "src/os/kernel/arch/riscv64/linker.ld",
+                target_triple: "riscv64-unknown-none",
+                output: "build/os/simpleos_riscv64.elf",
+                qemu_system: "qemu-system-riscv64",
+                qemu_machine: "virt",
+                qemu_cpu: "rv64",
+                qemu_memory: "128M",
+                qemu_bios: "default",
+                qemu_extra: []
+            )
+        Architecture.Riscv32:
+            OsTarget(
+                arch: Architecture.Riscv32,
+                entry: "src/os/kernel/arch/riscv32/boot.spl",
+                linker_script: "src/os/kernel/arch/riscv32/linker.ld",
+                target_triple: "riscv32-unknown-none",
+                output: "build/os/simpleos_riscv32.elf",
+                qemu_system: "qemu-system-riscv32",
+                qemu_machine: "virt",
+                qemu_cpu: "rv32",
+                qemu_memory: "128M",
+                qemu_bios: "default",
+                qemu_extra: []
+            )
+        Architecture.X86:
+            OsTarget(
+                arch: Architecture.X86,
+                entry: "src/os/kernel/arch/x86_32/boot.spl",
+                linker_script: "src/os/kernel/arch/x86_32/linker.ld",
+                target_triple: "i686-unknown-none",
+                output: "build/os/simpleos_x86_32.elf",
+                qemu_system: "qemu-system-i386",
+                qemu_machine: "pc",
+                qemu_cpu: "qemu32",
+                qemu_memory: "128M",
+                qemu_bios: "",
+                qemu_extra: ["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]
+            )
+        Architecture.Arm64:
+            OsTarget(
+                arch: Architecture.Arm64,
+                entry: "src/os/kernel/arch/arm64/boot.spl",
+                linker_script: "src/os/kernel/arch/arm64/linker.ld",
+                target_triple: "aarch64-unknown-none",
+                output: "build/os/simpleos_aarch64.elf",
+                qemu_system: "qemu-system-aarch64",
+                qemu_machine: "virt",
+                qemu_cpu: "cortex-a72",
+                qemu_memory: "128M",
+                qemu_bios: "",
+                qemu_extra: []
+            )
+        Architecture.Arm32:
+            OsTarget(
+                arch: Architecture.Arm32,
+                entry: "src/os/kernel/arch/arm32/boot.spl",
+                linker_script: "src/os/kernel/arch/arm32/linker.ld",
+                target_triple: "armv7-unknown-none-eabihf",
+                output: "build/os/simpleos_arm32.elf",
+                qemu_system: "qemu-system-arm",
+                qemu_machine: "virt",
+                qemu_cpu: "cortex-a15",
+                qemu_memory: "128M",
+                qemu_bios: "",
+                qemu_extra: []
+            )
+
+# ===========================================================================
+# Target Enumeration & Name Parsing
+# ===========================================================================
+
+fn get_all_targets() -> [OsTarget]:
+    """Returns all 6 architecture targets."""
+    [
+        get_target(Architecture.X86_64),
+        get_target(Architecture.X86),
+        get_target(Architecture.Riscv64),
+        get_target(Architecture.Riscv32),
+        get_target(Architecture.Arm64),
+        get_target(Architecture.Arm32)
+    ]
+
+fn arch_from_name(name: text) -> Architecture?:
+    """Parse architecture name string to Architecture enum.
+
+    Accepts: x86_64, x86_32, x86, i386, i686, riscv64, riscv32, arm64, aarch64, arm32, armv7.
+    Returns nil for unrecognized names.
+    """
+    if name == "x86_64":
+        Architecture.X86_64
+    elif name == "x86_32" or name == "x86" or name == "i386" or name == "i686":
+        Architecture.X86
+    elif name == "riscv64":
+        Architecture.Riscv64
+    elif name == "riscv32":
+        Architecture.Riscv32
+    elif name == "arm64" or name == "aarch64":
+        Architecture.Arm64
+    elif name == "arm32" or name == "armv7":
+        Architecture.Arm32
+    else:
+        nil
+
+fn arch_display_name(arch: Architecture) -> text:
+    """Human-readable name for an architecture."""
+    match arch:
+        Architecture.X86_64: "x86_64"
+        Architecture.X86: "x86_32"
+        Architecture.Riscv64: "riscv64"
+        Architecture.Riscv32: "riscv32"
+        Architecture.Arm64: "arm64"
+        Architecture.Arm32: "arm32"
+
+# ===========================================================================
+# Build
+# ===========================================================================
+
+fn build_os(target: OsTarget) -> bool:
+    """Builds the OS kernel for the given target.
+
+    Runs the native-build command via rt_process_run_timeout. Returns true on success.
+    """
+    val args = ["native-build", "--entry", target.entry, "--target", target.target_triple, "-o", target.output, "--linker-script", target.linker_script]
+    print "[build] {arch_display_name(target.arch)}: bin/simple {args.join(" ")}"
+    val (stdout, stderr, exit_code) = rt_process_run_timeout("bin/simple", args, 60000)
+    if exit_code != 0:
+        print "[build] FAILED (exit code {exit_code})"
+        if stdout != "":
+            print "[build] stdout: {stdout}"
+        if stderr != "":
+            print "[build] stderr: {stderr}"
+        return false
+    true
+
+# ===========================================================================
+# QEMU Command Construction
+# ===========================================================================
+
+fn build_qemu_command(target: OsTarget) -> [text]:
+    """Returns QEMU command line as a list of strings.
+
+    Includes machine, cpu, memory, serial stdio, no display, no reboot,
+    optional BIOS flags, kernel path, and extra architecture-specific flags.
+    """
+    var args: [text] = []
+
+    # QEMU system binary
+    args.push(target.qemu_system)
+
+    # Machine and CPU
+    args.push("-machine")
+    args.push(target.qemu_machine)
+    args.push("-cpu")
+    args.push(target.qemu_cpu)
+
+    # Memory
+    args.push("-m")
+    args.push(target.qemu_memory)
+
+    # Serial output to stdio
+    args.push("-serial")
+    args.push("stdio")
+
+    # Headless operation
+    args.push("-display")
+    args.push("none")
+
+    # Don't reboot on crash
+    args.push("-no-reboot")
+
+    # BIOS/firmware (OpenSBI uses "default", empty means no -bios flag)
+    if target.qemu_bios == "default":
+        args.push("-bios")
+        args.push("default")
+    elif target.qemu_bios != "":
+        args.push("-bios")
+        args.push(target.qemu_bios)
+
+    # Kernel ELF
+    args.push("-kernel")
+    args.push(target.output)
+
+    # Extra architecture-specific flags
+    for extra in target.qemu_extra:
+        args.push(extra)
+
+    args
+
+# ===========================================================================
+# Run
+# ===========================================================================
+
+fn run_os(target: OsTarget) -> bool:
+    """Runs QEMU with the built kernel for the given target.
+
+    Checks that the binary exists, then spawns QEMU. Returns true on success.
+    """
+    if not rt_file_exists(target.output):
+        print "[run] ERROR: kernel binary not found: {target.output}"
+        print "[run] Run 'bin/simple os build --arch={arch_display_name(target.arch)}' first"
+        return false
+    val cmd_parts = build_qemu_command(target)
+    val qemu_bin = cmd_parts[0]
+    val qemu_args = cmd_parts.slice(1)
+    print "[run] {arch_display_name(target.arch)}: {cmd_parts.join(" ")}"
+    val (stdout, stderr, exit_code) = rt_process_run_timeout(qemu_bin, qemu_args, 30000)
+    if stdout != "":
+        print "[run] serial output:\n{stdout}"
+    if stderr != "":
+        print "[run] stderr:\n{stderr}"
+    val success = is_qemu_success(target, exit_code)
+    if not success:
+        print "[run] FAILED (exit code {exit_code})"
+    success
+
+# ===========================================================================
+# Test
+# ===========================================================================
+
+fn test_os(target: OsTarget, timeout_ms: u64) -> bool:
+    """Runs QEMU and checks serial output for 'SimpleOS' within timeout.
+
+    Returns true if the kernel boots, prints the expected banner, and exits successfully.
+    """
+    if not rt_file_exists(target.output):
+        print "[test] ERROR: kernel binary not found: {target.output}"
+        print "[test] Run 'bin/simple os build --arch={arch_display_name(target.arch)}' first"
+        return false
+    val cmd_parts = build_qemu_command(target)
+    val qemu_bin = cmd_parts[0]
+    val qemu_args = cmd_parts.slice(1)
+    print "[test] {arch_display_name(target.arch)} (timeout: {timeout_ms}ms): {cmd_parts.join(" ")}"
+    val (stdout, stderr, exit_code) = rt_process_run_timeout(qemu_bin, qemu_args, timeout_ms as i64)
+    val serial_output = stdout + stderr
+    print "[test] serial output:\n{serial_output}"
+    val has_banner = serial_output.contains("SimpleOS")
+    val success = has_banner and is_qemu_success(target, exit_code)
+    if not has_banner:
+        print "[test] FAILED: 'SimpleOS' banner not found in serial output"
+    if not is_qemu_success(target, exit_code):
+        print "[test] FAILED: unexpected exit code {exit_code}"
+    success
+
+# ===========================================================================
+# Batch Operations
+# ===========================================================================
+
+fn run_all_architectures():
+    """Build and run SimpleOS for all 6 architectures."""
+    val targets = get_all_targets()
+    for target in targets:
+        print "=== {arch_display_name(target.arch)} ==="
+        val built = build_os(target)
+        if built:
+            run_os(target)
+        else:
+            print "[error] Build failed for {arch_display_name(target.arch)}, skipping run"
+        print ""
+
+fn test_all_architectures() -> bool:
+    """Build and test all 6 architectures, report results.
+
+    Returns true only if all architectures pass the boot smoke test.
+    """
+    val targets = get_all_targets()
+    var all_passed = true
+    var passed_count: u64 = 0
+    var failed_count: u64 = 0
+    val timeout_ms: u64 = 10000
+
+    print "SimpleOS Boot Smoke Test — All Architectures"
+    print "============================================="
+    print ""
+
+    for target in targets:
+        val name = arch_display_name(target.arch)
+        print "--- {name} ---"
+
+        val built = build_os(target)
+        if not built:
+            print "[FAIL] {name}: build failed"
+            all_passed = false
+            failed_count = failed_count + 1
+            continue
+
+        val ok = test_os(target, timeout_ms)
+        if ok:
+            print "[PASS] {name}"
+            passed_count = passed_count + 1
+        else:
+            print "[FAIL] {name}: boot test failed"
+            all_passed = false
+            failed_count = failed_count + 1
+        print ""
+
+    print "============================================="
+    print "Results: {passed_count} passed, {failed_count} failed"
+
+    all_passed

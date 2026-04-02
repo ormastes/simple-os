@@ -1,0 +1,14 @@
+# @platform: baremetal(aarch64)
+# @requires: aarch64-none-elf-gcc, qemu-system-aarch64
+#
+# ARM64 (AArch64) Bare-Metal Module
+#
+# Hardware abstraction for ARM64 bare-metal programming.
+# Supports QEMU virt machine and compatible hardware.
+#
+# Components:
+# - test_support: Testing utilities for boot code
+
+
+# Modules
+mod test_support

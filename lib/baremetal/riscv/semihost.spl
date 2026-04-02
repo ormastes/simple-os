@@ -1,0 +1,181 @@
+# RISC-V Semihosting Implementation
+#
+# Provides semihosting support for RISC-V processors (RV32/RV64).
+# Uses EBREAK instruction with magic NOP sequence for detection.
+#
+# Supported debuggers:
+# - OpenOCD: `riscv semihosting enable`
+# - SEGGER Ozone: Native RISC-V semihosting (Oct 2024+)
+# - Trace32: `SYStem.Option SemiHost ON`
+#
+# Reference: RISC-V Semihosting Specification
+# https://github.com/riscv/riscv-semihosting-spec
+
+# @cfg("target_arch", "riscv32")
+# @cfg("target_arch", "riscv64")
+
+
+# ============================================================================
+# RISC-V Semihosting Call Implementation
+# ============================================================================
+
+# The RISC-V semihosting mechanism uses a special instruction sequence:
+#
+#   slli zero, zero, 0x1f   # Entry NOP (magic marker)
+#   ebreak                   # Breakpoint triggers debugger
+#   srai zero, zero, 0x7    # Exit NOP (magic marker)
+#
+# Register usage:
+#   a0 = operation number (input) / return value (output)
+#   a1 = parameter block pointer
+
+# Semihosting call with simple arguments
+@inline
+fn arch_semi_host_call(op: u32, arg0: i64, arg1: i64) -> i64:
+    # Create inline param block on stack
+    var params: [i64; 2] = [arg0, arg1]
+    arch_semi_host_call_raw(op, params.as_ptr())
+
+# Semihosting call with parameter block
+@inline
+fn arch_semi_host_call_block(op: u32, arg0: i64, block_ptr: i64) -> i64:
+    arch_semi_host_call_raw(op, block_ptr as rawptr<i64>)
+
+# Raw semihosting call using inline assembly
+@inline
+fn arch_semi_host_call_raw(op: u32, params_ptr: rawptr<i64>) -> i64:
+    var result: i64 = 0
+
+    # RISC-V 32-bit semihosting
+    # @cfg("target_arch", "riscv32")
+    # asm volatile(
+    #     ".option push",
+    #     ".option norvc",              # Disable compressed instructions
+    #     "mv a0, {op}",                # Operation number
+    #     "mv a1, {params}",            # Parameter block pointer
+    #     "slli zero, zero, 0x1f",      # Entry magic NOP
+    #     "ebreak",                      # Trigger semihosting
+    #     "srai zero, zero, 0x7",       # Exit magic NOP
+    #     "mv {result}, a0",            # Get return value
+    #     ".option pop",
+    #     op = in(reg) op,
+    #     params = in(reg) params_ptr,
+    #     result = out(reg) result,
+    #     clobber_abi("C")
+    # )
+
+    # RISC-V 64-bit semihosting
+    # @cfg("target_arch", "riscv64")
+    # asm volatile(
+    #     ".option push",
+    #     ".option norvc",              # Disable compressed instructions
+    #     "mv a0, {op}",                # Operation number
+    #     "mv a1, {params}",            # Parameter block pointer
+    #     "slli zero, zero, 0x1f",      # Entry magic NOP
+    #     "ebreak",                      # Trigger semihosting
+    #     "srai zero, zero, 0x7",       # Exit magic NOP
+    #     "mv {result}, a0",            # Get return value
+    #     ".option pop",
+    #     op = in(reg) op,
+    #     params = in(reg) params_ptr,
+    #     result = out(reg) result,
+    #     clobber_abi("C")
+    # )
+
+    result
+
+# ============================================================================
+# RISC-V-Specific Helper Functions
+# ============================================================================
+
+# Write single character via semihosting
+@inline
+fn semi_writec(c: u8):
+    var ch: u8 = c
+    var params: [i64; 1] = [(&ch) as i64]
+    arch_semi_host_call_raw(0x03, params.as_ptr())  # SYS_WRITEC
+
+# Write null-terminated string via semihosting
+@inline
+fn semi_write0(s: rawptr<u8>):
+    var params: [i64; 1] = [s as i64]
+    arch_semi_host_call_raw(0x04, params.as_ptr())  # SYS_WRITE0
+
+# ============================================================================
+# RISC-V Interrupt Control for Semihosting
+# ============================================================================
+
+# Disable interrupts during semihosting call
+# Uses Machine Status Register (mstatus)
+@inline
+fn disable_interrupts() -> u64:
+    var mstatus: u64 = 0
+    asm volatile(
+        "csrrci {mstatus}, mstatus, 0x8",  # Clear MIE bit (bit 3)
+        mstatus = out(reg) mstatus
+    )
+    mstatus
+
+# Restore interrupts after semihosting call
+@inline
+fn restore_interrupts(mstatus: u64):
+    # Only restore MIE if it was previously set
+    if (mstatus & 0x8) != 0:
+        asm volatile(
+            "csrsi mstatus, 0x8"  # Set MIE bit
+        )
+
+# Interrupt-safe semihosting call wrapper
+fn semi_host_call_safe(op: u32, params_ptr: rawptr<i64>) -> i64:
+    val saved = disable_interrupts()
+    val result = arch_semi_host_call_raw(op, params_ptr)
+    restore_interrupts(saved)
+    result
+
+# ============================================================================
+# RISC-V CSR Helpers
+# ============================================================================
+
+# Read machine cycle counter (mcycle)
+@inline
+fn read_mcycle() -> u64:
+    var cycles: u64 = 0
+
+    # @cfg("target_arch", "riscv32")
+    # asm volatile(
+    #     # RV32: Need to read both mcycle and mcycleh
+    #     "1:",
+    #     "csrr {hi}, mcycleh",
+    #     "csrr {lo}, mcycle",
+    #     "csrr {tmp}, mcycleh",
+    #     "bne {hi}, {tmp}, 1b",  # Retry if high bits changed
+    #     hi = out(reg) _,
+    #     lo = out(reg) cycles,
+    #     tmp = out(reg) _
+    # )
+
+    # @cfg("target_arch", "riscv64")
+    # asm volatile(
+    #     "csrr {cycles}, mcycle",
+    #     cycles = out(reg) cycles
+    # )
+
+    cycles
+
+# Read machine time counter (mtime)
+# Note: mtime is typically memory-mapped, not a CSR
+@inline
+fn read_mtime(mtime_addr: u64) -> u64:
+    # Keep this parser-friendly in generic builds. Baremetal targets can
+    # provide an architecture-specific implementation later if needed.
+    *(mtime_addr as rawptr<u64>)
+
+# ============================================================================
+# RISC-V Platform Constants
+# ============================================================================
+
+# Common RISC-V platform memory addresses
+# These vary by platform - these are QEMU virt machine defaults
+const QEMU_VIRT_MTIME_ADDR: u64 = 0x0200BFF8
+const QEMU_VIRT_MTIMECMP_ADDR: u64 = 0x02004000
+const QEMU_VIRT_UART_ADDR: u64 = 0x10000000

@@ -1,0 +1,352 @@
+# Kernel IPC Manager — Computation Dimension
+#
+# Message-passing IPC with capability transfer.
+# Port-based: tasks create named ports, connect by name, send/recv messages.
+# Integrates with scheduler for blocking/unblocking on recv.
+#
+# Consumes: IpcInputPort (scheduler for blocking, memory for buffers)
+# Produces: IpcOutputPort (message passing, capability management)
+
+use os.kernel.types.ipc_types.{IpcPort, IpcMessage, IpcEndpoint, IpcFlags}
+use os.kernel.types.task_types.{TaskId, BlockReason}
+use os.kernel.types.capability_types.{CapabilityToken, CapabilityKind, CapabilitySet}
+use os.kernel.ipc.capability.{CapabilityManager}
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+val MAX_PORTS: i32 = 1024
+val MAX_MESSAGES: i32 = 64         # Per-port queue depth
+
+# ============================================================================
+# Message Queue — Bounded FIFO per Port
+# ============================================================================
+
+struct MessageQueue:
+    """Bounded FIFO queue of IPC messages for a single port."""
+    messages: [IpcMessage?]
+    head: i32
+    tail: i32
+    count: i32
+    capacity: i32
+
+impl MessageQueue:
+    static fn new(capacity: i32) -> MessageQueue:
+        """Create an empty message queue with given capacity."""
+        var messages: [IpcMessage?] = []
+        var i = 0
+        while i < capacity:
+            messages.push(nil)
+            i = i + 1
+        MessageQueue(
+            messages: messages,
+            head: 0,
+            tail: 0,
+            count: 0,
+            capacity: capacity
+        )
+
+    me push(msg: IpcMessage) -> bool:
+        """Enqueue a message. Returns false if queue is full."""
+        if self.count >= self.capacity:
+            return false
+        self.messages[self.tail] = msg
+        self.tail = (self.tail + 1) % self.capacity
+        self.count = self.count + 1
+        true
+
+    me pop() -> IpcMessage?:
+        """Dequeue the next message. Returns nil if empty."""
+        if self.count == 0:
+            return nil
+        val msg = self.messages[self.head]
+        self.messages[self.head] = nil
+        self.head = (self.head + 1) % self.capacity
+        self.count = self.count - 1
+        msg
+
+    fn is_empty() -> bool:
+        self.count == 0
+
+    fn is_full() -> bool:
+        self.count >= self.capacity
+
+    fn len() -> i32:
+        self.count
+
+# ============================================================================
+# Port State
+# ============================================================================
+
+struct IpcPortState:
+    """Runtime state for a single IPC port.
+
+    Each port has a name for service discovery, a bounded message queue,
+    and a list of tasks blocked waiting to receive from this port.
+    """
+    port: IpcPort
+    name: text
+    queue: MessageQueue
+    waiters: [TaskId]           # Tasks blocked on recv for this port
+    max_depth: i32
+
+# ============================================================================
+# IPC Manager
+# ============================================================================
+
+class IpcManager:
+    """Kernel IPC subsystem.
+
+    Manages named ports, message delivery, and capability transfer.
+    Works with the scheduler to block/unblock tasks on send/recv.
+
+    Port lifecycle:
+      1. create_port(owner, name) -> IpcPort
+      2. connect(name) -> IpcPort?  (lookup by name)
+      3. send(msg) / recv(port, timeout)
+      4. Ports are destroyed when the owning task exits.
+
+    Capability transfer:
+      Messages with CapTransfer flag carry CapabilityTokens.
+      cap_grant/cap_revoke/cap_check delegate to CapabilityManager.
+    """
+    ports: [IpcPortState?]          # Port table (nil = unused slot)
+    next_port_id: u64               # Monotonic port ID allocator
+    cap_manager: CapabilityManager  # Capability subsystem
+
+impl IpcManager:
+    static fn new() -> IpcManager:
+        """Create an IPC manager with empty port table."""
+        var ports: [IpcPortState?] = []
+        var i = 0
+        while i < MAX_PORTS:
+            ports.push(nil)
+            i = i + 1
+        IpcManager(
+            ports: ports,
+            next_port_id: 1,
+            cap_manager: CapabilityManager.new()
+        )
+
+    # -- Port Lifecycle ------------------------------------------------------
+
+    me create_port(owner: TaskId, name: text) -> IpcPort:
+        """Create a new named IPC port owned by the given task.
+
+        Returns the new port. Returns a port with id=0 if table is full.
+        """
+        val slot = self._find_empty_port_slot()
+        if slot < 0:
+            return IpcPort(id: 0, owner: owner.id)
+
+        val port = IpcPort(id: self.next_port_id, owner: owner.id)
+        self.next_port_id = self.next_port_id + 1
+
+        val port_state = IpcPortState(
+            port: port,
+            name: name,
+            queue: MessageQueue.new(MAX_MESSAGES),
+            waiters: [],
+            max_depth: MAX_MESSAGES
+        )
+        self.ports[slot] = port_state
+        port
+
+    me connect(name: text) -> IpcPort?:
+        """Look up a port by name for service discovery.
+
+        Returns the port if found, nil otherwise.
+        """
+        var i = 0
+        while i < MAX_PORTS:
+            val ps = self.ports[i]
+            if ps != nil:
+                val port_state = ps
+                if port_state.name == name:
+                    return port_state.port
+            i = i + 1
+        nil
+
+    # -- Message Passing -----------------------------------------------------
+
+    me send(msg: IpcMessage) -> i64:
+        """Send a message to the destination port.
+
+        Queues the message in the destination port's message queue.
+        If there are tasks blocked waiting to receive on that port,
+        the first waiter is returned (caller should unblock it via scheduler).
+
+        Returns:
+          0  = success
+          -1 = destination port not found
+          -2 = destination queue full
+          -3 = capability check failed
+        """
+        # Find the destination port
+        val slot = self._find_port_by_id(msg.dst_port)
+        if slot < 0:
+            return -1
+
+        val ps = self.ports[slot]
+        if ps == nil:
+            return -1
+
+        var port_state = ps
+
+        # Enqueue the message
+        val ok = port_state.queue.push(msg)
+        if not ok:
+            self.ports[slot] = port_state
+            return -2
+
+        # Wake the first waiting receiver, if any
+        if port_state.waiters.len() > 0:
+            var remaining: [TaskId] = []
+            var first = true
+            for waiter in port_state.waiters:
+                if first:
+                    # This waiter will be unblocked by the caller
+                    # We store the waiter ID for the scheduler to unblock
+                    first = false
+                else:
+                    remaining.push(waiter)
+            port_state.waiters = remaining
+
+        self.ports[slot] = port_state
+        0
+
+    me recv(port: IpcPort, timeout_ms: i64) -> IpcMessage?:
+        """Receive a message from the given port.
+
+        If a message is available, returns it immediately.
+        If the queue is empty and timeout_ms > 0, the caller should
+        block the task (via scheduler) and add it to the port's waiter list.
+        If timeout_ms == 0, returns nil immediately (non-blocking).
+
+        Returns the message, or nil if none available.
+        """
+        val slot = self._find_port_by_id(port.id)
+        if slot < 0:
+            return nil
+
+        val ps = self.ports[slot]
+        if ps == nil:
+            return nil
+
+        var port_state = ps
+        val msg = port_state.queue.pop()
+        self.ports[slot] = port_state
+
+        if msg != nil:
+            return msg
+
+        # Queue empty — non-blocking mode returns nil
+        if timeout_ms == 0:
+            return nil
+
+        # For blocking recv: caller (syscall handler) must call
+        # add_waiter() and then block the task via scheduler.
+        nil
+
+    me add_waiter(port: IpcPort, task_id: TaskId):
+        """Add a task to the waiter list for a port.
+
+        Called by the syscall handler when a recv() finds an empty queue
+        and blocking is requested.
+        """
+        val slot = self._find_port_by_id(port.id)
+        if slot < 0:
+            return
+
+        val ps = self.ports[slot]
+        if ps == nil:
+            return
+
+        var port_state = ps
+        port_state.waiters.push(task_id)
+        self.ports[slot] = port_state
+
+    me get_first_waiter(port_id: u64) -> TaskId?:
+        """Get (and remove) the first waiter for a port.
+
+        Used by send() path to determine which task to unblock.
+        """
+        val slot = self._find_port_by_id(port_id)
+        if slot < 0:
+            return nil
+
+        val ps = self.ports[slot]
+        if ps == nil:
+            return nil
+
+        var port_state = ps
+        if port_state.waiters.len() == 0:
+            return nil
+
+        # Pop the first waiter
+        val first = port_state.waiters[0]
+        var remaining: [TaskId] = []
+        var i = 1
+        while i < port_state.waiters.len():
+            remaining.push(port_state.waiters[i])
+            i = i + 1
+        port_state.waiters = remaining
+        self.ports[slot] = port_state
+        first
+
+    # -- Capability Delegation -----------------------------------------------
+
+    me cap_grant(from: TaskId, to: TaskId, cap: CapabilityToken) -> bool:
+        """Grant a capability from one task to another.
+
+        The granting task must hold the capability being granted.
+        """
+        self.cap_manager.grant(from, to, cap)
+
+    me cap_revoke(cap: CapabilityToken) -> bool:
+        """Revoke a capability token (by generation bump)."""
+        self.cap_manager.revoke(cap)
+
+    me cap_check(task: TaskId, kind: CapabilityKind) -> bool:
+        """Check if a task holds a capability of the given kind."""
+        self.cap_manager.check(task, kind)
+
+    # -- Cleanup -------------------------------------------------------------
+
+    me destroy_task_ports(task_id: TaskId):
+        """Destroy all ports owned by a task.
+
+        Called when a task exits. Drains queues, removes port entries.
+        """
+        var i = 0
+        while i < MAX_PORTS:
+            val ps = self.ports[i]
+            if ps != nil:
+                val port_state = ps
+                if port_state.port.owner == task_id.id:
+                    self.ports[i] = nil
+            i = i + 1
+
+    # -- Internal Helpers ----------------------------------------------------
+
+    fn _find_empty_port_slot() -> i32:
+        """Find the first empty port slot. Returns -1 if full."""
+        var i = 0
+        while i < MAX_PORTS:
+            if self.ports[i] == nil:
+                return i
+            i = i + 1
+        -1
+
+    fn _find_port_by_id(port_id: u64) -> i32:
+        """Find port slot by port ID. Returns -1 if not found."""
+        var i = 0
+        while i < MAX_PORTS:
+            val ps = self.ports[i]
+            if ps != nil:
+                val port_state = ps
+                if port_state.port.id == port_id:
+                    return i
+            i = i + 1
+        -1

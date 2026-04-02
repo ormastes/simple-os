@@ -1,0 +1,21 @@
+# Re-exported from mod.spl
+export plic, startup, semihost, test_support
+
+# Re-exported from plic.spl
+export PlicRegisters, PlicContext, TrapFrame
+export plic_init, plic_enable_irq, plic_set_priority, plic_claim, plic_complete
+export setup_trap_vector, handle_interrupt
+
+# Re-exported from semihost.spl
+export arch_semi_host_call, arch_semi_host_call_block
+
+# Re-exported from startup.spl
+export _start, trap_handler, machine_trap_handler
+export STACK_SIZE, RAM_BASE, UART_BASE
+
+# Re-exported from test_support.spl
+export check_machine_mode, check_mtvec_alignment, check_mstatus_bits
+export get_stack_pointer, STACK_SIZE, RAM_BASE
+export MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP_MACHINE
+export MIE_MSIE, MIE_MTIE, MIE_MEIE
+export MTVEC_MODE_DIRECT, MTVEC_MODE_VECTORED

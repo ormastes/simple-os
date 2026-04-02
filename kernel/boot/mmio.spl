@@ -1,0 +1,45 @@
+# Volatile MMIO for OS kernel (64-bit addresses)
+#
+# Wraps the C runtime volatile access functions.
+# These guarantee reads/writes are not optimized away by the compiler.
+
+extern fn rt_mmio_read_u64(addr: u64) -> u64
+extern fn rt_mmio_write_u64(addr: u64, value: u64)
+extern fn rt_mmio_read_u32(addr: u64) -> u32
+extern fn rt_mmio_write_u32(addr: u64, value: u32)
+extern fn rt_mmio_read_u16(addr: u64) -> u16
+extern fn rt_mmio_write_u16(addr: u64, value: u16)
+extern fn rt_mmio_read_u8(addr: u64) -> u8
+extern fn rt_mmio_write_u8(addr: u64, value: u8)
+
+fn mmio_read64(addr: u64) -> u64:
+    """Read 64-bit value from memory-mapped register."""
+    rt_mmio_read_u64(addr)
+
+fn mmio_write64(addr: u64, value: u64):
+    """Write 64-bit value to memory-mapped register."""
+    rt_mmio_write_u64(addr, value)
+
+fn mmio_read32(addr: u64) -> u32:
+    """Read 32-bit value from memory-mapped register."""
+    rt_mmio_read_u32(addr)
+
+fn mmio_write32(addr: u64, value: u32):
+    """Write 32-bit value to memory-mapped register."""
+    rt_mmio_write_u32(addr, value)
+
+fn mmio_read16(addr: u64) -> u16:
+    """Read 16-bit value from memory-mapped register."""
+    rt_mmio_read_u16(addr)
+
+fn mmio_write16(addr: u64, value: u16):
+    """Write 16-bit value to memory-mapped register."""
+    rt_mmio_write_u16(addr, value)
+
+fn mmio_read8(addr: u64) -> u8:
+    """Read 8-bit value from memory-mapped register."""
+    rt_mmio_read_u8(addr)
+
+fn mmio_write8(addr: u64, value: u8):
+    """Write 8-bit value to memory-mapped register."""
+    rt_mmio_write_u8(addr, value)

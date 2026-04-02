@@ -1,0 +1,19 @@
+# SimpleOS Window Compositor
+#
+# Implements RenderBackend trait targeting framebuffer.
+# Manages windows as surfaces via SurfaceManager.
+#   - FramebufferBackend (RenderBackend impl)
+#   - Window Z-ordering, clipping, damage tracking
+#   - Input multiplexer (focus, Alt-Tab, mouse click/drag)
+#   - Desktop shell (taskbar, launcher, tray)
+#
+# Modules:
+#   - fb_backend.spl    — FramebufferBackend (RenderBackend implementation)
+#   - compositor.spl    — Window compositor with Z-order, focus, input routing
+#   - decorations.spl   — Window chrome: title bar, close button, borders
+#   - cursor.spl        — Mouse cursor rendering (12x19 arrow bitmap)
+
+use os.compositor.fb_backend.{FramebufferBackend}
+use os.compositor.compositor.{Compositor, WindowSurface}
+use os.compositor.decorations.{draw_window_frame}
+use os.compositor.cursor.{CursorState, draw_cursor}

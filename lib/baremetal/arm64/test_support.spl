@@ -1,0 +1,136 @@
+# ARM64 (AArch64) Test Support Functions
+#
+# Helper functions for testing bare-metal ARM64 boot code.
+
+
+# Exception Levels
+val EL0: u64 = 0  # Unprivileged (user mode)
+val EL1: u64 = 1  # Privileged (kernel)
+val EL2: u64 = 2  # Hypervisor
+val EL3: u64 = 3  # Secure monitor
+
+# Stack configuration (16-byte aligned for AArch64)
+val STACK_SIZE: u64 = 65536  # 64KB stack
+
+# ARM64 exception types (4 types × 4 sources = 16 vectors)
+enum ExceptionType:
+    # Current EL with SP_EL0
+    SyncCurrentSP0
+    IrqCurrentSP0
+    FiqCurrentSP0
+    SerrCurrentSP0
+
+    # Current EL with SP_ELx
+    SyncCurrentSPx
+    IrqCurrentSPx
+    FiqCurrentSPx
+    SerrCurrentSPx
+
+    # Lower EL using AArch64
+    SyncLower64
+    IrqLower64
+    FiqLower64
+    SerrLower64
+
+    # Lower EL using AArch32
+    SyncLower32
+    IrqLower32
+    FiqLower32
+    SerrLower32
+
+# Exception vector entry (each is 128 bytes, contains branch instruction)
+struct ExceptionVector:
+    # Simplified: just store the handler address
+    handler: u64
+
+# Exception vector table (16 entries × 128 bytes each = 2KB)
+struct VectorTable:
+    # Current EL with SP_EL0
+    sync_current_sp0: ExceptionVector
+    irq_current_sp0: ExceptionVector
+    fiq_current_sp0: ExceptionVector
+    serr_current_sp0: ExceptionVector
+
+    # Current EL with SP_ELx
+    sync_current_spx: ExceptionVector
+    irq_current_spx: ExceptionVector
+    fiq_current_spx: ExceptionVector
+    serr_current_spx: ExceptionVector
+
+    # Lower EL using AArch64
+    sync_lower64: ExceptionVector
+    irq_lower64: ExceptionVector
+    fiq_lower64: ExceptionVector
+    serr_lower64: ExceptionVector
+
+    # Lower EL using AArch32
+    sync_lower32: ExceptionVector
+    irq_lower32: ExceptionVector
+    fiq_lower32: ExceptionVector
+    serr_lower32: ExceptionVector
+
+# Create test vector table
+fn create_vector_table() -> VectorTable:
+    VectorTable(
+        # Current EL with SP_EL0
+        sync_current_sp0: ExceptionVector(handler: 0x40000000),
+        irq_current_sp0: ExceptionVector(handler: 0x40000080),
+        fiq_current_sp0: ExceptionVector(handler: 0x40000100),
+        serr_current_sp0: ExceptionVector(handler: 0x40000180),
+
+        # Current EL with SP_ELx
+        sync_current_spx: ExceptionVector(handler: 0x40000200),
+        irq_current_spx: ExceptionVector(handler: 0x40000280),
+        fiq_current_spx: ExceptionVector(handler: 0x40000300),
+        serr_current_spx: ExceptionVector(handler: 0x40000380),
+
+        # Lower EL using AArch64
+        sync_lower64: ExceptionVector(handler: 0x40000400),
+        irq_lower64: ExceptionVector(handler: 0x40000480),
+        fiq_lower64: ExceptionVector(handler: 0x40000500),
+        serr_lower64: ExceptionVector(handler: 0x40000580),
+
+        # Lower EL using AArch32
+        sync_lower32: ExceptionVector(handler: 0x40000600),
+        irq_lower32: ExceptionVector(handler: 0x40000680),
+        fiq_lower32: ExceptionVector(handler: 0x40000700),
+        serr_lower32: ExceptionVector(handler: 0x40000780)
+    )
+
+# Validate vector table
+fn validate_vector_table(vt: VectorTable) -> bool:
+    # All handlers should be non-zero and in valid memory range
+    if vt.sync_current_sp0.handler == 0:
+        return false
+    if vt.irq_current_spx.handler == 0:
+        return false
+    if vt.sync_lower64.handler == 0:
+        return false
+
+    # Check handlers are in reasonable range (not NULL)
+    vt.sync_current_spx.handler > 0x40000000 and
+    vt.sync_current_spx.handler < 0x80000000
+
+# Check VBAR alignment (must be 2KB aligned = 0x800)
+fn check_vbar_alignment(addr: u64) -> bool:
+    (addr % 2048) == 0
+
+# Check exception level
+fn check_exception_level(el: u64) -> bool:
+    el >= EL0 and el <= EL3
+
+# Check if transitioning down exception levels (secure → normal)
+fn check_el_transition(from_el: u64, to_el: u64) -> bool:
+    # Can only transition to lower or same EL
+    # EL3 → EL2 → EL1 → EL0
+    to_el <= from_el
+
+# Check stack alignment (AArch64 requires 16-byte alignment)
+fn check_stack_alignment(sp: u64) -> bool:
+    (sp % 16) == 0
+
+# Get simulated stack pointer
+fn get_stack_pointer() -> u64:
+    # Simulate stack at 64MB RAM
+    val ram_base = 0x40000000
+    ram_base + STACK_SIZE

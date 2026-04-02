@@ -1,0 +1,20 @@
+# Re-exported from mod.spl
+export nvic, startup, semihost, test_support
+
+# Re-exported from nvic.spl
+export VectorTable, ExceptionVector, NvicRegisters
+export nvic_init, nvic_enable_irq, nvic_disable_irq, nvic_set_priority
+
+# Re-exported from semihost.spl
+export arch_semi_host_call, arch_semi_host_call_block
+
+# Re-exported from startup.spl
+export reset_handler, default_handler
+export vector_table, STACK_TOP
+
+# Re-exported from test_support.spl
+export create_vector_table, validate_vector_table
+export check_exception_count, check_vector_alignment
+export check_stack_alignment, STACK_TOP
+export check_data_init, check_bss_init
+export ExceptionVector

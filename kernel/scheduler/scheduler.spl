@@ -1,0 +1,437 @@
+# Preemptive Scheduler — Computation Dimension
+#
+# Priority-based preemptive scheduler with round-robin within same priority.
+# Fixed-size task table (MAX_TASKS slots). Timer interrupt drives preemption.
+#
+# Consumes: SchedulerInputPort (interrupts, memory)
+# Produces: SchedulerOutputPort (task lifecycle, blocking)
+
+use os.kernel.types.task_types.{TaskId, TaskState, TaskPriority, TaskContext, BlockReason}
+use os.kernel.types.capability_types.{CapabilitySet}
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+val MAX_TASKS: i32 = 256
+val PRIORITY_LEVELS: i32 = 5      # Realtime, High, Normal, Low, Idle
+val TIME_SLICE_TICKS: u64 = 10    # Ticks per time slice before preemption
+
+# ============================================================================
+# Task Control Block
+# ============================================================================
+
+@repr("C")
+struct TaskControlBlock:
+    """Full task state held by the scheduler.
+
+    Contains saved CPU context, address space root, stack pointers,
+    capability set, and parent linkage. One per active task.
+    """
+    id: TaskId
+    state: TaskState
+    priority: TaskPriority
+    context: TaskContext             # Saved CPU state
+    address_space: u64              # PML4 physical address
+    kernel_stack: u64               # Kernel stack top
+    user_stack: u64                 # User stack top
+    capabilities: CapabilitySet     # Security capabilities
+    parent: TaskId?                 # Parent task (nil for init)
+    exit_code: i32
+    ticks_remaining: u64            # Time slice countdown
+
+# ============================================================================
+# Ready Queue — Per-Priority FIFO
+# ============================================================================
+
+struct ReadyQueue:
+    """Per-priority FIFO queue of task IDs.
+
+    Flattened array with head/tail indices. Fixed capacity MAX_TASKS.
+    """
+    entries: [u64]      # Task ID values
+    head: i32
+    tail: i32
+    count: i32
+    capacity: i32
+
+impl ReadyQueue:
+    static fn new() -> ReadyQueue:
+        """Create an empty ready queue."""
+        var entries: [u64] = []
+        var i = 0
+        while i < MAX_TASKS:
+            entries.push(0)
+            i = i + 1
+        ReadyQueue(
+            entries: entries,
+            head: 0,
+            tail: 0,
+            count: 0,
+            capacity: MAX_TASKS
+        )
+
+    me enqueue(task_id: TaskId):
+        """Add a task to the back of the queue."""
+        if self.count >= self.capacity:
+            return  # Queue full, drop silently (should not happen)
+        self.entries[self.tail] = task_id.id
+        self.tail = (self.tail + 1) % self.capacity
+        self.count = self.count + 1
+
+    me dequeue() -> TaskId?:
+        """Remove and return the task at the front of the queue."""
+        if self.count == 0:
+            return nil
+        val id_val = self.entries[self.head]
+        self.head = (self.head + 1) % self.capacity
+        self.count = self.count - 1
+        TaskId(id: id_val)
+
+    me remove(task_id: TaskId):
+        """Remove a specific task from the queue (linear scan).
+
+        Used when blocking a task that is in the ready queue.
+        Rebuilds the queue without the target task.
+        """
+        var new_entries: [u64] = []
+        var i = 0
+        while i < MAX_TASKS:
+            new_entries.push(0)
+            i = i + 1
+        var new_tail = 0
+        var scan = self.head
+        var scanned = 0
+        while scanned < self.count:
+            val idx = scan % self.capacity
+            val entry_id = self.entries[idx]
+            if entry_id != task_id.id:
+                new_entries[new_tail] = entry_id
+                new_tail = new_tail + 1
+            scan = scan + 1
+            scanned = scanned + 1
+        self.entries = new_entries
+        self.head = 0
+        self.tail = new_tail
+        self.count = new_tail
+
+    fn is_empty() -> bool:
+        self.count == 0
+
+    fn len() -> i32:
+        self.count
+
+# ============================================================================
+# Scheduler
+# ============================================================================
+
+class Scheduler:
+    """Priority-based preemptive scheduler.
+
+    Maintains a fixed-size task table (nil = empty slot) and per-priority
+    ready queues. Timer interrupts drive preemption: each tick decrements
+    the current task's remaining time slice, and when it expires the
+    scheduler picks the next highest-priority ready task.
+
+    Within the same priority level, tasks are scheduled round-robin.
+    """
+    tasks: [TaskControlBlock?]          # Fixed-size task table
+    current: TaskId                     # Currently running task
+    ready_queues: [ReadyQueue]          # One per priority level
+    tick_count: u64                     # Global tick counter
+    next_task_id: u64                   # Monotonic task ID allocator
+
+impl Scheduler:
+    static fn new() -> Scheduler:
+        """Create a scheduler with empty task table and ready queues."""
+        # Initialize task slots to nil
+        var tasks: [TaskControlBlock?] = []
+        var i = 0
+        while i < MAX_TASKS:
+            tasks.push(nil)
+            i = i + 1
+
+        # Initialize per-priority ready queues
+        var queues: [ReadyQueue] = []
+        var p = 0
+        while p < PRIORITY_LEVELS:
+            queues.push(ReadyQueue.new())
+            p = p + 1
+
+        Scheduler(
+            tasks: tasks,
+            current: TaskId(id: 0),
+            ready_queues: queues,
+            tick_count: 0,
+            next_task_id: 1         # 0 is reserved for idle/kernel
+        )
+
+    # -- Task Lifecycle ------------------------------------------------------
+
+    me create_task(entry: u64, priority: TaskPriority, caps: CapabilitySet) -> TaskId:
+        """Create a new task and add it to the ready queue.
+
+        Allocates a slot in the task table, initializes the context
+        with the entry point, and enqueues in the appropriate
+        priority-level ready queue.
+
+        Returns the new task's ID.
+        """
+        val id = TaskId(id: self.next_task_id)
+        self.next_task_id = self.next_task_id + 1
+
+        # Find an empty slot
+        val slot = self._find_empty_slot()
+        if slot < 0:
+            # No slots available — return invalid ID
+            return TaskId(id: 0)
+
+        # Build initial context: RIP = entry point, RFLAGS = interrupts enabled (IF=1)
+        val ctx = TaskContext(
+            rax: 0, rbx: 0, rcx: 0, rdx: 0,
+            rsi: 0, rdi: 0, rbp: 0, rsp: 0,
+            r8: 0, r9: 0, r10: 0, r11: 0,
+            r12: 0, r13: 0, r14: 0, r15: 0,
+            rip: entry,
+            rflags: 0x202,      # IF=1, reserved bit 1 set
+            cs: 0x23,           # User code segment (ring 3)
+            ss: 0x1B,           # User data segment (ring 3)
+            fpu_state: 0
+        )
+
+        val tcb = TaskControlBlock(
+            id: id,
+            state: TaskState.Ready,
+            priority: priority,
+            context: ctx,
+            address_space: 0,
+            kernel_stack: 0,
+            user_stack: 0,
+            capabilities: caps,
+            parent: Some(self.current),
+            exit_code: 0,
+            ticks_remaining: TIME_SLICE_TICKS
+        )
+
+        self.tasks[slot] = tcb
+
+        # Enqueue in the appropriate ready queue
+        val queue_idx = _priority_to_index(priority)
+        self.ready_queues[queue_idx].enqueue(id)
+
+        id
+
+    me exit_task(code: i32):
+        """Exit the currently running task.
+
+        Sets state to Zombie and exit code. The task is NOT placed back
+        in a ready queue. Parent can collect via Wait syscall.
+        """
+        val current_slot = self._find_slot(self.current)
+        if current_slot < 0:
+            return
+        val tcb = self.tasks[current_slot]
+        if tcb == nil:
+            return
+        var task = tcb
+        task.state = TaskState.Zombie
+        task.exit_code = code
+        self.tasks[current_slot] = task
+
+    me yield_current():
+        """Voluntarily yield the current task's time slice.
+
+        Moves the current task to Ready state and enqueues it at the
+        back of its priority-level ready queue.
+        """
+        val current_slot = self._find_slot(self.current)
+        if current_slot < 0:
+            return
+        val tcb = self.tasks[current_slot]
+        if tcb == nil:
+            return
+        var task = tcb
+        task.state = TaskState.Ready
+        task.ticks_remaining = TIME_SLICE_TICKS
+        self.tasks[current_slot] = task
+
+        val queue_idx = _priority_to_index(task.priority)
+        self.ready_queues[queue_idx].enqueue(self.current)
+
+    me block_task(id: TaskId, reason: BlockReason):
+        """Block a task, removing it from the ready queue.
+
+        The task will not be scheduled until unblock_task() is called.
+        """
+        val slot = self._find_slot(id)
+        if slot < 0:
+            return
+        val tcb = self.tasks[slot]
+        if tcb == nil:
+            return
+        var task = tcb
+        task.state = TaskState.Blocked(reason: reason)
+        self.tasks[slot] = task
+
+        # Remove from ready queue
+        val queue_idx = _priority_to_index(task.priority)
+        self.ready_queues[queue_idx].remove(id)
+
+    me unblock_task(id: TaskId):
+        """Unblock a previously blocked task.
+
+        Sets state back to Ready and enqueues in the appropriate
+        priority-level ready queue.
+        """
+        val slot = self._find_slot(id)
+        if slot < 0:
+            return
+        val tcb = self.tasks[slot]
+        if tcb == nil:
+            return
+        var task = tcb
+        task.state = TaskState.Ready
+        task.ticks_remaining = TIME_SLICE_TICKS
+        self.tasks[slot] = task
+
+        val queue_idx = _priority_to_index(task.priority)
+        self.ready_queues[queue_idx].enqueue(id)
+
+    # -- Scheduling ----------------------------------------------------------
+
+    me schedule() -> TaskContext:
+        """Pick the next task to run.
+
+        Scans ready queues from highest priority (Realtime=0) to lowest
+        (Idle=4). Within a priority level, tasks are dequeued round-robin
+        (FIFO).
+
+        Sets the chosen task to Running and returns its saved context
+        for restoration by the context switch stub.
+
+        If no task is ready, returns the idle task context (task 0).
+        """
+        # Find the highest-priority non-empty queue
+        var p = 0
+        while p < PRIORITY_LEVELS:
+            val next_id = self.ready_queues[p].dequeue()
+            if next_id != nil:
+                val task_id = next_id
+                val slot = self._find_slot(task_id)
+                if slot >= 0:
+                    val tcb = self.tasks[slot]
+                    if tcb != nil:
+                        var task = tcb
+                        task.state = TaskState.Running
+                        task.ticks_remaining = TIME_SLICE_TICKS
+                        self.tasks[slot] = task
+                        self.current = task_id
+                        return task.context
+            p = p + 1
+
+        # No ready tasks — return idle context (task 0)
+        val idle_tcb = self.tasks[0]
+        if idle_tcb != nil:
+            return idle_tcb.context
+        # Absolute fallback: empty context (should never happen)
+        TaskContext(
+            rax: 0, rbx: 0, rcx: 0, rdx: 0,
+            rsi: 0, rdi: 0, rbp: 0, rsp: 0,
+            r8: 0, r9: 0, r10: 0, r11: 0,
+            r12: 0, r13: 0, r14: 0, r15: 0,
+            rip: 0, rflags: 0x202,
+            cs: 0x08, ss: 0x10, fpu_state: 0
+        )
+
+    me timer_tick(ctx: TaskContext) -> TaskContext:
+        """Handle APIC timer interrupt.
+
+        Saves the interrupted task's context, decrements time slice.
+        If the time slice expires, the current task is preempted and
+        schedule() picks the next task. Otherwise returns the same
+        context to resume.
+        """
+        self.tick_count = self.tick_count + 1
+
+        # Save the interrupted context into the current task's TCB
+        val current_slot = self._find_slot(self.current)
+        if current_slot < 0:
+            return self.schedule()
+        val tcb = self.tasks[current_slot]
+        if tcb == nil:
+            return self.schedule()
+
+        var task = tcb
+        task.context = ctx
+
+        # Decrement time slice
+        if task.ticks_remaining > 0:
+            task.ticks_remaining = task.ticks_remaining - 1
+
+        if task.ticks_remaining == 0:
+            # Time slice expired — preempt
+            task.state = TaskState.Ready
+            task.ticks_remaining = TIME_SLICE_TICKS
+            self.tasks[current_slot] = task
+
+            val queue_idx = _priority_to_index(task.priority)
+            self.ready_queues[queue_idx].enqueue(self.current)
+
+            return self.schedule()
+
+        # Time slice not expired — continue running
+        self.tasks[current_slot] = task
+        ctx
+
+    # -- Queries -------------------------------------------------------------
+
+    fn get_current() -> TaskId:
+        """Return the currently running task's ID."""
+        self.current
+
+    fn get_task(id: TaskId) -> TaskControlBlock?:
+        """Look up a task by ID."""
+        val slot = self._find_slot(id)
+        if slot < 0:
+            return nil
+        self.tasks[slot]
+
+    fn get_tick_count() -> u64:
+        """Return the global tick counter."""
+        self.tick_count
+
+    # -- Internal Helpers ----------------------------------------------------
+
+    fn _find_slot(id: TaskId) -> i32:
+        """Find the slot index for a given task ID. Returns -1 if not found."""
+        var i = 0
+        while i < MAX_TASKS:
+            val tcb = self.tasks[i]
+            if tcb != nil:
+                val task = tcb
+                if task.id.id == id.id:
+                    return i
+            i = i + 1
+        -1
+
+    fn _find_empty_slot() -> i32:
+        """Find the first empty slot. Returns -1 if full."""
+        var i = 0
+        while i < MAX_TASKS:
+            if self.tasks[i] == nil:
+                return i
+            i = i + 1
+        -1
+
+# ============================================================================
+# Priority Mapping
+# ============================================================================
+
+fn _priority_to_index(priority: TaskPriority) -> i32:
+    """Map TaskPriority enum to ready queue index (0 = highest)."""
+    match priority:
+        case Realtime: 0
+        case High: 1
+        case Normal: 2
+        case Low: 3
+        case Idle: 4

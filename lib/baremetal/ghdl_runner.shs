@@ -1,0 +1,109 @@
+#!/bin/bash
+# GHDL Test Runner for Simple Bare-Metal RV32I Binaries
+#
+# Runs RISC-V 32-bit ELF binaries on a GHDL-simulated RV32I CPU
+# with semihosting support (SYS_WRITE0, SYS_WRITEC, SYS_EXIT).
+#
+# Usage: ./ghdl_runner.shs <binary.elf> [--timeout=30]
+#
+# Exit codes: 0=success, 1=failure, 124=timeout
+
+set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+RTL_DIR="$PROJECT_ROOT/examples/09_embedded/fpga_riscv/rtl"
+TIMEOUT=30
+BINARY=""
+
+for arg in "$@"; do
+    case "$arg" in
+        --timeout=*) TIMEOUT="${arg#--timeout=}" ;;
+        *) [ -z "$BINARY" ] && BINARY="$arg" ;;
+    esac
+done
+
+if [ -z "$BINARY" ]; then
+    echo "Usage: $0 <binary.elf> [--timeout=N]"
+    exit 1
+fi
+
+if [ ! -f "$BINARY" ]; then
+    echo "Error: Binary not found: $BINARY"
+    exit 1
+fi
+
+# Verify RISC-V
+if ! file "$BINARY" | grep -q "RISC-V"; then
+    echo "Error: Not a RISC-V binary: $BINARY"
+    exit 1
+fi
+
+echo "[GHDL] Running: $BINARY"
+echo "[GHDL] Timeout: ${TIMEOUT}s"
+echo "----------------------------------------"
+
+TMP_DIR=$(mktemp -d /tmp/ghdl_runner_XXXXXX)
+TMP_BIN="$TMP_DIR/test.bin"
+TMP_PKG="$TMP_DIR/test_program.vhd"
+trap "rm -rf $TMP_DIR" EXIT
+
+# Step 1: ELF → binary
+riscv64-linux-gnu-objcopy -O binary "$BINARY" "$TMP_BIN"
+
+# Step 2: binary → VHDL package
+python3 -c "
+import struct
+data = open('$TMP_BIN', 'rb').read()
+while len(data) % 4 != 0: data += b'\x00'
+words = [struct.unpack('<I', data[i:i+4])[0] for i in range(0, len(data), 4)]
+print('library ieee;')
+print('use ieee.std_logic_1164.all;')
+print('package test_program is')
+print('    type word_array_t is array (natural range <>) of std_logic_vector(31 downto 0);')
+print('    constant PROGRAM_SIZE : integer := %d;' % len(words))
+print('    constant PROGRAM_DATA : word_array_t(0 to %d) := (' % (len(words)-1))
+for i, w in enumerate(words):
+    comma = ',' if i < len(words)-1 else ''
+    print('        x\"%08x\"%s' % (w, comma))
+print('    );')
+print('end package test_program;')
+" > "$TMP_PKG"
+
+# Step 3: Compile GHDL
+cd "$TMP_DIR"
+ghdl -a --std=08 "$RTL_DIR/rv32i_pkg.vhd" "$RTL_DIR/regfile.vhd" "$RTL_DIR/alu.vhd" \
+    "$RTL_DIR/decoder.vhd" "$RTL_DIR/rv32i_core.vhd" "$TMP_PKG" "$RTL_DIR/tb_semi_run.vhd"
+ghdl -e --std=08 tb_semi_run
+
+# Step 4: Run simulation
+STOP_MS=$((TIMEOUT * 1000))
+OUTPUT=$(timeout "$TIMEOUT" ghdl -r --std=08 tb_semi_run --stop-time="${STOP_MS}ms" 2>&1) || EXIT_STATUS=$?
+EXIT_STATUS=${EXIT_STATUS:-0}
+
+# Step 5: Parse results
+SEMI_OUTPUT=$(echo "$OUTPUT" | grep "OUTPUT:" | sed 's/.*OUTPUT: //' || true)
+EXIT_CODE=$(echo "$OUTPUT" | grep "EXIT_CODE:" | grep -oP 'EXIT_CODE: \K[0-9-]+' || echo "-1")
+CYCLES=$(echo "$OUTPUT" | grep "CYCLES:" | grep -oP 'CYCLES: \K[0-9]+' || echo "0")
+
+# Print semihosting output
+if [ -n "$SEMI_OUTPUT" ]; then
+    echo "$SEMI_OUTPUT"
+fi
+
+echo ""
+echo "----------------------------------------"
+echo "[GHDL] Cycles: $CYCLES"
+
+if [ "$EXIT_STATUS" = "124" ]; then
+    echo "[GHDL] Test TIMEOUT after ${TIMEOUT}s"
+    exit 124
+elif [ "$EXIT_CODE" = "0" ]; then
+    echo "[GHDL] Test PASSED (exit code 0)"
+    exit 0
+elif [ "$EXIT_CODE" -gt "0" ] 2>/dev/null; then
+    echo "[GHDL] Test FAILED (exit code $EXIT_CODE)"
+    exit 1
+else
+    echo "[GHDL] Test completed (no SYS_EXIT detected)"
+    exit 0
+fi

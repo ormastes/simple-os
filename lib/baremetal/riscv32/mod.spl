@@ -1,0 +1,23 @@
+# @platform: baremetal(riscv32)
+# @requires: riscv32-unknown-elf-gcc, qemu-system-riscv32
+#
+# RISC-V 32-bit Bare-Metal Module
+#
+# Hardware abstraction for RISC-V 32-bit bare-metal programming (RV32IM).
+# Supports QEMU virt machine in 32-bit mode.
+#
+# Components:
+# - startup: Machine mode entry and trap handling (32-bit)
+# - semihost: Semihosting support (32-bit register sizes)
+#
+# Key differences from baremetal/riscv/ (64-bit):
+# - All registers are 32-bit (u32)
+# - Uses lw/sw instead of ld/sd
+# - ILP32 ABI
+# - CAUSE_INTERRUPT_BIT is bit 31 (not bit 63)
+# - Trap frame offsets are 4 bytes apart
+
+
+# Modules
+mod startup
+mod semihost

@@ -1,0 +1,26 @@
+# @platform: baremetal(x86)
+# @requires: i686-elf-gcc, qemu-system-i386
+#
+# x86 Bare-Metal Module
+#
+# Hardware abstraction for x86 (i686) bare-metal programming.
+# Supports QEMU PC and compatible real hardware.
+#
+# Components:
+# - boot: Multiboot header and entry point (stub design)
+# - boot_impl: Real multiboot implementation with inline assembly
+# - test_support: Testing utilities for boot code
+# - gdt: Global Descriptor Table setup
+# - idt: Interrupt Descriptor Table
+# - io: Port I/O operations
+# - serial: COM port serial driver
+
+
+# Modules
+mod boot
+mod boot_impl
+mod test_support
+mod gdt
+mod idt
+mod io
+mod serial

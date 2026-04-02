@@ -1,0 +1,40 @@
+# x86_64 HAL Implementation — Module Root
+#
+# Aggregates all x86_64-specific HAL implementations.
+# Each submodule wraps architecture-specific primitives behind
+# a HAL-compatible interface for the kernel's portable layers.
+
+use os.kernel.arch.x86_64.console.{X86Console}
+use os.kernel.arch.x86_64.boot.{X86Boot}
+use os.kernel.arch.x86_64.cpu.{X86Cpu}
+use os.kernel.arch.x86_64.paging.{X86Paging}
+use os.kernel.arch.x86_64.interrupt.{X86Interrupt}
+use os.kernel.arch.x86_64.timer.{X86Timer}
+use os.kernel.arch.x86_64.context.{X86ContextSwitch}
+
+struct X86_64Hal:
+    """x86_64 Hardware Abstraction Layer.
+
+    Composes all x86_64-specific HAL subsystems into a single aggregate.
+    The kernel portable layer dispatches through this struct to access
+    architecture-specific functionality.
+    """
+    console: X86Console
+    boot: X86Boot
+    cpu: X86Cpu
+    paging: X86Paging
+    interrupt: X86Interrupt
+    timer: X86Timer
+    context: X86ContextSwitch
+
+fn create_x86_64_hal() -> X86_64Hal:
+    """Create x86_64 HAL with default configuration."""
+    X86_64Hal(
+        console: X86Console(),
+        boot: X86Boot(),
+        cpu: X86Cpu(),
+        paging: X86Paging(),
+        interrupt: X86Interrupt(),
+        timer: X86Timer(),
+        context: X86ContextSwitch()
+    )

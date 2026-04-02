@@ -1,0 +1,170 @@
+# VirtIO Network Device Driver
+#
+# MDSOC: feature dimension, drivers layer
+# Provides Ethernet frame send/receive for the network stack service.
+# Uses two virtqueues: RX (receive) and TX (transmit).
+
+use os.drivers.virtio.virtio_common.{VirtioDevice, VIRTIO_DEVICE_NET, VIRTQ_DESC_F_WRITE}
+use os.kernel.boot.mmio.{mmio_read32, mmio_write32}
+
+# VirtIO net config offsets (from device base + 0x100)
+val VIRTIO_NET_CFG_MAC: u32 = 0x100      # 6-byte MAC address
+val VIRTIO_NET_CFG_STATUS: u32 = 0x106   # Network link status
+
+# ============================================================================
+# VirtIO Network Driver
+# ============================================================================
+
+struct MacAddress:
+    """6-byte Ethernet MAC address."""
+    bytes: [u8]
+
+impl MacAddress:
+    fn to_string() -> text:
+        var parts: [text] = []
+        for b in self.bytes:
+            parts.push(b.to_hex())
+        parts.join(":")
+
+class VirtioNetDriver:
+    """VirtIO network device driver.
+
+    Provides raw Ethernet frame send/receive.
+    The network stack service (TCP/IP) runs on top.
+    """
+    device: VirtioDevice
+    mac: MacAddress
+    initialized: bool
+    # RX/TX use separate virtqueues (0=RX, 1=TX)
+    rx_buffers_addr: u64    # Pre-allocated receive buffers
+    tx_buffers_addr: u64    # Transmit buffer area
+
+impl VirtioNetDriver:
+    static fn new(base_addr: u64) -> VirtioNetDriver:
+        VirtioNetDriver(
+            device: VirtioDevice(
+                base_addr: base_addr,
+                device_id: 0,
+                queue: Virtqueue.new(0, 0)  # Placeholder; real queue created in init()
+            ),
+            mac: MacAddress(bytes: [0, 0, 0, 0, 0, 0]),
+            initialized: false,
+            rx_buffers_addr: 0x400000,  # 4MB (TODO: allocate from PMM)
+            tx_buffers_addr: 0x500000   # 5MB
+        )
+
+    me init() -> Result<bool, text>:
+        """Initialize VirtIO network device."""
+        val result = self.device.init()
+        if result.is_err():
+            return result
+
+        if self.device.device_id != VIRTIO_DEVICE_NET:
+            return Result.Err("not a network device")
+
+        # Read MAC address (6 bytes)
+        val mac_low = mmio_read32(self.device.base_addr + VIRTIO_NET_CFG_MAC.to_u64())
+        val mac_high = mmio_read32(self.device.base_addr + (VIRTIO_NET_CFG_MAC + 4).to_u64())
+        self.mac = MacAddress(bytes: [
+            (mac_low & 0xFF).to_u8(),
+            ((mac_low >> 8) & 0xFF).to_u8(),
+            ((mac_low >> 16) & 0xFF).to_u8(),
+            ((mac_low >> 24) & 0xFF).to_u8(),
+            (mac_high & 0xFF).to_u8(),
+            ((mac_high >> 8) & 0xFF).to_u8()
+        ])
+
+        self.initialized = true
+        Result.Ok(true)
+
+    me send_frame(data: [u8]) -> Result<bool, text>:
+        """Send an Ethernet frame."""
+        if not self.initialized:
+            return Result.Err("device not initialized")
+        if data.len() > 1514:
+            return Result.Err("frame too large")
+
+        # VirtIO net header (10 bytes for legacy, 12 for modern)
+        # flags=0, gso_type=0, hdr_len=0, gso_size=0, csum_start=0, csum_offset=0
+        val header_addr = self.tx_buffers_addr
+        mmio_write32(header_addr, 0)       # flags + gso_type
+        mmio_write32(header_addr + 4, 0)   # hdr_len + gso_size
+        mmio_write32(header_addr + 8, 0)   # csum_start + csum_offset
+
+        # Copy frame data after header
+        val data_addr = self.tx_buffers_addr + 12
+        var i = 0
+        while i < data.len():
+            mmio_write32(data_addr + i.to_u64(), data[i].to_u32())
+            i = i + 1
+
+        # Build single descriptor: header + data combined
+        val desc_idx = self.device.queue.alloc_desc()
+        if desc_idx < 0:
+            return Result.Err("no free TX descriptors")
+
+        val d_addr = self.device.queue.desc_addr + (desc_idx * 16).to_u64()
+        mmio_write32(d_addr, (header_addr & 0xFFFFFFFF).to_u32())
+        mmio_write32(d_addr + 4, (header_addr >> 32).to_u32())
+        mmio_write32(d_addr + 8, (12 + data.len()).to_u32())  # header + frame
+        mmio_write32(d_addr + 12, 0)  # No flags (driver-readable), no next
+
+        self.device.queue.push_avail(desc_idx.to_u16())
+        self.device.notify_queue(1)  # TX queue = 1
+
+        # Poll for completion
+        var timeout = 100000
+        while timeout > 0:
+            val used_idx = mmio_read32(self.device.queue.used_addr + 2).to_u16()
+            if used_idx != self.device.queue.last_used_idx:
+                self.device.queue.last_used_idx = used_idx
+                break
+            timeout = timeout - 1
+
+        self.device.queue.free_desc(desc_idx.to_u16())
+        if timeout == 0:
+            return Result.Err("virtio-net TX timeout")
+        Result.Ok(true)
+
+    me recv_frame() -> Result<[u8], text>:
+        """Receive an Ethernet frame (non-blocking)."""
+        if not self.initialized:
+            return Result.Err("device not initialized")
+
+        # Check if there are completed RX descriptors in the used ring
+        val used_idx_addr = self.device.queue.used_addr + 2
+        val used_idx = mmio_read32(used_idx_addr).to_u16()
+        if used_idx == self.device.queue.last_used_idx:
+            return Result.Err("no frame available")  # Non-blocking: nothing ready
+
+        # Read the used ring entry (id + len)
+        val ring_idx = self.device.queue.last_used_idx % self.device.queue.num_descs.to_u16()
+        val used_entry_addr = self.device.queue.used_addr + 4 + (ring_idx * 8).to_u64()
+        val desc_id = mmio_read32(used_entry_addr)
+        val total_len = mmio_read32(used_entry_addr + 4)
+        self.device.queue.last_used_idx = self.device.queue.last_used_idx + 1
+
+        # Read frame from RX buffer (skip 10-byte virtio-net header)
+        val rx_buf_addr = self.rx_buffers_addr + (desc_id * 2048).to_u64()
+        val header_len: u32 = 10
+        val frame_len = total_len - header_len
+        var frame: [u8] = []
+        var i: u32 = 0
+        while i < frame_len:
+            val byte = mmio_read32(rx_buf_addr + (header_len + i).to_u64()).to_u8()
+            frame.push(byte)
+            i = i + 1
+
+        # Re-post the descriptor for future receives
+        self.device.queue.push_avail(desc_id.to_u16())
+        self.device.notify_queue(0)  # RX queue = 0
+
+        Result.Ok(frame)
+
+    fn link_up() -> bool:
+        """Check if network link is active."""
+        val status = mmio_read32(self.device.base_addr + VIRTIO_NET_CFG_STATUS.to_u64())
+        (status & 1) != 0
+
+    fn get_mac() -> MacAddress:
+        self.mac

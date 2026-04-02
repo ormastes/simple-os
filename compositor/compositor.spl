@@ -1,0 +1,543 @@
+# Window Compositor
+#
+# Manages windows as surfaces in Z-order, routes input to the focused
+# window, and orchestrates rendering of all visible windows plus
+# their decorations onto the framebuffer.
+#
+# Each window owns a UISession, reusing the existing UI system.
+# The compositor itself is NOT a RenderBackend — it uses the
+# FramebufferDriver directly for compositing, and delegates
+# per-window rendering to FramebufferBackend.
+
+use common.ui.widget.{WidgetNode, UITree, UIState, UIEvent, UIMode}
+use common.ui.session.{UISession, new_session}
+use common.ui.layout.{compute_layout}
+use common.ui.builder.{column, text_widget}
+use os.drivers.framebuffer.fb_driver.{FramebufferDriver, Color}
+use os.drivers.input.ps2_keyboard.{Ps2Keyboard, KeyEvent, Key}
+use os.drivers.input.ps2_mouse.{Ps2Mouse, MouseEvent}
+use os.compositor.decorations.{draw_window_frame, TITLE_BAR_HEIGHT, BORDER_WIDTH, client_area_x, client_area_y, client_area_width, client_area_height, is_in_title_bar, is_in_close_button}
+use os.compositor.cursor.{CursorState, default_cursor_state, draw_cursor}
+use os.compositor.fb_backend.{_render_tree, resolve_theme, CHAR_W, CHAR_H}
+
+# ============================================================================
+# Window Surface
+# ============================================================================
+
+struct WindowSurface:
+    """A managed window in the compositor.
+
+    Each surface has its own UISession containing the widget tree,
+    plus position/size and rendering state.
+    """
+    id: u64
+    title: text
+    x: i32
+    y: i32
+    width: i32
+    height: i32
+    visible: bool
+    session: UISession
+    dirty: bool
+
+# ============================================================================
+# Compositor
+# ============================================================================
+
+class Compositor:
+    """Window compositor managing multiple surfaces.
+
+    Surfaces are stored in Z-order: index 0 is the backmost window,
+    last index is the frontmost. The focused window is always rendered
+    on top.
+    """
+    surfaces: [WindowSurface]
+    focused_idx: i32
+    fb: FramebufferDriver
+    keyboard: Ps2Keyboard
+    mouse: Ps2Mouse
+    cursor: CursorState
+    desktop_bg: Color
+    next_id: u64
+    screen_width: i32
+    screen_height: i32
+    running: bool
+    dragging: bool
+    drag_window_id: u64
+    drag_offset_x: i32
+    drag_offset_y: i32
+
+impl Compositor:
+
+    static fn new(fb: FramebufferDriver, keyboard: Ps2Keyboard, mouse: Ps2Mouse) -> Compositor:
+        """Create a new compositor with the given framebuffer, keyboard, and mouse."""
+        val sw = fb.width.to_i32()
+        val sh = fb.height.to_i32()
+        val initial_cursor = CursorState(
+            x: sw / 2,
+            y: sh / 2,
+            visible: true,
+            hotspot_x: 1,
+            hotspot_y: 1
+        )
+        Compositor(
+            surfaces: [],
+            focused_idx: -1,
+            fb: fb,
+            keyboard: keyboard,
+            mouse: mouse,
+            cursor: initial_cursor,
+            desktop_bg: Color.rgb(0, 48, 96),
+            next_id: 1,
+            screen_width: sw,
+            screen_height: sh,
+            running: false,
+            dragging: false,
+            drag_window_id: 0,
+            drag_offset_x: 0,
+            drag_offset_y: 0
+        )
+
+    # -- Window Management ---------------------------------------------------
+
+    me create_window(title: text, x: i32, y: i32, w: i32, h: i32) -> u64:
+        """Create a new window surface and return its ID.
+
+        The window gets a default widget tree (empty column).
+        """
+        val id = self.next_id
+        self.next_id = self.next_id + 1
+
+        val root = column("win_{id}_root", [
+            text_widget("win_{id}_content", "")
+        ])
+        val tree = UITree.new(root)
+        val session = new_session(tree)
+
+        val surface = WindowSurface(
+            id: id,
+            title: title,
+            x: x,
+            y: y,
+            width: w,
+            height: h,
+            visible: true,
+            session: session,
+            dirty: true
+        )
+
+        self.surfaces = self.surfaces.push(surface)
+        self.focused_idx = self.surfaces.len() - 1
+        return id
+
+    me create_window_with_tree(title: text, x: i32, y: i32, w: i32, h: i32, tree: UITree) -> u64:
+        """Create a new window with a pre-built widget tree."""
+        val id = self.next_id
+        self.next_id = self.next_id + 1
+
+        val session = new_session(tree)
+
+        val surface = WindowSurface(
+            id: id,
+            title: title,
+            x: x,
+            y: y,
+            width: w,
+            height: h,
+            visible: true,
+            session: session,
+            dirty: true
+        )
+
+        self.surfaces = self.surfaces.push(surface)
+        self.focused_idx = self.surfaces.len() - 1
+        return id
+
+    me destroy_window(id: u64):
+        """Remove a window by ID."""
+        var updated: [WindowSurface] = []
+        for s in self.surfaces:
+            if s.id != id:
+                updated = updated.push(s)
+        self.surfaces = updated
+
+        # Fix focused index
+        if self.surfaces.len() == 0:
+            self.focused_idx = -1
+        elif self.focused_idx >= self.surfaces.len():
+            self.focused_idx = self.surfaces.len() - 1
+
+    me focus_window(id: u64):
+        """Bring a window to focus (front of Z-order)."""
+        var target_idx: i32 = -1
+        var idx: i32 = 0
+        for s in self.surfaces:
+            if s.id == id:
+                target_idx = idx
+            idx = idx + 1
+
+        if target_idx < 0:
+            return
+
+        # Move target to end of list (topmost Z-order)
+        val target = self.surfaces[target_idx]
+        var reordered: [WindowSurface] = []
+        for s in self.surfaces:
+            if s.id != id:
+                reordered = reordered.push(s)
+        reordered = reordered.push(target)
+        self.surfaces = reordered
+        self.focused_idx = self.surfaces.len() - 1
+
+    me move_window(id: u64, new_x: i32, new_y: i32):
+        """Move a window to a new position."""
+        var updated: [WindowSurface] = []
+        for s in self.surfaces:
+            if s.id == id:
+                updated = updated.push(WindowSurface(
+                    id: s.id, title: s.title,
+                    x: new_x, y: new_y,
+                    width: s.width, height: s.height,
+                    visible: s.visible, session: s.session,
+                    dirty: true
+                ))
+            else:
+                updated = updated.push(s)
+        self.surfaces = updated
+
+    me resize_window(id: u64, new_w: i32, new_h: i32):
+        """Resize a window."""
+        var updated: [WindowSurface] = []
+        for s in self.surfaces:
+            if s.id == id:
+                updated = updated.push(WindowSurface(
+                    id: s.id, title: s.title,
+                    x: s.x, y: s.y,
+                    width: new_w, height: new_h,
+                    visible: s.visible, session: s.session,
+                    dirty: true
+                ))
+            else:
+                updated = updated.push(s)
+        self.surfaces = updated
+
+    # -- Queries -------------------------------------------------------------
+
+    fn window_count() -> i32:
+        var count: i32 = 0
+        for s in self.surfaces:
+            count = count + 1
+        return count
+
+    fn focused_window_id() -> u64:
+        if self.focused_idx >= 0 and self.focused_idx < self.surfaces.len():
+            return self.surfaces[self.focused_idx].id
+        return 0
+
+    fn get_surface(id: u64) -> WindowSurface?:
+        for s in self.surfaces:
+            if s.id == id:
+                return s
+        return nil
+
+    fn window_titles() -> [text]:
+        """Get titles of all windows in Z-order."""
+        var titles: [text] = []
+        for s in self.surfaces:
+            titles = titles.push(s.title)
+        return titles
+
+    # -- Rendering -----------------------------------------------------------
+
+    me render_all():
+        """Composite all windows onto the framebuffer.
+
+        Draws desktop background, then each window back-to-front
+        with decorations. The focused window is drawn last (topmost).
+        """
+        # Clear to desktop background
+        self.fb.clear(self.desktop_bg)
+
+        # Render each window in Z-order (back to front)
+        var idx: i32 = 0
+        for surface in self.surfaces:
+            if surface.visible:
+                val is_focused = idx == self.focused_idx
+                _render_window(self.fb, surface, is_focused)
+            idx = idx + 1
+
+        # Draw mouse cursor on top of everything
+        draw_cursor(self.fb, self.screen_width, self.screen_height, self.cursor)
+
+        # Flip to screen
+        self.fb.swap_buffers()
+
+    # -- Input Handling ------------------------------------------------------
+
+    me handle_input():
+        """Poll keyboard and mouse, route events.
+
+        Keyboard shortcuts:
+          Alt+Tab  — cycle focus to next window
+          Alt+F4   — close focused window
+          Alt+F5   — minimize focused window (toggle visibility)
+
+        Mouse actions:
+          Left click on close button — close that window
+          Left click on title bar — start dragging
+          Left click on window body — focus that window
+          Mouse move while dragging — move window
+          Left release — stop dragging
+        """
+        # --- Keyboard input ---
+        val key_event = self.keyboard.poll()
+        if key_event != nil:
+            me _handle_key_event(key_event)
+
+        # --- Mouse input ---
+        val mouse_event = self.mouse.poll()
+        if mouse_event != nil:
+            me _handle_mouse_event(mouse_event)
+
+    me _handle_key_event(key_event: KeyEvent):
+        """Process a keyboard event."""
+        match key_event:
+            KeyEvent.Release(key):
+                return
+            KeyEvent.Press(key):
+                pass_dn
+
+        val key = key_event.key
+
+        # Compositor-level shortcuts (Alt held)
+        if self.keyboard.alt_held:
+            match key:
+                Key.Tab:
+                    me cycle_focus()
+                    return
+                Key.F4:
+                    me close_focused_window()
+                    return
+                Key.F5:
+                    me toggle_focused_visibility()
+                    return
+                _:
+                    pass_dn
+
+        # Route to focused window
+        if self.focused_idx >= 0 and self.focused_idx < self.surfaces.len():
+            val ui_event = _key_to_ui_event(self.keyboard, key)
+            if ui_event != nil:
+                self.surfaces[self.focused_idx].session.dispatch(ui_event)
+                # Mark dirty
+                var updated: [WindowSurface] = []
+                var i: i32 = 0
+                for s in self.surfaces:
+                    if i == self.focused_idx:
+                        updated = updated.push(WindowSurface(
+                            id: s.id, title: s.title,
+                            x: s.x, y: s.y,
+                            width: s.width, height: s.height,
+                            visible: s.visible, session: s.session,
+                            dirty: true
+                        ))
+                    else:
+                        updated = updated.push(s)
+                    i = i + 1
+                self.surfaces = updated
+
+    me _handle_mouse_event(event: MouseEvent):
+        """Process a mouse event: update cursor, handle clicks, dragging."""
+        # Update cursor position
+        self.cursor = CursorState(
+            x: event.x.to_i32(),
+            y: event.y.to_i32(),
+            visible: self.cursor.visible,
+            hotspot_x: self.cursor.hotspot_x,
+            hotspot_y: self.cursor.hotspot_y
+        )
+
+        val mx = event.x.to_i32()
+        val my = event.y.to_i32()
+
+        # Handle drag release
+        if event.left_just_released:
+            self.dragging = false
+            self.drag_window_id = 0
+            return
+
+        # Handle ongoing drag
+        if self.dragging and event.left_pressed:
+            val new_x = mx - self.drag_offset_x
+            val new_y = my - self.drag_offset_y
+            me move_window(self.drag_window_id, new_x, new_y)
+            return
+
+        # Handle new left click — hit test windows back-to-front (topmost first)
+        if event.left_just_pressed:
+            # Iterate in reverse Z-order to find topmost hit
+            var idx = self.surfaces.len() - 1
+            while idx >= 0:
+                val s = self.surfaces[idx]
+                if s.visible:
+                    # Check if click is within the window frame
+                    val in_x = mx >= s.x and mx < s.x + s.width
+                    val in_y = my >= s.y and my < s.y + s.height
+                    if in_x and in_y:
+                        # Check close button first
+                        if is_in_close_button(s.x, s.y, s.width, mx, my):
+                            me destroy_window(s.id)
+                            return
+
+                        # Check title bar for drag
+                        if is_in_title_bar(s.x, s.y, s.width, mx, my):
+                            me focus_window(s.id)
+                            self.dragging = true
+                            self.drag_window_id = s.id
+                            self.drag_offset_x = mx - s.x
+                            self.drag_offset_y = my - s.y
+                            return
+
+                        # Click on window body — just focus
+                        me focus_window(s.id)
+                        return
+                idx = idx - 1
+
+    me cycle_focus():
+        """Cycle focus to the next window (Alt+Tab behavior)."""
+        if self.surfaces.len() <= 1:
+            return
+        # Move to the next window, wrapping around
+        var next = self.focused_idx + 1
+        if next >= self.surfaces.len():
+            next = 0
+        # Re-order: bring the new focused window to front
+        val target = self.surfaces[next]
+        val target_id = target.id
+        me focus_window(target_id)
+
+    me close_focused_window():
+        """Close the currently focused window."""
+        if self.focused_idx >= 0 and self.focused_idx < self.surfaces.len():
+            val id = self.surfaces[self.focused_idx].id
+            me destroy_window(id)
+
+    me toggle_focused_visibility():
+        """Toggle visibility of the focused window."""
+        if self.focused_idx < 0:
+            return
+        var updated: [WindowSurface] = []
+        var i: i32 = 0
+        for s in self.surfaces:
+            if i == self.focused_idx:
+                updated = updated.push(WindowSurface(
+                    id: s.id, title: s.title,
+                    x: s.x, y: s.y,
+                    width: s.width, height: s.height,
+                    visible: not s.visible, session: s.session,
+                    dirty: true
+                ))
+            else:
+                updated = updated.push(s)
+            i = i + 1
+        self.surfaces = updated
+
+    # -- Main Loop -----------------------------------------------------------
+
+    me run_loop():
+        """Main compositor loop: handle input, render, repeat."""
+        self.running = true
+        while self.running:
+            me handle_input()
+            me render_all()
+
+    me stop():
+        """Signal the compositor loop to exit."""
+        self.running = false
+
+# ============================================================================
+# Internal: Render a Single Window
+# ============================================================================
+
+fn _render_window(fb: FramebufferDriver, surface: WindowSurface, focused: bool):
+    """Render a single window: decorations + client area content."""
+    # Draw window frame (border + title bar + close button)
+    draw_window_frame(fb, surface.x, surface.y, surface.width, surface.height, surface.title, focused)
+
+    # Calculate client area
+    val sx_u = surface.x.to_u32()
+    val cx_raw = client_area_x(sx_u)
+    val cx = cx_raw.to_i32()
+    val sy_u = surface.y.to_u32()
+    val cy_raw = client_area_y(sy_u)
+    val cy = cy_raw.to_i32()
+    val sw_u = surface.width.to_u32()
+    val cw_raw = client_area_width(sw_u)
+    val cw = cw_raw.to_i32()
+    val sh_u = surface.height.to_u32()
+    val ch_raw = client_area_height(sh_u)
+    val ch = ch_raw.to_i32()
+
+    if cw <= 0 or ch <= 0:
+        return
+
+    # Render the window's widget tree into the client area
+    val state = surface.session.current_state()
+    val tree_theme = state.tree.theme()
+    val theme = resolve_theme(tree_theme)
+    val root = state.tree.root_node()
+    val rects = compute_layout(root, cx, cy, cw, ch)
+
+    # Clear client area background
+    val cx_u32 = cx.to_u32()
+    val cy_u32 = cy.to_u32()
+    val cw_u32 = cw.to_u32()
+    val ch_u32 = ch.to_u32()
+    fb.fill_rect(cx_u32, cy_u32, cw_u32, ch_u32, theme.bg)
+
+    # Render widget tree into client area
+    _render_tree(fb, root, rects, state.focused_id, theme)
+
+# ============================================================================
+# Internal: Key to UIEvent Translation
+# ============================================================================
+
+fn _key_to_ui_event(keyboard: Ps2Keyboard, key: Key) -> UIEvent?:
+    """Convert a Key press to a UIEvent for window dispatch."""
+    match key:
+        Key.Escape:
+            return UIEvent.Quit
+        Key.Tab:
+            if keyboard.shift_held:
+                return UIEvent.FocusPrev
+            return UIEvent.FocusNext
+        Key.Up:
+            return UIEvent.KeyPress(key: "up")
+        Key.Down:
+            return UIEvent.KeyPress(key: "down")
+        Key.Left:
+            return UIEvent.KeyPress(key: "left")
+        Key.Right:
+            return UIEvent.KeyPress(key: "right")
+        Key.Enter:
+            return UIEvent.KeyPress(key: "enter")
+        Key.Backspace:
+            return UIEvent.KeyPress(key: "backspace")
+        Key.Delete:
+            return UIEvent.KeyPress(key: "delete")
+        Key.Home:
+            return UIEvent.KeyPress(key: "home")
+        Key.End:
+            return UIEvent.KeyPress(key: "end")
+        Key.PageUp:
+            return UIEvent.KeyPress(key: "pageup")
+        Key.PageDown:
+            return UIEvent.KeyPress(key: "pagedown")
+        _:
+            pass_dn
+
+    val ch = keyboard.key_to_char(key)
+    if ch != nil:
+        return UIEvent.KeyPress(key: ch)
+
+    return nil

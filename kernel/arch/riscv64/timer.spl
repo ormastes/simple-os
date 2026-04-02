@@ -1,0 +1,166 @@
+# RISC-V 64 Timer HAL — SBI Timer + CLINT
+#
+# Implements timer management for RISC-V 64-bit in S-mode.
+#
+# Timer sources:
+#   - `time` CSR: Read-only 64-bit monotonic counter (accessible in S-mode)
+#   - SBI set_timer: Programs the next timer interrupt via OpenSBI ecall
+#   - CLINT mtime: Memory-mapped timer at 0x0200BFF8 (M-mode, but readable)
+#
+# QEMU virt timer frequency: 10 MHz (10,000,000 ticks per second)
+#
+# Timer interrupt flow:
+#   1. S-mode sets timer deadline via SBI set_timer
+#   2. OpenSBI programs CLINT mtimecmp in M-mode
+#   3. When time >= mtimecmp, M-mode gets timer interrupt
+#   4. OpenSBI reflects it as S-mode timer interrupt (scause bit 63 + code 5)
+#   5. Kernel handles S-mode timer interrupt, sets next deadline
+
+use os.kernel.arch.riscv64.sbi.{sbi_set_timer}
+use os.kernel.arch.riscv64.cpu.{csrr_time, csrs_sie, csrc_sie, SIE_STIE}
+use os.kernel.arch.riscv64.console.{serial_writeln}
+use os.kernel.boot.mmio.{mmio_read64}
+
+# ============================================================================
+# Timer Constants
+# ============================================================================
+
+# QEMU virt timer frequency (10 MHz)
+val TIMER_FREQ_HZ: u64 = 10000000
+
+# CLINT memory-mapped timer (readable from S-mode on QEMU)
+val CLINT_BASE: u64 = 0x02000000
+val CLINT_MTIME: u64 = 0x0200BFF8       # 64-bit mtime register
+
+# ============================================================================
+# Rv64Timer
+# ============================================================================
+
+struct Rv64Timer:
+    """RISC-V 64-bit timer using SBI set_timer and time CSR.
+
+    The time CSR provides a monotonic counter at a fixed frequency.
+    Timer interrupts are programmed via the SBI timer extension,
+    which delegates to OpenSBI to program CLINT mtimecmp.
+    """
+    pass_dn
+
+# Global timer state
+var g_timer_freq: u64 = TIMER_FREQ_HZ
+var g_timer_interval: u64 = 0
+
+# ============================================================================
+# Timer Tick Reading
+# ============================================================================
+
+fn _read_time_csr() -> u64:
+    """Read the current time from the time CSR.
+
+    The time CSR is a read-only 64-bit counter that increments at
+    a fixed frequency. On QEMU virt, this is 10 MHz.
+    """
+    csrr_time()
+
+fn _read_mtime() -> u64:
+    """Read the CLINT mtime register via MMIO.
+
+    Fallback for platforms where the time CSR is not available.
+    On QEMU virt, both work identically.
+    """
+    mmio_read64(CLINT_MTIME)
+
+# ============================================================================
+# Timer Deadline Programming
+# ============================================================================
+
+fn _set_timer_deadline(deadline: u64):
+    """Program the next timer interrupt at the given absolute tick count.
+
+    Uses SBI set_timer ecall which programs CLINT mtimecmp
+    via OpenSBI in M-mode.
+    """
+    sbi_set_timer(deadline)
+
+fn _set_timer_relative(ticks_from_now: u64):
+    """Set a timer interrupt relative to the current time."""
+    val now = _read_time_csr()
+    _set_timer_deadline(now + ticks_from_now)
+
+# ============================================================================
+# Rv64Timer Implementation
+# ============================================================================
+
+impl Rv64Timer:
+    fn init(frequency_hz: u64):
+        """Initialize the timer at the given tick frequency.
+
+        The hardware timer runs at a fixed frequency (10 MHz on QEMU).
+        The frequency_hz parameter controls how often timer interrupts
+        fire (e.g., 100 Hz for 10ms scheduling ticks).
+        """
+        g_timer_freq = TIMER_FREQ_HZ
+
+        if frequency_hz > 0:
+            g_timer_interval = g_timer_freq / frequency_hz
+        else:
+            g_timer_interval = g_timer_freq   # Default to 1 second
+
+        # Enable S-mode timer interrupt in sie
+        csrs_sie(SIE_STIE)
+
+        # Set first timer deadline
+        _set_timer_relative(g_timer_interval)
+
+        serial_writeln("[TIMER] Initialized: freq={TIMER_FREQ_HZ} Hz, interval={g_timer_interval} ticks ({frequency_hz} Hz tick)")
+
+    fn set_deadline(ticks: u64):
+        """Set a one-shot deadline at the given absolute tick count."""
+        _set_timer_deadline(ticks)
+
+    fn set_relative(ticks_from_now: u64):
+        """Set a timer interrupt relative to now."""
+        _set_timer_relative(ticks_from_now)
+
+    fn current_ticks() -> u64:
+        """Read the current tick counter value from time CSR."""
+        _read_time_csr()
+
+    fn ticks_per_second() -> u64:
+        """Return the timer frequency in ticks per second (10 MHz on QEMU)."""
+        g_timer_freq
+
+    fn elapsed_us() -> u64:
+        """Return microseconds elapsed since boot (approximate).
+
+        Computed from time CSR and known frequency.
+        """
+        val ticks = _read_time_csr()
+        # ticks / (freq / 1_000_000) = ticks * 1_000_000 / freq
+        # To avoid overflow: divide first, then multiply
+        (ticks / (g_timer_freq / 1000000))
+
+    fn disable():
+        """Disable S-mode timer interrupts."""
+        csrc_sie(SIE_STIE)
+
+    fn enable():
+        """Enable S-mode timer interrupts."""
+        csrs_sie(SIE_STIE)
+
+# ============================================================================
+# Timer Interrupt Handler (called from trap dispatcher)
+# ============================================================================
+
+fn rv64_handle_timer_interrupt():
+    """Handle S-mode timer interrupt.
+
+    Reprogram the next timer deadline and handle scheduling tick.
+    Called from the trap vector when scause = 0x8000000000000005
+    (interrupt bit set, code 5 = S-mode timer interrupt).
+    """
+    # Set next timer deadline
+    if g_timer_interval > 0:
+        _set_timer_relative(g_timer_interval)
+
+    # The scheduler hook would be called here
+    # scheduler_tick()

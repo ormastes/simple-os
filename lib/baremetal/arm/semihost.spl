@@ -1,0 +1,152 @@
+@allow(unnamed_duplicate_typed_args)
+# ARM Semihosting Implementation
+#
+# Provides semihosting support for ARM Cortex-M and ARM processors.
+# Uses BKPT instruction (Thumb) or SVC instruction (ARM mode).
+#
+# Supported debuggers:
+# - OpenOCD: `arm semihosting enable`
+# - J-Link: Built-in semihosting support
+# - Trace32: `SYStem.Option SemiHost ON`
+#
+# Reference: ARM Semihosting ABI Specification
+# https://github.com/ARM-software/abi-aa/blob/main/semihosting/semihosting.rst
+
+@cfg("target_arch", "arm")
+@cfg("target_arch", "thumbv7m")
+@cfg("target_arch", "thumbv7em")
+@cfg("target_arch", "thumbv6m")
+
+
+# ============================================================================
+# ARM Semihosting Call Implementation
+# ============================================================================
+
+# Semihosting call with simple arguments
+# r0 = operation number
+# r1 = pointer to parameter block (or single value for some ops)
+# Returns result in r0
+@inline
+fn arch_semi_host_call(op: u32, arg0: i64, arg1: i64) -> i64:
+    # For simple calls, create inline param block on stack
+    var params: [i64; 2] = [arg0, arg1]
+    arch_semi_host_call_raw(op, params.as_ptr() as u32)
+
+# Semihosting call with parameter block
+@inline
+fn arch_semi_host_call_block(op: u32, arg0: i64, block_ptr: i64) -> i64:
+    # arg0 is typically unused when block_ptr is provided
+    # block_ptr points to the parameter block
+    arch_semi_host_call_raw(op, block_ptr as u32)
+
+# Raw semihosting call using inline assembly
+# This is the actual instruction sequence that triggers semihosting
+@inline
+fn arch_semi_host_call_raw(op: u32, params_ptr: u32) -> i64:
+    var result: i64 = 0
+
+    # Detect ARM vs Thumb mode at compile time
+    # For Cortex-M (Thumb-only), always use BKPT
+    # For ARM7/ARM9 (ARM mode), use SVC
+
+    # Thumb mode semihosting (Cortex-M)
+    # BKPT #0xAB is the standard semihosting breakpoint
+    # @cfg("target_feature", "thumb")
+    asm volatile(
+        "mov r0, {op}",
+        "mov r1, {params}",
+        "bkpt #0xAB",
+        "mov {result}, r0",
+        op = in(reg) op,
+        params = in(reg) params_ptr,
+        result = out(reg) result,
+        clobber_abi("C")
+    )
+
+    # ARM mode semihosting (ARM7, ARM9, etc.)
+    # SVC #0x123456 is the Angel semihosting call
+    # @cfg("target_feature", "arm")
+    asm volatile(
+        "mov r0, {op}",
+        "mov r1, {params}",
+        "svc #0x123456",
+        "mov {result}, r0",
+        op = in(reg) op,
+        params = in(reg) params_ptr,
+        result = out(reg) result,
+        clobber_abi("C")
+    )
+
+    result
+
+# ============================================================================
+# ARM-Specific Helper Functions
+# ============================================================================
+
+# Write single character via semihosting
+# Useful for simple debug output without string interning
+@inline
+fn semi_writec(c: u8):
+    var ch: u8 = c
+    arch_semi_host_call_raw(0x03, (&ch) as u32)  # SYS_WRITEC
+
+# Write null-terminated string via semihosting
+# Note: Prefer interned strings (semi_print) for production
+@inline
+fn semi_write0(s: rawptr<u8>):
+    arch_semi_host_call_raw(0x04, s as u32)  # SYS_WRITE0
+
+# ============================================================================
+# ARM Interrupt Control for Semihosting
+# ============================================================================
+
+# Disable interrupts during semihosting call
+# Important: Semihosting is not interrupt-safe
+@inline
+fn disable_interrupts() -> u32:
+    var primask: u32 = 0
+    asm volatile(
+        "mrs {primask}, primask",
+        "cpsid i",
+        primask = out(reg) primask
+    )
+    primask
+
+# Restore interrupts after semihosting call
+@inline
+fn restore_interrupts(primask: u32):
+    asm volatile(
+        "msr primask, {primask}",
+        primask = in(reg) primask
+    )
+
+# Interrupt-safe semihosting call wrapper
+fn semi_host_call_safe(op: u32, params_ptr: u32) -> i64:
+    val saved = disable_interrupts()
+    val result = arch_semi_host_call_raw(op, params_ptr)
+    restore_interrupts(saved)
+    result
+
+# ============================================================================
+# ARM-Specific Constants
+# ============================================================================
+
+# Angel semihosting reason codes (for SYS_EXIT_EXTENDED)
+const ADP_Stopped_BranchThroughZero: i64 = 0x20000
+const ADP_Stopped_UndefinedInstr: i64 = 0x20001
+const ADP_Stopped_SoftwareInterrupt: i64 = 0x20002
+const ADP_Stopped_PrefetchAbort: i64 = 0x20003
+const ADP_Stopped_DataAbort: i64 = 0x20004
+const ADP_Stopped_AddressException: i64 = 0x20005
+const ADP_Stopped_IRQ: i64 = 0x20006
+const ADP_Stopped_FIQ: i64 = 0x20007
+const ADP_Stopped_BreakPoint: i64 = 0x20020
+const ADP_Stopped_WatchPoint: i64 = 0x20021
+const ADP_Stopped_StepComplete: i64 = 0x20022
+const ADP_Stopped_RunTimeErrorUnknown: i64 = 0x20023
+const ADP_Stopped_InternalError: i64 = 0x20024
+const ADP_Stopped_UserInterruption: i64 = 0x20025
+const ADP_Stopped_ApplicationExit: i64 = 0x20026
+const ADP_Stopped_StackOverflow: i64 = 0x20027
+const ADP_Stopped_DivisionByZero: i64 = 0x20028
+const ADP_Stopped_OSSpecific: i64 = 0x20029

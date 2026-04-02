@@ -1,0 +1,9 @@
+# SimpleOS Services
+#
+# Userspace services communicating via kernel IPC:
+#   - Init / service manager
+#   - VFS (Virtual Filesystem)
+#   - FAT32 filesystem driver
+#   - Network stack (lwIP initially, pure Simple later)
+#   - Logging / journal
+#   - LLM MCP server (OS control via MCP tools + widget DSL)

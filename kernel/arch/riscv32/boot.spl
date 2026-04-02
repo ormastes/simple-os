@@ -1,0 +1,160 @@
+# RISC-V 32 Boot — OpenSBI S-Mode Boot Layer
+#
+# Parses boot-time info for the QEMU riscv32 virt machine.
+# Unlike x86_64 (which uses the Limine boot protocol), RISC-V boots
+# via OpenSBI into S-mode. The boot state is:
+#   - a0 = hart ID
+#   - a1 = DTB (device tree blob) physical address
+#   - sp is undefined, satp = 0 (MMU off)
+#
+# For the initial implementation, we hardcode the QEMU virt memory map
+# rather than parsing the DTB (device tree support is a future enhancement).
+#
+# QEMU riscv32 virt machine memory map:
+#   0x00000000 .. 0x00000FFF — Boot ROM
+#   0x02000000 .. 0x0200FFFF — CLINT (Core Local Interruptor)
+#   0x0C000000 .. 0x0FFFFFFF — PLIC (Platform-Level Interrupt Controller)
+#   0x10000000 .. 0x10000FFF — UART (16550)
+#   0x80000000 .. 0x87FFFFFF — RAM (128MB)
+#
+# Kernel is loaded at 0x80400000 by OpenSBI (4MB into RAM).
+
+use os.kernel.types.memory_types.{PhysAddr, VirtAddr}
+use os.kernel.boot.ports.{BootOutputPort, BootMemoryRegion, FramebufferInfo, MemoryRegionKind}
+use os.kernel.arch.arch_context.{Architecture}
+use os.kernel.arch.riscv32.console.{uart_writeln}
+
+# ============================================================================
+# QEMU virt riscv32 Constants
+# ============================================================================
+
+val QEMU_RAM_BASE: u64 = 0x80000000
+val QEMU_RAM_SIZE: u64 = 0x08000000         # 128 MB
+val QEMU_KERNEL_LOAD: u64 = 0x80400000      # OpenSBI loads kernel here
+val QEMU_UART_BASE: u64 = 0x10000000
+val QEMU_PLIC_BASE: u64 = 0x0C000000
+val QEMU_CLINT_BASE: u64 = 0x02000000
+
+# Estimated kernel size (4MB reserved; linker symbols override later)
+val ESTIMATED_KERNEL_SIZE: u64 = 0x00400000  # 4 MB
+
+# ============================================================================
+# Rv32Boot
+# ============================================================================
+
+struct Rv32Boot:
+    """RISC-V 32-bit boot handler for QEMU virt machine.
+
+    Hardcodes the QEMU virt memory map to produce a BootOutputPort.
+    DTB parsing will be added in a future iteration.
+    """
+    pass_dn
+
+# ============================================================================
+# Global State
+# ============================================================================
+
+var g_hart_id: u32 = 0
+var g_dtb_addr: u32 = 0
+
+# ============================================================================
+# Boot Output Assembly
+# ============================================================================
+
+fn _build_memory_map() -> [BootMemoryRegion]:
+    """Build memory map from hardcoded QEMU virt layout.
+
+    RAM region: 0x80000000 .. 0x87FFFFFF (128MB)
+    We split it into:
+      - Kernel region: 0x80000000 .. 0x80400000 (OpenSBI + firmware area)
+      - Kernel image: 0x80400000 .. 0x80800000 (kernel load area)
+      - Usable RAM: 0x80800000 .. 0x87FFFFFF (remaining ~120MB)
+    """
+    var regions: [BootMemoryRegion] = []
+
+    # OpenSBI firmware area (first 4MB)
+    regions.push(BootMemoryRegion(
+        base: PhysAddr(addr: QEMU_RAM_BASE),
+        size: QEMU_KERNEL_LOAD - QEMU_RAM_BASE,
+        kind: MemoryRegionKind.Reserved
+    ))
+
+    # Kernel image region
+    regions.push(BootMemoryRegion(
+        base: PhysAddr(addr: QEMU_KERNEL_LOAD),
+        size: ESTIMATED_KERNEL_SIZE,
+        kind: MemoryRegionKind.Kernel
+    ))
+
+    # Usable RAM after kernel
+    val usable_start = QEMU_KERNEL_LOAD + ESTIMATED_KERNEL_SIZE
+    val usable_size = (QEMU_RAM_BASE + QEMU_RAM_SIZE) - usable_start
+    regions.push(BootMemoryRegion(
+        base: PhysAddr(addr: usable_start),
+        size: usable_size,
+        kind: MemoryRegionKind.Usable
+    ))
+
+    uart_writeln("[BOOT-RV32] Memory map: 3 regions")
+    uart_writeln("[BOOT-RV32]   reserved: 0x{QEMU_RAM_BASE}..0x{QEMU_KERNEL_LOAD}")
+    uart_writeln("[BOOT-RV32]   kernel:   0x{QEMU_KERNEL_LOAD}..0x{usable_start}")
+    uart_writeln("[BOOT-RV32]   usable:   0x{usable_start}..0x{QEMU_RAM_BASE + QEMU_RAM_SIZE}")
+
+    regions
+
+fn _build_boot_output() -> BootOutputPort:
+    """Assemble BootOutputPort from hardcoded QEMU virt memory map.
+
+    RV32 has no HHDM — runs with identity mapping or flat physical addressing
+    until paging is set up. hhdm_offset = 0.
+    No framebuffer on QEMU virt (serial console only).
+    """
+    val memory_map = _build_memory_map()
+
+    val framebuffer = FramebufferInfo(
+        addr: PhysAddr(addr: 0),
+        width: 0,
+        height: 0,
+        pitch: 0,
+        bpp: 0
+    )
+
+    BootOutputPort(
+        memory_map: memory_map,
+        framebuffer: framebuffer,
+        rsdp_addr: nil,
+        kernel_phys_base: PhysAddr(addr: QEMU_KERNEL_LOAD),
+        kernel_virt_base: VirtAddr(addr: QEMU_KERNEL_LOAD),
+        kernel_size: ESTIMATED_KERNEL_SIZE,
+        serial_base: QEMU_UART_BASE,
+        serial_is_mmio: true,
+        arch: Architecture.Riscv32,
+        hhdm_offset: 0
+    )
+
+# ============================================================================
+# Boot Entry Helpers
+# ============================================================================
+
+impl Rv32Boot:
+    fn save_boot_params(hart_id: u32, dtb_addr: u32):
+        """Save boot parameters from OpenSBI (a0=hart_id, a1=dtb_addr)."""
+        g_hart_id = hart_id
+        g_dtb_addr = dtb_addr
+        uart_writeln("[BOOT-RV32] hart_id={hart_id}, dtb=0x{dtb_addr}")
+
+    fn build_boot_output() -> BootOutputPort:
+        """Assemble BootOutputPort from hardcoded QEMU virt layout."""
+        _build_boot_output()
+
+    fn hart_id() -> u32:
+        """Return the boot hart ID."""
+        g_hart_id
+
+    fn dtb_addr() -> u32:
+        """Return the DTB physical address."""
+        g_dtb_addr
+
+    fn kernel_load_addr() -> u64:
+        """Return the kernel load address (0x80400000 for QEMU virt rv32)."""
+        QEMU_KERNEL_LOAD

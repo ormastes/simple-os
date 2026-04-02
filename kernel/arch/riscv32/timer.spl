@@ -1,0 +1,98 @@
+# RISC-V 32 Timer HAL — SBI Timer + CLINT
+#
+# Timer management for RISC-V 32-bit S-mode.
+# Uses the SBI timer extension to set timer deadlines (the SBI
+# firmware handles the actual CLINT programming in M-mode).
+#
+# On rv32, the mtime counter is still 64-bit (in the CLINT), but
+# requires two 32-bit reads since registers are 32-bit.
+# CLINT mtime address: 0x0200BFF8 (same as rv64 QEMU virt).
+#
+# Timer frequency on QEMU virt: 10 MHz (10_000_000 ticks/second).
+
+use os.kernel.boot.mmio.{mmio_read32}
+use os.kernel.arch.riscv32.sbi.{sbi_set_timer}
+
+# ============================================================================
+# CLINT Constants
+# ============================================================================
+
+val CLINT_BASE: u64 = 0x02000000
+val CLINT_MTIME_LO: u64 = 0x0200BFF8       # mtime low 32 bits
+val CLINT_MTIME_HI: u64 = 0x0200BFFC       # mtime high 32 bits
+
+# QEMU virt timer frequency: 10 MHz
+val TIMER_FREQUENCY: u64 = 10000000
+
+# ============================================================================
+# Rv32Timer
+# ============================================================================
+
+struct Rv32Timer:
+    """RISC-V 32-bit timer via SBI + CLINT mtime.
+
+    Uses SBI set_timer ecall to program timer interrupts.
+    Reads the 64-bit mtime counter via two 32-bit MMIO reads
+    from the CLINT (with high-word consistency check).
+    """
+    pass_dn
+
+# ============================================================================
+# mtime Read (64-bit from two 32-bit reads)
+# ============================================================================
+
+fn _read_mtime() -> u64:
+    """Read the 64-bit mtime counter from CLINT.
+
+    Since rv32 has 32-bit registers, we must read high and low words
+    separately. We use a loop to ensure consistency (the high word
+    might increment between reads).
+    """
+    # Read high-low-high pattern for consistency
+    var hi = mmio_read32(CLINT_MTIME_HI)
+    var lo = mmio_read32(CLINT_MTIME_LO)
+    var hi2 = mmio_read32(CLINT_MTIME_HI)
+
+    # If high word changed, re-read
+    while hi != hi2:
+        hi = hi2
+        lo = mmio_read32(CLINT_MTIME_LO)
+        hi2 = mmio_read32(CLINT_MTIME_HI)
+
+    ((hi as u64) << 32) | (lo as u64)
+
+# ============================================================================
+# HAL Implementation
+# ============================================================================
+
+impl Rv32Timer:
+    fn init():
+        """Initialize timer (no-op on rv32 — SBI handles CLINT setup)."""
+        pass_do_nothing
+
+    fn current_ticks() -> u64:
+        """Read current mtime tick count (64-bit value)."""
+        _read_mtime()
+
+    fn ticks_per_second() -> u64:
+        """Return timer frequency in ticks per second (10 MHz on QEMU virt)."""
+        TIMER_FREQUENCY
+
+    fn set_deadline(ticks: u64):
+        """Set a one-shot timer deadline at the given absolute tick count.
+
+        Uses SBI set_timer ecall. The timer interrupt fires when
+        mtime >= the deadline value.
+        """
+        sbi_set_timer(ticks)
+
+    fn set_periodic(interval_us: u64):
+        """Set a timer deadline relative to now (microseconds from now)."""
+        val now = _read_mtime()
+        val ticks_delay = (interval_us * TIMER_FREQUENCY) / 1000000
+        sbi_set_timer(now + ticks_delay)
+
+    fn elapsed_us() -> u64:
+        """Return microseconds since boot (approximate)."""
+        val ticks = _read_mtime()
+        (ticks * 1000000) / TIMER_FREQUENCY

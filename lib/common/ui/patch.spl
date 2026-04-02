@@ -1,0 +1,82 @@
+# UI Patch Types
+#
+# Defines the patch operations produced by tree diffing.
+# Backends apply these patches to incrementally update their output.
+
+use common.ui.widget.{WidgetNode}
+
+# =========================================================================
+# Patch Kind
+# =========================================================================
+
+enum PatchKind:
+    InsertChild
+    RemoveChild
+    ReplaceNode
+    UpdateProp
+    RemoveProp
+    UpdateLayout
+    UpdateVisibility
+    MoveChild
+
+# =========================================================================
+# UI Patch
+# =========================================================================
+
+class UIPatch:
+    kind: PatchKind
+    target_id: text
+    parent_id: text
+    prop_key: text
+    prop_value: text
+    node: WidgetNode?
+
+    static fn new(kind: PatchKind, target_id: text, parent_id: text, node: WidgetNode) -> UIPatch:
+        return UIPatch(
+            kind: kind,
+            target_id: target_id,
+            parent_id: parent_id,
+            prop_key: "",
+            prop_value: "",
+            node: node
+        )
+
+    static fn new_simple(kind: PatchKind, target_id: text) -> UIPatch:
+        return UIPatch(
+            kind: kind,
+            target_id: target_id,
+            parent_id: "",
+            prop_key: "",
+            prop_value: "",
+            node: nil
+        )
+
+    static fn new_prop(kind: PatchKind, target_id: text, key: text, value: text) -> UIPatch:
+        return UIPatch(
+            kind: kind,
+            target_id: target_id,
+            parent_id: "",
+            prop_key: key,
+            prop_value: value,
+            node: nil
+        )
+
+    fn describe() -> text:
+        """Human-readable description of the patch."""
+        match self.kind:
+            PatchKind.InsertChild:
+                return "insert {self.target_id} into {self.parent_id}"
+            PatchKind.RemoveChild:
+                return "remove {self.target_id}"
+            PatchKind.ReplaceNode:
+                return "replace {self.target_id} in {self.parent_id}"
+            PatchKind.UpdateProp:
+                return "update {self.target_id}.{self.prop_key} = {self.prop_value}"
+            PatchKind.RemoveProp:
+                return "remove {self.target_id}.{self.prop_key}"
+            PatchKind.UpdateLayout:
+                return "update layout of {self.target_id}"
+            PatchKind.UpdateVisibility:
+                return "update visibility of {self.target_id}"
+            PatchKind.MoveChild:
+                return "move {self.target_id} to {self.parent_id}"

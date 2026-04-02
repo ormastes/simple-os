@@ -1,0 +1,264 @@
+# Widget Lifecycle System
+#
+# Provides lifecycle event types and a handler registry for
+# widgets. Lifecycle events are emitted when widgets enter/leave
+# the tree, when props change, and on focus/blur transitions.
+# The registry dispatches events to registered handler callbacks.
+
+use common.ui.widget.{WidgetNode, UIState, WidgetProp}
+use common.ui.patch.{UIPatch, PatchKind}
+
+# =========================================================================
+# Lifecycle Event Types
+# =========================================================================
+
+enum LifecycleEvent:
+    Mount(widget_id: text)
+    Unmount(widget_id: text)
+    Update(widget_id: text, prop_key: text, prop_value: text)
+    Action(widget_id: text, action_name: text)
+    Focus(widget_id: text)
+    Blur(widget_id: text)
+
+# =========================================================================
+# Lifecycle Handler
+# =========================================================================
+
+struct LifecycleHandler:
+    widget_id: text
+    on_mount_id: text
+    on_unmount_id: text
+    on_update_id: text
+    on_action_id: text
+    on_focus_id: text
+    on_blur_id: text
+
+fn new_lifecycle_handler(widget_id: text) -> LifecycleHandler:
+    """Create a handler with no callbacks set."""
+    return LifecycleHandler(
+        widget_id: widget_id,
+        on_mount_id: "",
+        on_unmount_id: "",
+        on_update_id: "",
+        on_action_id: "",
+        on_focus_id: "",
+        on_blur_id: ""
+    )
+
+impl LifecycleHandler:
+
+    fn with_on_mount(handler_id: text) -> LifecycleHandler:
+        return LifecycleHandler(
+            widget_id: self.widget_id,
+            on_mount_id: handler_id,
+            on_unmount_id: self.on_unmount_id,
+            on_update_id: self.on_update_id,
+            on_action_id: self.on_action_id,
+            on_focus_id: self.on_focus_id,
+            on_blur_id: self.on_blur_id
+        )
+
+    fn with_on_unmount(handler_id: text) -> LifecycleHandler:
+        return LifecycleHandler(
+            widget_id: self.widget_id,
+            on_mount_id: self.on_mount_id,
+            on_unmount_id: handler_id,
+            on_update_id: self.on_update_id,
+            on_action_id: self.on_action_id,
+            on_focus_id: self.on_focus_id,
+            on_blur_id: self.on_blur_id
+        )
+
+    fn with_on_update(handler_id: text) -> LifecycleHandler:
+        return LifecycleHandler(
+            widget_id: self.widget_id,
+            on_mount_id: self.on_mount_id,
+            on_unmount_id: self.on_unmount_id,
+            on_update_id: handler_id,
+            on_action_id: self.on_action_id,
+            on_focus_id: self.on_focus_id,
+            on_blur_id: self.on_blur_id
+        )
+
+    fn with_on_action(handler_id: text) -> LifecycleHandler:
+        return LifecycleHandler(
+            widget_id: self.widget_id,
+            on_mount_id: self.on_mount_id,
+            on_unmount_id: self.on_unmount_id,
+            on_update_id: self.on_update_id,
+            on_action_id: handler_id,
+            on_focus_id: self.on_focus_id,
+            on_blur_id: self.on_blur_id
+        )
+
+    fn with_on_focus(handler_id: text) -> LifecycleHandler:
+        return LifecycleHandler(
+            widget_id: self.widget_id,
+            on_mount_id: self.on_mount_id,
+            on_unmount_id: self.on_unmount_id,
+            on_update_id: self.on_update_id,
+            on_action_id: self.on_action_id,
+            on_focus_id: handler_id,
+            on_blur_id: self.on_blur_id
+        )
+
+    fn with_on_blur(handler_id: text) -> LifecycleHandler:
+        return LifecycleHandler(
+            widget_id: self.widget_id,
+            on_mount_id: self.on_mount_id,
+            on_unmount_id: self.on_unmount_id,
+            on_update_id: self.on_update_id,
+            on_action_id: self.on_action_id,
+            on_focus_id: self.on_focus_id,
+            on_blur_id: handler_id
+        )
+
+    fn has_mount_handler() -> bool:
+        return self.on_mount_id != ""
+
+    fn has_unmount_handler() -> bool:
+        return self.on_unmount_id != ""
+
+    fn has_update_handler() -> bool:
+        return self.on_update_id != ""
+
+    fn has_action_handler() -> bool:
+        return self.on_action_id != ""
+
+    fn has_focus_handler() -> bool:
+        return self.on_focus_id != ""
+
+    fn has_blur_handler() -> bool:
+        return self.on_blur_id != ""
+
+# =========================================================================
+# Lifecycle Registry
+# =========================================================================
+
+class LifecycleRegistry:
+    handlers: [LifecycleHandler]
+    event_log: [LifecycleEvent]
+
+    static fn new() -> LifecycleRegistry:
+        return LifecycleRegistry(
+            handlers: [],
+            event_log: []
+        )
+
+    me register_handler(handler: LifecycleHandler):
+        """Register a lifecycle handler for a widget."""
+        # Replace existing handler for the same widget_id
+        var new_handlers: [LifecycleHandler] = []
+        var replaced = false
+        for existing in self.handlers:
+            if existing.widget_id == handler.widget_id:
+                new_handlers = new_handlers.push(handler)
+                replaced = true
+            else:
+                new_handlers = new_handlers.push(existing)
+        if not replaced:
+            new_handlers = new_handlers.push(handler)
+        self.handlers = new_handlers
+
+    me unregister_handler(widget_id: text):
+        """Remove a lifecycle handler for a widget."""
+        var new_handlers: [LifecycleHandler] = []
+        for existing in self.handlers:
+            if existing.widget_id != widget_id:
+                new_handlers = new_handlers.push(existing)
+        self.handlers = new_handlers
+
+    fn get_handler(widget_id: text) -> LifecycleHandler?:
+        """Look up the handler for a widget."""
+        for handler in self.handlers:
+            if handler.widget_id == widget_id:
+                return handler
+        return nil
+
+    fn handler_count() -> i32:
+        return self.handlers.len()
+
+    fn event_count() -> i32:
+        return self.event_log.len()
+
+    fn last_event() -> LifecycleEvent?:
+        if self.event_log.len() == 0:
+            return nil
+        return self.event_log[self.event_log.len() - 1]
+
+    me clear_log():
+        self.event_log = []
+
+# =========================================================================
+# Registry Construction
+# =========================================================================
+
+fn new_lifecycle_registry() -> LifecycleRegistry:
+    """Create a new empty lifecycle registry."""
+    return LifecycleRegistry.new()
+
+# =========================================================================
+# Event Emission
+# =========================================================================
+
+fn emit_lifecycle_events(registry: LifecycleRegistry, patches: [UIPatch]):
+    """Process diff patches and emit corresponding lifecycle events.
+    InsertChild -> Mount, RemoveChild -> Unmount, UpdateProp -> Update."""
+    for patch in patches:
+        match patch.kind:
+            PatchKind.InsertChild:
+                val event = LifecycleEvent.Mount(widget_id: patch.target_id)
+                registry.event_log = registry.event_log.push(event)
+            PatchKind.RemoveChild:
+                val event = LifecycleEvent.Unmount(widget_id: patch.target_id)
+                registry.event_log = registry.event_log.push(event)
+            PatchKind.UpdateProp:
+                val event = LifecycleEvent.Update(
+                    widget_id: patch.target_id,
+                    prop_key: patch.prop_key,
+                    prop_value: patch.prop_value
+                )
+                registry.event_log = registry.event_log.push(event)
+            PatchKind.ReplaceNode:
+                # Replace is an unmount of old + mount of new
+                val unmount_event = LifecycleEvent.Unmount(widget_id: patch.parent_id)
+                registry.event_log = registry.event_log.push(unmount_event)
+                val mount_event = LifecycleEvent.Mount(widget_id: patch.target_id)
+                registry.event_log = registry.event_log.push(mount_event)
+            _:
+                pass_do_nothing
+
+fn emit_action_event(registry: LifecycleRegistry, widget_id: text, action: text):
+    """Emit an action lifecycle event for a widget."""
+    val event = LifecycleEvent.Action(widget_id: widget_id, action_name: action)
+    registry.event_log = registry.event_log.push(event)
+
+fn emit_focus_event(registry: LifecycleRegistry, widget_id: text):
+    """Emit a focus lifecycle event for a widget."""
+    val event = LifecycleEvent.Focus(widget_id: widget_id)
+    registry.event_log = registry.event_log.push(event)
+
+fn emit_blur_event(registry: LifecycleRegistry, old_focus: text):
+    """Emit a blur lifecycle event for a widget losing focus."""
+    val event = LifecycleEvent.Blur(widget_id: old_focus)
+    registry.event_log = registry.event_log.push(event)
+
+# =========================================================================
+# Event Description
+# =========================================================================
+
+fn describe_lifecycle_event(event: LifecycleEvent) -> text:
+    """Human-readable description of a lifecycle event."""
+    match event:
+        LifecycleEvent.Mount(widget_id):
+            return "mount:{widget_id}"
+        LifecycleEvent.Unmount(widget_id):
+            return "unmount:{widget_id}"
+        LifecycleEvent.Update(widget_id, prop_key, prop_value):
+            return "update:{widget_id}.{prop_key}={prop_value}"
+        LifecycleEvent.Action(widget_id, action_name):
+            return "action:{widget_id}:{action_name}"
+        LifecycleEvent.Focus(widget_id):
+            return "focus:{widget_id}"
+        LifecycleEvent.Blur(widget_id):
+            return "blur:{widget_id}"

@@ -1,0 +1,241 @@
+# VirtIO Common — Shared VirtIO structures and virtqueue management
+#
+# MDSOC: feature dimension, drivers layer
+# VirtIO specification: https://docs.oasis-open.org/virtio/virtio/v1.1/
+#
+# VirtIO devices use virtqueues (ring buffers) for communication:
+#   Driver writes descriptors → Available ring → Device processes → Used ring → Driver
+
+use os.kernel.boot.mmio.{mmio_read32, mmio_write32}
+use os.kernel.types.memory_types.{PhysAddr}
+
+# ============================================================================
+# VirtIO MMIO Registers (offset from device base address)
+# ============================================================================
+
+val VIRTIO_MMIO_MAGIC: u32 = 0x000        # "virt" (0x74726976)
+val VIRTIO_MMIO_VERSION: u32 = 0x004      # Version (2 for modern)
+val VIRTIO_MMIO_DEVICE_ID: u32 = 0x008    # Device type
+val VIRTIO_MMIO_VENDOR_ID: u32 = 0x00C    # Vendor
+val VIRTIO_MMIO_DEVICE_FEATURES: u32 = 0x010
+val VIRTIO_MMIO_DEVICE_FEATURES_SEL: u32 = 0x014
+val VIRTIO_MMIO_DRIVER_FEATURES: u32 = 0x020
+val VIRTIO_MMIO_DRIVER_FEATURES_SEL: u32 = 0x024
+val VIRTIO_MMIO_QUEUE_SEL: u32 = 0x030
+val VIRTIO_MMIO_QUEUE_NUM_MAX: u32 = 0x034
+val VIRTIO_MMIO_QUEUE_NUM: u32 = 0x038
+val VIRTIO_MMIO_QUEUE_READY: u32 = 0x044
+val VIRTIO_MMIO_QUEUE_NOTIFY: u32 = 0x050
+val VIRTIO_MMIO_INTERRUPT_STATUS: u32 = 0x060
+val VIRTIO_MMIO_INTERRUPT_ACK: u32 = 0x064
+val VIRTIO_MMIO_STATUS: u32 = 0x070
+val VIRTIO_MMIO_QUEUE_DESC_LOW: u32 = 0x080
+val VIRTIO_MMIO_QUEUE_DESC_HIGH: u32 = 0x084
+val VIRTIO_MMIO_QUEUE_AVAIL_LOW: u32 = 0x090
+val VIRTIO_MMIO_QUEUE_AVAIL_HIGH: u32 = 0x094
+val VIRTIO_MMIO_QUEUE_USED_LOW: u32 = 0x0A0
+val VIRTIO_MMIO_QUEUE_USED_HIGH: u32 = 0x0A4
+
+# Device status bits
+val VIRTIO_STATUS_ACKNOWLEDGE: u32 = 1
+val VIRTIO_STATUS_DRIVER: u32 = 2
+val VIRTIO_STATUS_DRIVER_OK: u32 = 4
+val VIRTIO_STATUS_FEATURES_OK: u32 = 8
+val VIRTIO_STATUS_FAILED: u32 = 128
+
+# Device type IDs
+val VIRTIO_DEVICE_NET: u32 = 1
+val VIRTIO_DEVICE_BLK: u32 = 2
+val VIRTIO_DEVICE_CONSOLE: u32 = 3
+val VIRTIO_DEVICE_GPU: u32 = 16
+val VIRTIO_DEVICE_INPUT: u32 = 18
+
+# ============================================================================
+# Virtqueue Descriptor
+# ============================================================================
+
+val VIRTQ_DESC_F_NEXT: u16 = 1       # Descriptor has next field
+val VIRTQ_DESC_F_WRITE: u16 = 2      # Device writes (vs reads)
+val VIRTQ_DESC_F_INDIRECT: u16 = 4   # Indirect descriptor
+
+@repr("C")
+struct VirtqDesc:
+    """Virtqueue descriptor (16 bytes)."""
+    addr: u64           # Physical address of buffer
+    len: u32            # Length of buffer
+    flags: u16          # VIRTQ_DESC_F_* flags
+    next: u16           # Next descriptor index (if NEXT flag set)
+
+# ============================================================================
+# Virtqueue
+# ============================================================================
+
+val VIRTQUEUE_SIZE: i32 = 128
+
+class Virtqueue:
+    """VirtIO virtqueue for device communication.
+
+    Three parts:
+    1. Descriptor table: array of buffer descriptors
+    2. Available ring: driver writes descriptor indices for device to process
+    3. Used ring: device writes completed descriptor indices
+    """
+    base_addr: u64          # Physical base address of virtqueue memory
+    num_descs: i32          # Number of descriptors
+    free_head: u16          # Head of free descriptor list
+    last_used_idx: u16      # Last used ring index we've seen
+
+    # Ring positions
+    desc_addr: u64          # Descriptor table address
+    avail_addr: u64         # Available ring address
+    used_addr: u64          # Used ring address
+
+impl Virtqueue:
+    static fn new(base: u64, num: i32) -> Virtqueue:
+        # Layout: descriptors | available ring | used ring
+        val desc_size = (num * 16).to_u64()             # 16 bytes per descriptor
+        val avail_size = (6 + 2 * num).to_u64()         # 2-byte header + indices
+        val used_size = (6 + 8 * num).to_u64()          # 2-byte header + (id, len) pairs
+
+        Virtqueue(
+            base_addr: base,
+            num_descs: num,
+            free_head: 0,
+            last_used_idx: 0,
+            desc_addr: base,
+            avail_addr: base + desc_size,
+            used_addr: base + desc_size + avail_size
+        )
+
+    fn init_free_list():
+        """Initialize descriptor free list (chain all descriptors)."""
+        var i: u16 = 0
+        while i < self.num_descs.to_u16() - 1:
+            # Set each descriptor's next to i+1
+            val desc_offset = self.desc_addr + (i * 16).to_u64()
+            mmio_write32(desc_offset + 14, (i + 1).to_u32())  # next field at offset 14
+            i = i + 1
+
+    me alloc_desc() -> i32:
+        """Allocate a free descriptor. Returns -1 if none available."""
+        if self.free_head >= self.num_descs.to_u16():
+            return -1
+        val idx = self.free_head.to_i32()
+        # Read next free from descriptor's next field
+        val desc_offset = self.desc_addr + (self.free_head * 16).to_u64()
+        val next = mmio_read32(desc_offset + 14).to_u16()
+        self.free_head = next
+        idx
+
+    me free_desc(idx: u16):
+        """Return descriptor to free list."""
+        val desc_offset = self.desc_addr + (idx * 16).to_u64()
+        mmio_write32(desc_offset + 14, self.free_head.to_u32())
+        self.free_head = idx
+
+    me push_avail(desc_idx: u16):
+        """Add descriptor index to available ring."""
+        # Read current avail idx
+        val avail_idx_addr = self.avail_addr + 2  # offset 2 = idx field
+        val avail_idx = mmio_read32(avail_idx_addr).to_u16()
+        # Write descriptor index to ring
+        val ring_offset = self.avail_addr + 4 + (avail_idx % self.num_descs.to_u16() * 2).to_u64()
+        mmio_write32(ring_offset, desc_idx.to_u32())
+        # Increment avail idx
+        mmio_write32(avail_idx_addr, (avail_idx + 1).to_u32())
+
+# ============================================================================
+# VirtIO Device Initialization
+# ============================================================================
+
+class VirtioDevice:
+    """Generic VirtIO MMIO device."""
+    base_addr: u64          # MMIO base address
+    device_id: u32
+    queue: Virtqueue
+
+impl VirtioDevice:
+    fn read_reg(offset: u32) -> u32:
+        mmio_read32(self.base_addr + offset.to_u64())
+
+    fn write_reg(offset: u32, value: u32):
+        mmio_write32(self.base_addr + offset.to_u64(), value)
+
+    me init() -> Result<bool, text>:
+        """Standard VirtIO device initialization sequence."""
+        # 1. Verify magic number
+        val magic = self.read_reg(VIRTIO_MMIO_MAGIC)
+        if magic != 0x74726976:
+            return Result.Err("not a virtio device (bad magic)")
+
+        # 2. Check version
+        val version = self.read_reg(VIRTIO_MMIO_VERSION)
+        if version != 2:
+            return Result.Err("unsupported virtio version: {version}")
+
+        # 3. Check device type
+        self.device_id = self.read_reg(VIRTIO_MMIO_DEVICE_ID)
+        if self.device_id == 0:
+            return Result.Err("virtio device not present")
+
+        # 4. Reset device
+        self.write_reg(VIRTIO_MMIO_STATUS, 0)
+
+        # 5. Set ACKNOWLEDGE
+        self.write_reg(VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACKNOWLEDGE)
+
+        # 6. Set DRIVER
+        self.write_reg(VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER)
+
+        # 7. Negotiate features (accept all for now)
+        self.write_reg(VIRTIO_MMIO_DEVICE_FEATURES_SEL, 0)
+        val features = self.read_reg(VIRTIO_MMIO_DEVICE_FEATURES)
+        self.write_reg(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0)
+        self.write_reg(VIRTIO_MMIO_DRIVER_FEATURES, features)
+
+        # 8. Set FEATURES_OK
+        self.write_reg(VIRTIO_MMIO_STATUS,
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK)
+
+        # 9. Verify FEATURES_OK
+        val status = self.read_reg(VIRTIO_MMIO_STATUS)
+        if (status & VIRTIO_STATUS_FEATURES_OK) == 0:
+            self.write_reg(VIRTIO_MMIO_STATUS, VIRTIO_STATUS_FAILED)
+            return Result.Err("virtio feature negotiation failed")
+
+        # 10. Setup virtqueue 0
+        self.write_reg(VIRTIO_MMIO_QUEUE_SEL, 0)
+        val max_queue = self.read_reg(VIRTIO_MMIO_QUEUE_NUM_MAX)
+        if max_queue == 0:
+            return Result.Err("virtqueue 0 not available")
+
+        val queue_size = if max_queue > VIRTQUEUE_SIZE.to_u32(): VIRTQUEUE_SIZE.to_u32() else: max_queue
+        self.write_reg(VIRTIO_MMIO_QUEUE_NUM, queue_size)
+
+        # Virtqueue memory would be allocated from PMM
+        # For now, use a fixed address (TODO: proper allocation)
+        val queue_base: u64 = 0x200000  # 2MB
+        self.queue = Virtqueue.new(queue_base, queue_size.to_i32())
+        self.queue.init_free_list()
+
+        # Set queue addresses
+        self.write_reg(VIRTIO_MMIO_QUEUE_DESC_LOW, (self.queue.desc_addr & 0xFFFFFFFF).to_u32())
+        self.write_reg(VIRTIO_MMIO_QUEUE_DESC_HIGH, (self.queue.desc_addr >> 32).to_u32())
+        self.write_reg(VIRTIO_MMIO_QUEUE_AVAIL_LOW, (self.queue.avail_addr & 0xFFFFFFFF).to_u32())
+        self.write_reg(VIRTIO_MMIO_QUEUE_AVAIL_HIGH, (self.queue.avail_addr >> 32).to_u32())
+        self.write_reg(VIRTIO_MMIO_QUEUE_USED_LOW, (self.queue.used_addr & 0xFFFFFFFF).to_u32())
+        self.write_reg(VIRTIO_MMIO_QUEUE_USED_HIGH, (self.queue.used_addr >> 32).to_u32())
+
+        # Enable queue
+        self.write_reg(VIRTIO_MMIO_QUEUE_READY, 1)
+
+        # 11. Set DRIVER_OK
+        self.write_reg(VIRTIO_MMIO_STATUS,
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER |
+            VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK)
+
+        Result.Ok(true)
+
+    fn notify_queue(queue_idx: u32):
+        """Notify device that new buffers are available."""
+        self.write_reg(VIRTIO_MMIO_QUEUE_NOTIFY, queue_idx)

@@ -1,0 +1,197 @@
+# Window Decorations
+#
+# Draws window chrome: title bar, close button, minimize/maximize,
+# and borders around each window surface.
+#
+# Title bar: 24px tall, dark gray (focused) or medium gray (unfocused)
+# Close button: red square with white X in top-right of title bar
+# Border: 1px gray line around the window frame
+
+use os.drivers.framebuffer.fb_driver.{FramebufferDriver, Color}
+
+# ============================================================================
+# Decoration Constants
+# ============================================================================
+
+val TITLE_BAR_HEIGHT: u32 = 24
+val BORDER_WIDTH: u32 = 1
+val CLOSE_BUTTON_SIZE: u32 = 18
+val CLOSE_BUTTON_MARGIN: u32 = 3
+val TITLE_TEXT_X_OFFSET: u32 = 8
+val TITLE_TEXT_Y_OFFSET: u32 = 4
+
+# ============================================================================
+# Color Palette
+# ============================================================================
+
+fn title_bar_color_focused() -> Color:
+    Color.rgb(50, 50, 50)
+
+fn title_bar_color_unfocused() -> Color:
+    Color.rgb(100, 100, 100)
+
+fn title_text_color_focused() -> Color:
+    Color.white()
+
+fn title_text_color_unfocused() -> Color:
+    Color.rgb(180, 180, 180)
+
+fn close_button_bg() -> Color:
+    Color.rgb(200, 50, 50)
+
+fn close_button_hover_bg() -> Color:
+    Color.rgb(230, 70, 70)
+
+fn close_button_x_color() -> Color:
+    Color.white()
+
+fn border_color_focused() -> Color:
+    Color.rgb(100, 149, 237)
+
+fn border_color_unfocused() -> Color:
+    Color.rgb(80, 80, 80)
+
+# ============================================================================
+# Decoration Dimensions
+# ============================================================================
+
+fn total_decoration_top() -> u32:
+    """Total height consumed by title bar + top border."""
+    TITLE_BAR_HEIGHT + BORDER_WIDTH
+
+fn total_decoration_left() -> u32:
+    """Width consumed by left border."""
+    BORDER_WIDTH
+
+fn total_decoration_right() -> u32:
+    """Width consumed by right border."""
+    BORDER_WIDTH
+
+fn total_decoration_bottom() -> u32:
+    """Height consumed by bottom border."""
+    BORDER_WIDTH
+
+fn client_area_x(window_x: u32) -> u32:
+    """X coordinate of client area within window."""
+    window_x + total_decoration_left()
+
+fn client_area_y(window_y: u32) -> u32:
+    """Y coordinate of client area within window."""
+    window_y + total_decoration_top()
+
+fn client_area_width(window_w: u32) -> u32:
+    """Width of client area within window."""
+    if window_w <= total_decoration_left() + total_decoration_right():
+        return 0
+    window_w - total_decoration_left() - total_decoration_right()
+
+fn client_area_height(window_h: u32) -> u32:
+    """Height of client area within window."""
+    val overhead = total_decoration_top() + total_decoration_bottom()
+    if window_h <= overhead:
+        return 0
+    window_h - overhead
+
+# ============================================================================
+# Drawing Functions
+# ============================================================================
+
+fn draw_window_frame(fb: FramebufferDriver, x: i32, y: i32, width: i32, height: i32, title: text, focused: bool):
+    """Draw complete window frame: border + title bar + close button."""
+    val ux = x.to_u32()
+    val uy = y.to_u32()
+    val uw = width.to_u32()
+    val uh = height.to_u32()
+
+    draw_border(fb, ux, uy, uw, uh, focused)
+    draw_title_bar(fb, ux, uy, uw, title, focused)
+    draw_close_button(fb, ux, uy, uw)
+
+fn draw_title_bar(fb: FramebufferDriver, x: u32, y: u32, width: u32, title: text, focused: bool):
+    """Draw the title bar at the top of the window."""
+    val bar_x = x + BORDER_WIDTH
+    val bar_y = y + BORDER_WIDTH
+    val bar_w = if width > 2 * BORDER_WIDTH: width - 2 * BORDER_WIDTH else: 0
+    val bar_h = TITLE_BAR_HEIGHT
+
+    if bar_w == 0:
+        return
+
+    # Background
+    val bg = if focused: title_bar_color_focused() else: title_bar_color_unfocused()
+    fb.fill_rect(bar_x, bar_y, bar_w, bar_h, bg)
+
+    # Title text
+    val fg = if focused: title_text_color_focused() else: title_text_color_unfocused()
+    val text_x = bar_x + TITLE_TEXT_X_OFFSET
+    val text_y = bar_y + TITLE_TEXT_Y_OFFSET
+    fb.draw_text(text_x, text_y, title, fg, bg)
+
+fn draw_close_button(fb: FramebufferDriver, x: u32, y: u32, width: u32):
+    """Draw the close button (red square with X) at the top-right of the title bar."""
+    val bar_x = x + BORDER_WIDTH
+    val bar_y = y + BORDER_WIDTH
+    val bar_w = if width > 2 * BORDER_WIDTH: width - 2 * BORDER_WIDTH else: 0
+
+    if bar_w < CLOSE_BUTTON_SIZE + CLOSE_BUTTON_MARGIN * 2:
+        return
+
+    val btn_x = bar_x + bar_w - CLOSE_BUTTON_SIZE - CLOSE_BUTTON_MARGIN
+    val btn_y = bar_y + CLOSE_BUTTON_MARGIN
+
+    # Red background
+    fb.fill_rect(btn_x, btn_y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, close_button_bg())
+
+    # White X: two diagonal lines approximated with small filled rects
+    val inner = CLOSE_BUTTON_SIZE - 6
+    var i: u32 = 0
+    while i < inner:
+        # Top-left to bottom-right diagonal
+        fb.fill_rect(btn_x + 3 + i, btn_y + 3 + i, 2, 2, close_button_x_color())
+        # Top-right to bottom-left diagonal
+        fb.fill_rect(btn_x + 3 + inner - 1 - i, btn_y + 3 + i, 2, 2, close_button_x_color())
+        i = i + 1
+
+fn draw_border(fb: FramebufferDriver, x: u32, y: u32, w: u32, h: u32, focused: bool):
+    """Draw a 1px border around the window."""
+    val color = if focused: border_color_focused() else: border_color_unfocused()
+
+    # Top
+    fb.fill_rect(x, y, w, BORDER_WIDTH, color)
+    # Bottom
+    if h > BORDER_WIDTH:
+        fb.fill_rect(x, y + h - BORDER_WIDTH, w, BORDER_WIDTH, color)
+    # Left
+    fb.fill_rect(x, y, BORDER_WIDTH, h, color)
+    # Right
+    if w > BORDER_WIDTH:
+        fb.fill_rect(x + w - BORDER_WIDTH, y, BORDER_WIDTH, h, color)
+
+# ============================================================================
+# Hit Testing
+# ============================================================================
+
+fn is_in_title_bar(window_x: i32, window_y: i32, window_w: i32, click_x: i32, click_y: i32) -> bool:
+    """Test if a click lands in the title bar area."""
+    val bar_x = window_x + BORDER_WIDTH.to_i32()
+    val bar_y = window_y + BORDER_WIDTH.to_i32()
+    val bar_w = window_w - 2 * BORDER_WIDTH.to_i32()
+    val bar_h = TITLE_BAR_HEIGHT.to_i32()
+
+    val in_x = click_x >= bar_x and click_x < bar_x + bar_w
+    val in_y = click_y >= bar_y and click_y < bar_y + bar_h
+    return in_x and in_y
+
+fn is_in_close_button(window_x: i32, window_y: i32, window_w: i32, click_x: i32, click_y: i32) -> bool:
+    """Test if a click lands on the close button."""
+    val bar_x = window_x + BORDER_WIDTH.to_i32()
+    val bar_y = window_y + BORDER_WIDTH.to_i32()
+    val bar_w = window_w - 2 * BORDER_WIDTH.to_i32()
+
+    val btn_x = bar_x + bar_w - CLOSE_BUTTON_SIZE.to_i32() - CLOSE_BUTTON_MARGIN.to_i32()
+    val btn_y = bar_y + CLOSE_BUTTON_MARGIN.to_i32()
+    val btn_s = CLOSE_BUTTON_SIZE.to_i32()
+
+    val in_x = click_x >= btn_x and click_x < btn_x + btn_s
+    val in_y = click_y >= btn_y and click_y < btn_y + btn_s
+    return in_x and in_y

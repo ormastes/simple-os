@@ -1,0 +1,133 @@
+# UI Tree Diffing
+#
+# Computes a minimal set of patches to transform one WidgetNode tree
+# into another. Used by the reactive state system to efficiently
+# update backends.
+
+use common.ui.widget.{WidgetNode}
+use common.ui.widget_store.{WidgetStore}
+use common.ui.patch.{UIPatch, PatchKind}
+
+# =========================================================================
+# Tree Diff
+# =========================================================================
+
+fn diff_trees(old_tree: WidgetNode, new_tree: WidgetNode) -> [UIPatch]:
+    """Compute patches to transform old_tree into new_tree."""
+    var patches: [UIPatch] = []
+    diff_node(old_tree, new_tree, patches)
+    return patches
+
+fn diff_node(old_node: WidgetNode, new_node: WidgetNode, patches: [UIPatch]):
+    """Recursively diff two nodes and accumulate patches."""
+    # If IDs differ, this is a full replacement
+    if old_node.id != new_node.id:
+        patches.push(UIPatch(kind: PatchKind.ReplaceNode, target_id: new_node.id, parent_id: old_node.id, prop_key: "", prop_value: "", node: new_node))
+        return
+
+    # Check for kind change
+    if old_node.kind_name() != new_node.kind_name():
+        patches.push(UIPatch(kind: PatchKind.ReplaceNode, target_id: new_node.id, parent_id: old_node.id, prop_key: "", prop_value: "", node: new_node))
+        return
+
+    # Check for layout change
+    if old_node.layout_name() != new_node.layout_name():
+        patches.push(UIPatch.new_simple(PatchKind.UpdateLayout, new_node.id))
+
+    # Check for visibility change
+    if old_node.is_visible() != new_node.is_visible():
+        patches.push(UIPatch.new_simple(PatchKind.UpdateVisibility, new_node.id))
+
+    # Diff properties
+    diff_props(old_node, new_node, patches)
+
+    # Diff children
+    diff_children(old_node.children(), new_node.children(), old_node.id, patches)
+
+fn diff_props(old_node: WidgetNode, new_node: WidgetNode, patches: [UIPatch]):
+    """Diff the props of two nodes."""
+    # Check for changed or new props
+    for key in new_node.prop_keys():
+        val new_val = new_node.get_prop(key)
+        if old_node.has_prop(key):
+            val old_val = old_node.get_prop(key)
+            if old_val != new_val:
+                patches.push(UIPatch.new_prop(PatchKind.UpdateProp, old_node.id, key, new_val))
+        else:
+            patches.push(UIPatch.new_prop(PatchKind.UpdateProp, old_node.id, key, new_val))
+
+    # Check for removed props
+    for key in old_node.prop_keys():
+        if not new_node.has_prop(key):
+            patches.push(UIPatch.new_prop(PatchKind.RemoveProp, old_node.id, key, ""))
+
+fn diff_children(old_children: [WidgetNode], new_children: [WidgetNode],
+                 parent_id: text, patches: [UIPatch]):
+    """Diff child lists using a simple index-based strategy."""
+    val old_len = old_children.len()
+    val new_len = new_children.len()
+    val min_len = if old_len < new_len: old_len else: new_len
+
+    # Diff matched children
+    var idx = 0
+    while idx < min_len:
+        val old_child = old_children[idx]
+        val new_child = new_children[idx]
+
+        if old_child.id == new_child.id:
+            # Same node — recurse
+            diff_node(old_child, new_child, patches)
+        else:
+            # Different node at same index — replace
+            patches.push(UIPatch(kind: PatchKind.ReplaceNode, target_id: new_child.id, parent_id: parent_id, prop_key: "", prop_value: "", node: new_child))
+        idx = idx + 1
+
+    # Handle added children
+    while idx < new_len:
+        patches.push(UIPatch(kind: PatchKind.InsertChild, target_id: new_children[idx].id, parent_id: parent_id, prop_key: "", prop_value: "", node: new_children[idx]))
+        idx = idx + 1
+
+    # Handle removed children
+    idx = min_len
+    while idx < old_len:
+        patches.push(UIPatch.new_simple(PatchKind.RemoveChild, old_children[idx].id))
+        idx = idx + 1
+
+# =========================================================================
+# Store-Aware Diff
+# =========================================================================
+
+fn diff_trees_with(old_tree: WidgetNode, new_tree: WidgetNode, store: WidgetStore) -> [UIPatch]:
+    """Compute patches using a session-scoped store instead of globals."""
+    var patches: [UIPatch] = []
+    diff_node_with(old_tree, new_tree, store, patches)
+    return patches
+
+fn diff_node_with(old_node: WidgetNode, new_node: WidgetNode, store: WidgetStore, patches: [UIPatch]):
+    """Recursively diff two nodes using a store for record lookups."""
+    if old_node.id != new_node.id:
+        patches.push(UIPatch(kind: PatchKind.ReplaceNode, target_id: new_node.id, parent_id: old_node.id, prop_key: "", prop_value: "", node: new_node))
+        return
+    if old_node.kind_name_from(store) != new_node.kind_name_from(store):
+        patches.push(UIPatch(kind: PatchKind.ReplaceNode, target_id: new_node.id, parent_id: old_node.id, prop_key: "", prop_value: "", node: new_node))
+        return
+    if old_node.layout_name_from(store) != new_node.layout_name_from(store):
+        patches.push(UIPatch.new_simple(PatchKind.UpdateLayout, new_node.id))
+    if old_node.is_visible_from(store) != new_node.is_visible_from(store):
+        patches.push(UIPatch.new_simple(PatchKind.UpdateVisibility, new_node.id))
+    diff_props_with(old_node, new_node, store, patches)
+    diff_children(old_node.children_from(store), new_node.children_from(store), old_node.id, patches)
+
+fn diff_props_with(old_node: WidgetNode, new_node: WidgetNode, store: WidgetStore, patches: [UIPatch]):
+    """Diff the props of two nodes using a store."""
+    for key in new_node.prop_keys_from(store):
+        val new_val = new_node.get_prop_from(store, key)
+        if old_node.has_prop_in(store, key):
+            val old_val = old_node.get_prop_from(store, key)
+            if old_val != new_val:
+                patches.push(UIPatch.new_prop(PatchKind.UpdateProp, old_node.id, key, new_val))
+        else:
+            patches.push(UIPatch.new_prop(PatchKind.UpdateProp, old_node.id, key, new_val))
+    for key in old_node.prop_keys_from(store):
+        if not new_node.has_prop_in(store, key):
+            patches.push(UIPatch.new_prop(PatchKind.RemoveProp, old_node.id, key, ""))

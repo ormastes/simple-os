@@ -1,0 +1,41 @@
+# Demo Memory — Real physical memory allocation demo
+#
+# Uses the actual PMM bitmap allocator from os.kernel.memory.pmm.
+# Reports [PASS]/[FAIL] based on real allocation results.
+
+use os.kernel.memory.pmm.{g_pmm, PAGE_SIZE}
+
+extern fn serial_println(msg: text)
+
+fn demo_pmm_status():
+    """Report real PMM status from the global allocator.
+
+    Reads actual bitmap allocator state (total_pages, free_pages)
+    that was initialized by pmm_init() during boot.
+    """
+    serial_println("[MEM] PMM Status:")
+    serial_println("[MEM]   Total pages: {g_pmm.total_pages}")
+    serial_println("[MEM]   Free pages: {g_pmm.free_pages}")
+    serial_println("[MEM]   Used pages: {g_pmm.used_pages()}")
+    serial_println("[MEM]   Total memory: {g_pmm.total_memory()} bytes")
+    serial_println("[MEM]   Free memory: {g_pmm.free_memory()} bytes")
+
+    # Verify PMM has valid state from real init
+    if g_pmm.total_pages > 0 and g_pmm.bitmap_addr != 0:
+        serial_println("[PASS] pmm_status_valid")
+    else:
+        serial_println("[FAIL] pmm_status_valid: PMM not properly initialized")
+
+fn demo_pmm_verify_regions():
+    """Verify the PMM bitmap is at a valid physical address.
+
+    The bitmap_addr must be non-zero and within the usable
+    memory region established by pmm_init().
+    """
+    serial_println("[MEM] Bitmap address: 0x{g_pmm.bitmap_addr}")
+    serial_println("[MEM] Last alloc index: {g_pmm.last_alloc_index}")
+
+    if g_pmm.bitmap_addr > 0:
+        serial_println("[PASS] pmm_bitmap_placed")
+    else:
+        serial_println("[FAIL] pmm_bitmap_placed: bitmap_addr is 0")

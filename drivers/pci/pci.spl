@@ -1,0 +1,188 @@
+# PCI Bus Enumeration — Configuration Space Access
+#
+# MDSOC: feature dimension, drivers layer
+# Scans PCI bus for devices via I/O ports 0xCF8/0xCFC (x86 method 1).
+# Used to discover VirtIO devices, network cards, GPU, etc.
+
+use os.kernel.boot.cpu.{port_inl, port_outl}
+
+# PCI configuration ports
+val PCI_CONFIG_ADDR: u16 = 0xCF8
+val PCI_CONFIG_DATA: u16 = 0xCFC
+
+# ============================================================================
+# PCI Device Identifier
+# ============================================================================
+
+struct PciDevice:
+    """Discovered PCI device."""
+    bus: u8
+    device: u8
+    func: u8
+    vendor_id: u16
+    device_id: u16
+    class_code: u8
+    subclass: u8
+    prog_if: u8
+    header_type: u8
+    bar0: u32               # Base Address Register 0
+    bar1: u32
+    irq_line: u8
+
+impl PciDevice:
+    fn is_valid() -> bool:
+        self.vendor_id != 0xFFFF
+
+    fn is_bridge() -> bool:
+        self.class_code == 0x06
+
+    fn is_virtio() -> bool:
+        self.vendor_id == 0x1AF4  # Red Hat VirtIO vendor
+
+    fn description() -> text:
+        "PCI {self.bus}:{self.device}.{self.func} vendor={self.vendor_id} device={self.device_id} class={self.class_code}:{self.subclass}"
+
+# ============================================================================
+# PCI Config Space Access
+# ============================================================================
+
+fn pci_config_addr(bus: u8, device: u8, func: u8, offset: u8) -> u32:
+    """Build PCI config address for I/O method 1."""
+    val b = bus.to_u32()
+    val d = device.to_u32()
+    val f = func.to_u32()
+    val o = offset.to_u32()
+    ((1 << 31) | (b << 16) | (d << 11) | (f << 8) | (o & 0xFC))
+
+fn pci_read_config(bus: u8, device: u8, func: u8, offset: u8) -> u32:
+    """Read 32-bit value from PCI config space."""
+    val addr = pci_config_addr(bus, device, func, offset)
+    port_outl(PCI_CONFIG_ADDR, addr)
+    port_inl(PCI_CONFIG_DATA)
+
+fn pci_write_config(bus: u8, device: u8, func: u8, offset: u8, value: u32):
+    """Write 32-bit value to PCI config space."""
+    val addr = pci_config_addr(bus, device, func, offset)
+    port_outl(PCI_CONFIG_ADDR, addr)
+    port_outl(PCI_CONFIG_DATA, value)
+
+fn pci_read_vendor(bus: u8, device: u8, func: u8) -> u16:
+    val raw = pci_read_config(bus, device, func, 0x00) & 0xFFFF
+    raw.to_u16()
+
+fn pci_read_device_id(bus: u8, device: u8, func: u8) -> u16:
+    val raw = pci_read_config(bus, device, func, 0x00) >> 16
+    raw.to_u16()
+
+fn pci_read_class(bus: u8, device: u8, func: u8) -> u32:
+    pci_read_config(bus, device, func, 0x08)
+
+fn pci_read_header_type(bus: u8, device: u8, func: u8) -> u8:
+    val raw = (pci_read_config(bus, device, func, 0x0C) >> 16) & 0xFF
+    raw.to_u8()
+
+fn pci_read_bar(bus: u8, device: u8, func: u8, bar_num: u8) -> u32:
+    pci_read_config(bus, device, func, 0x10 + bar_num * 4)
+
+fn pci_read_irq(bus: u8, device: u8, func: u8) -> u8:
+    val raw = pci_read_config(bus, device, func, 0x3C) & 0xFF
+    raw.to_u8()
+
+# ============================================================================
+# PCI Bus Scanner
+# ============================================================================
+
+class PciBus:
+    """PCI bus scanner and device registry."""
+    devices: [PciDevice]
+
+impl PciBus:
+    static fn new() -> PciBus:
+        PciBus(devices: [])
+
+    me scan():
+        """Enumerate all PCI devices on all buses."""
+        var bus: u16 = 0
+        while bus < 256:
+            var dev: u8 = 0
+            while dev < 32:
+                val bus_u8 = bus.to_u8()
+                me scan_device(bus_u8, dev)
+                dev = dev + 1
+            bus = bus + 1
+
+    me scan_device(bus: u8, device: u8):
+        """Check if a device exists at bus:device and scan all functions."""
+        val vendor = pci_read_vendor(bus, device, 0)
+        if vendor == 0xFFFF:
+            return  # No device
+
+        val zero_func: u8 = 0
+        me scan_function(bus, device, zero_func)
+
+        # Check for multi-function device
+        val header_type = pci_read_header_type(bus, device, zero_func)
+        if (header_type & 0x80) != 0:
+            var func: u8 = 1
+            while func < 8:
+                val fv = pci_read_vendor(bus, device, func)
+                if fv != 0xFFFF:
+                    me scan_function(bus, device, func)
+                func = func + 1
+
+    me scan_function(bus: u8, device: u8, func: u8):
+        """Read device info for one PCI function."""
+        val class_info = pci_read_class(bus, device, func)
+        val cc_raw = (class_info >> 24) & 0xFF
+        val class_code = cc_raw.to_u8()
+        val sc_raw = (class_info >> 16) & 0xFF
+        val subclass = sc_raw.to_u8()
+        val pi_raw = (class_info >> 8) & 0xFF
+        val prog_if = pi_raw.to_u8()
+        val vid = pci_read_vendor(bus, device, func)
+        val did = pci_read_device_id(bus, device, func)
+        val htype = pci_read_header_type(bus, device, func)
+        val b0 = pci_read_bar(bus, device, func, 0)
+        val b1 = pci_read_bar(bus, device, func, 1)
+        val irq = pci_read_irq(bus, device, func)
+        val pci_dev = PciDevice(
+            bus: bus,
+            device: device,
+            func: func,
+            vendor_id: vid,
+            device_id: did,
+            class_code: class_code,
+            subclass: subclass,
+            prog_if: prog_if,
+            header_type: htype,
+            bar0: b0,
+            bar1: b1,
+            irq_line: irq
+        )
+        self.devices.push(pci_dev)
+
+    fn find_by_vendor_device(vendor: u16, device_id: u16) -> PciDevice?:
+        """Find first device matching vendor:device."""
+        for dev in self.devices:
+            if dev.vendor_id == vendor and dev.device_id == device_id:
+                return dev
+        nil
+
+    fn find_virtio_devices() -> [PciDevice]:
+        """Find all VirtIO devices."""
+        var result: [PciDevice] = []
+        for dev in self.devices:
+            if dev.is_virtio():
+                result.push(dev)
+        result
+
+    fn find_by_class(class_code: u8, subclass: u8) -> [PciDevice]:
+        """Find devices by class/subclass."""
+        var result: [PciDevice] = []
+        for dev in self.devices:
+            if dev.class_code == class_code and dev.subclass == subclass:
+                result.push(dev)
+        result
+
+    fn device_count() -> i32:
+        self.devices.len()

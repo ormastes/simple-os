@@ -1,0 +1,492 @@
+# Terminal Emulator — VT100/ANSI Terminal
+#
+# Provides a terminal emulator with scrollback buffer, ANSI escape
+# sequence parsing, and cursor management. Renders as a widget tree
+# using the existing UI builder DSL.
+#
+# MDSOC: feature dimension, terminal layer
+
+use common.ui.builder.{column, row, menubar, statusbar, text_widget, scroll, build_tree, with_flex, with_height}
+use common.ui.widget.{WidgetNode, UITree, UIEvent}
+use common.ui.session.{UISession}
+use os.userlib.process.{signal}
+use os.kernel.types.syscall_types.{SignalKind}
+
+# =========================================================================
+# Terminal Character
+# =========================================================================
+
+struct TerminalChar:
+    """Single character cell with color attributes."""
+    ch: text
+    fg: u8
+    bg: u8
+    bold: bool
+
+fn default_char() -> TerminalChar:
+    """Create a blank terminal character."""
+    return TerminalChar(ch: " ", fg: 7, bg: 0, bold: false)
+
+# =========================================================================
+# Terminal Line
+# =========================================================================
+
+struct TerminalLine:
+    """A single line in the terminal buffer."""
+    chars: [TerminalChar]
+
+fn new_line(cols: i32) -> TerminalLine:
+    """Create an empty line of the given width."""
+    var chars: [TerminalChar] = []
+    var i = 0
+    while i < cols:
+        chars = chars.push(default_char())
+        i = i + 1
+    return TerminalLine(chars: chars)
+
+fn line_to_text(line: TerminalLine) -> text:
+    """Render a terminal line to plain text (no color)."""
+    var result = ""
+    for ch in line.chars:
+        result = "{result}{ch.ch}"
+    return result
+
+fn line_to_styled(line: TerminalLine) -> text:
+    """Render a terminal line with ANSI color codes for display."""
+    val esc = "\u{001b}"
+    var result = ""
+    var prev_fg: u8 = 255
+    var prev_bg: u8 = 255
+    var prev_bold = false
+    for ch in line.chars:
+        val need_change = (ch.fg != prev_fg or ch.bg != prev_bg or ch.bold != prev_bold)
+        if need_change:
+            result = "{result}{esc}[0m"
+            if ch.bold:
+                result = "{result}{esc}[1m"
+            result = "{result}{esc}[3{ch.fg}m"
+            if ch.bg != 0:
+                result = "{result}{esc}[4{ch.bg}m"
+            prev_fg = ch.fg
+            prev_bg = ch.bg
+            prev_bold = ch.bold
+        result = "{result}{ch.ch}"
+    result = "{result}{esc}[0m"
+    return result
+
+# =========================================================================
+# ANSI Parser State
+# =========================================================================
+
+enum AnsiState:
+    """State machine for parsing ANSI escape sequences."""
+    Normal
+    Escape          # Saw ESC
+    Bracket         # Saw ESC[
+    Param           # Collecting numeric parameter
+
+# =========================================================================
+# Terminal
+# =========================================================================
+
+class Terminal:
+    """VT100/ANSI terminal emulator with scrollback.
+
+    Manages a scrollback buffer, cursor position, color state,
+    and I/O buffers for shell interaction.
+    """
+    lines: [TerminalLine]
+    cursor_row: i32
+    cursor_col: i32
+    cols: i32
+    rows: i32
+    scroll_offset: i32
+    fg_color: u8
+    bg_color: u8
+    bold: bool
+    input_buffer: text
+    output_buffer: text
+    # ANSI parser state
+    ansi_state: AnsiState
+    ansi_params: [i32]
+    ansi_current_param: text
+    # Scrollback
+    max_scrollback: i32
+    # Foreground process for signal forwarding
+    foreground_pid: u64
+
+impl Terminal:
+
+    static fn new(cols: i32, rows: i32) -> Terminal:
+        """Create a new terminal with the given dimensions."""
+        var lines: [TerminalLine] = []
+        var i = 0
+        while i < rows:
+            lines = lines.push(new_line(cols))
+            i = i + 1
+        return Terminal(
+            lines: lines,
+            cursor_row: 0,
+            cursor_col: 0,
+            cols: cols,
+            rows: rows,
+            scroll_offset: 0,
+            fg_color: 7,
+            bg_color: 0,
+            bold: false,
+            input_buffer: "",
+            output_buffer: "",
+            ansi_state: AnsiState.Normal,
+            ansi_params: [],
+            ansi_current_param: "",
+            max_scrollback: 1000,
+            foreground_pid: 0
+        )
+
+    # -- Character Output ----------------------------------------------------
+
+    me write_char(ch: text):
+        """Write a single character at cursor position, advancing cursor."""
+        if ch == "\n":
+            self.newline()
+            return
+        if ch == "\r":
+            self.cursor_col = 0
+            return
+        if ch == "\t":
+            # Tab to next 8-column stop
+            val next_stop = ((self.cursor_col / 8) + 1) * 8
+            self.cursor_col = if next_stop >= self.cols: self.cols - 1 else: next_stop
+            return
+        if ch == "\u{0008}":
+            # Backspace
+            if self.cursor_col > 0:
+                self.cursor_col = self.cursor_col - 1
+            return
+
+        # Place character at cursor
+        if self.cursor_row >= 0 and self.cursor_row < self.lines.len():
+            val line = self.lines[self.cursor_row]
+            if self.cursor_col >= 0 and self.cursor_col < line.chars.len():
+                line.chars[self.cursor_col] = TerminalChar(
+                    ch: ch,
+                    fg: self.fg_color,
+                    bg: self.bg_color,
+                    bold: self.bold
+                )
+                self.lines[self.cursor_row] = TerminalLine(chars: line.chars)
+
+        # Advance cursor
+        self.cursor_col = self.cursor_col + 1
+        if self.cursor_col >= self.cols:
+            self.cursor_col = 0
+            self.newline()
+
+    me write_string(s: text):
+        """Write a string, parsing ANSI escape sequences inline."""
+        for ch in s:
+            self._process_char(ch)
+
+    # -- ANSI Escape Sequence Parser -----------------------------------------
+
+    me _process_char(ch: text):
+        """Process a single character through the ANSI state machine."""
+        match self.ansi_state:
+            AnsiState.Normal:
+                if ch == "\u{001b}":
+                    self.ansi_state = AnsiState.Escape
+                    self.ansi_params = []
+                    self.ansi_current_param = ""
+                else:
+                    self.write_char(ch)
+            AnsiState.Escape:
+                if ch == "[":
+                    self.ansi_state = AnsiState.Bracket
+                else:
+                    # Unknown escape, ignore
+                    self.ansi_state = AnsiState.Normal
+            AnsiState.Bracket:
+                self._parse_csi_char(ch)
+            AnsiState.Param:
+                self._parse_csi_char(ch)
+
+    me _parse_csi_char(ch: text):
+        """Parse a character within a CSI (ESC[...) sequence."""
+        # Numeric digit: accumulate parameter
+        if ch >= "0" and ch <= "9":
+            self.ansi_current_param = "{self.ansi_current_param}{ch}"
+            self.ansi_state = AnsiState.Param
+            return
+
+        # Separator: push current param
+        if ch == ";":
+            val param_val = _parse_int(self.ansi_current_param, 0)
+            self.ansi_params = self.ansi_params.push(param_val)
+            self.ansi_current_param = ""
+            return
+
+        # Terminal character: execute the command
+        val param_val = _parse_int(self.ansi_current_param, 0)
+        self.ansi_params = self.ansi_params.push(param_val)
+        self._execute_csi(ch)
+        self.ansi_state = AnsiState.Normal
+        self.ansi_params = []
+        self.ansi_current_param = ""
+
+    me _execute_csi(cmd: text):
+        """Execute a parsed CSI command."""
+        val p0 = if self.ansi_params.len() > 0: self.ansi_params[0] else: 0
+        val p1 = if self.ansi_params.len() > 1: self.ansi_params[1] else: 0
+
+        match cmd:
+            "m":
+                # SGR — Set Graphics Rendition
+                self._apply_sgr()
+            "H" | "f":
+                # CUP — Cursor Position (1-based)
+                val target_row = if p0 > 0: p0 - 1 else: 0
+                val target_col = if p1 > 0: p1 - 1 else: 0
+                self.cursor_row = if target_row < self.rows: target_row else: self.rows - 1
+                self.cursor_col = if target_col < self.cols: target_col else: self.cols - 1
+            "A":
+                # CUU — Cursor Up
+                val n = if p0 > 0: p0 else: 1
+                self.cursor_row = if self.cursor_row - n >= 0: self.cursor_row - n else: 0
+            "B":
+                # CUD — Cursor Down
+                val n = if p0 > 0: p0 else: 1
+                self.cursor_row = if self.cursor_row + n < self.rows: self.cursor_row + n else: self.rows - 1
+            "C":
+                # CUF — Cursor Forward
+                val n = if p0 > 0: p0 else: 1
+                self.cursor_col = if self.cursor_col + n < self.cols: self.cursor_col + n else: self.cols - 1
+            "D":
+                # CUB — Cursor Back
+                val n = if p0 > 0: p0 else: 1
+                self.cursor_col = if self.cursor_col - n >= 0: self.cursor_col - n else: 0
+            "J":
+                # ED — Erase in Display
+                match p0:
+                    0:
+                        self._erase_below()
+                    1:
+                        self._erase_above()
+                    2:
+                        self.clear()
+                    _:
+                        pass_dn
+            "K":
+                # EL — Erase in Line
+                match p0:
+                    0:
+                        self._erase_line_right()
+                    1:
+                        self._erase_line_left()
+                    2:
+                        self._erase_line()
+                    _:
+                        pass_dn
+            _:
+                pass_dn
+
+    me _apply_sgr():
+        """Apply SGR (Select Graphic Rendition) parameters."""
+        if self.ansi_params.len() == 0:
+            self.fg_color = 7
+            self.bg_color = 0
+            self.bold = false
+            return
+        for param in self.ansi_params:
+            match param:
+                0:
+                    self.fg_color = 7
+                    self.bg_color = 0
+                    self.bold = false
+                1:
+                    self.bold = true
+                22:
+                    self.bold = false
+                30: self.fg_color = 0
+                31: self.fg_color = 1
+                32: self.fg_color = 2
+                33: self.fg_color = 3
+                34: self.fg_color = 4
+                35: self.fg_color = 5
+                36: self.fg_color = 6
+                37: self.fg_color = 7
+                40: self.bg_color = 0
+                41: self.bg_color = 1
+                42: self.bg_color = 2
+                43: self.bg_color = 3
+                44: self.bg_color = 4
+                45: self.bg_color = 5
+                46: self.bg_color = 6
+                47: self.bg_color = 7
+                _:
+                    pass_dn
+
+    # -- Line Operations -----------------------------------------------------
+
+    me newline():
+        """Move cursor to start of next line, scrolling if needed."""
+        self.cursor_col = 0
+        if self.cursor_row < self.rows - 1:
+            self.cursor_row = self.cursor_row + 1
+        else:
+            self.scroll_up()
+
+    me scroll_up():
+        """Scroll the buffer up by one line, adding a blank line at bottom."""
+        if self.lines.len() > 0:
+            # Move lines up; first line goes to scrollback overflow (dropped after max)
+            var new_lines: [TerminalLine] = []
+            var i = 1
+            while i < self.lines.len():
+                new_lines = new_lines.push(self.lines[i])
+                i = i + 1
+            new_lines = new_lines.push(new_line(self.cols))
+            self.lines = new_lines
+
+    me clear():
+        """Clear the entire terminal screen."""
+        var new_lines: [TerminalLine] = []
+        var i = 0
+        while i < self.rows:
+            new_lines = new_lines.push(new_line(self.cols))
+            i = i + 1
+        self.lines = new_lines
+        self.cursor_row = 0
+        self.cursor_col = 0
+
+    me _erase_below():
+        """Erase from cursor to end of screen."""
+        self._erase_line_right()
+        var r = self.cursor_row + 1
+        while r < self.rows and r < self.lines.len():
+            self.lines[r] = new_line(self.cols)
+            r = r + 1
+
+    me _erase_above():
+        """Erase from start of screen to cursor."""
+        var r = 0
+        while r < self.cursor_row and r < self.lines.len():
+            self.lines[r] = new_line(self.cols)
+            r = r + 1
+        self._erase_line_left()
+
+    me _erase_line_right():
+        """Erase from cursor to end of current line."""
+        if self.cursor_row < self.lines.len():
+            val line = self.lines[self.cursor_row]
+            var c = self.cursor_col
+            while c < line.chars.len():
+                line.chars[c] = default_char()
+                c = c + 1
+            self.lines[self.cursor_row] = TerminalLine(chars: line.chars)
+
+    me _erase_line_left():
+        """Erase from start of current line to cursor."""
+        if self.cursor_row < self.lines.len():
+            val line = self.lines[self.cursor_row]
+            var c = 0
+            while c <= self.cursor_col and c < line.chars.len():
+                line.chars[c] = default_char()
+                c = c + 1
+            self.lines[self.cursor_row] = TerminalLine(chars: line.chars)
+
+    me _erase_line():
+        """Erase the entire current line."""
+        if self.cursor_row < self.lines.len():
+            self.lines[self.cursor_row] = new_line(self.cols)
+
+    # -- Input Handling ------------------------------------------------------
+
+    me handle_key(key: text):
+        """Handle keyboard input, adding to input buffer."""
+        match key:
+            "ctrl_c":
+                # Send interrupt signal to foreground process
+                if self.foreground_pid > 0:
+                    val _ = signal(self.foreground_pid, SignalKind.Int)
+                self.write_string("^C\n")
+                self.input_buffer = ""
+            "ctrl_z":
+                # Suspend foreground process
+                if self.foreground_pid > 0:
+                    val _ = signal(self.foreground_pid, SignalKind.Stop)
+                self.write_string("^Z\n")
+            "enter":
+                self.input_buffer = "{self.input_buffer}\n"
+            "backspace":
+                if self.input_buffer.len() > 0:
+                    self.input_buffer = self.input_buffer.slice(0, self.input_buffer.len() - 1)
+                    # Echo backspace
+                    self.write_string("\u{0008} \u{0008}")
+            _:
+                self.input_buffer = "{self.input_buffer}{key}"
+                # Echo character
+                self.write_char(key)
+
+    fn read_input() -> text:
+        """Read and consume the current input buffer."""
+        val result = self.input_buffer
+        self.input_buffer = ""
+        return result
+
+    me flush_output():
+        """Write pending output buffer to the terminal display."""
+        if self.output_buffer != "":
+            self.write_string(self.output_buffer)
+            self.output_buffer = ""
+
+    me append_output(s: text):
+        """Append text to the output buffer."""
+        self.output_buffer = "{self.output_buffer}{s}"
+
+    # -- UI Construction -----------------------------------------------------
+
+    fn build_ui() -> UISession:
+        """Build the terminal UI as a widget tree.
+
+        Layout:
+          Menubar: File | Edit | View
+          Scrollable terminal output (one text widget per visible line)
+          Statusbar: cursor position | mode
+        """
+        # Build visible line widgets
+        var line_widgets: [WidgetNode] = []
+        var row_idx = 0
+        while row_idx < self.rows and row_idx < self.lines.len():
+            val styled = line_to_styled(self.lines[row_idx])
+            var line_node = text_widget("term_line_{row_idx}", styled)
+            line_widgets = line_widgets.push(line_node)
+            row_idx = row_idx + 1
+
+        val root = column("terminal_root", [
+            menubar("term_menu", ["File", "Edit", "View"]),
+            with_flex(scroll("term_scroll", self.rows, line_widgets), 1),
+            statusbar("term_status",
+                "Ln {self.cursor_row + 1}, Col {self.cursor_col + 1}",
+                "{self.cols}x{self.rows}"
+            )
+        ])
+
+        val tree = build_tree(root)
+        return UISession.new(tree)
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn _parse_int(s: text, default_val: i32) -> i32:
+    """Parse integer from text, returning default on failure."""
+    if s == "":
+        return default_val
+    var result: i32 = 0
+    for ch in s:
+        if ch >= "0" and ch <= "9":
+            val digit = ch.to_i32() - "0".to_i32()
+            result = result * 10 + digit
+        else:
+            return default_val
+    return result

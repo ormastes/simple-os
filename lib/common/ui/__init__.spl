@@ -1,0 +1,134 @@
+# UI Core Library - Re-exports
+#
+# Platform-independent UI framework.
+# Use `common.ui.*` for new code; `app.ui.core.*` still works (shim).
+
+# Types (widget.spl)
+export UIMode, UIEvent
+export WidgetNode, UITree, UIState, WidgetRect
+export parse_widget_kind, parse_layout_kind
+
+# Layout (layout.spl)
+export compute_layout, find_rect
+
+# Mode (mode.spl)
+export switch_mode, resolve_keybinding, action_to_event
+
+# Event (event.spl)
+export process_event
+
+# State (state.spl)
+export init_state, init_state_with_mode, update_state, update_tree
+export is_quit_event, is_quit_command
+
+# Backend trait (backend.spl)
+export RenderBackend
+export Capability, NotSupported
+
+# Builder API (builder.spl)
+export column, row, grid, panel, text_widget, label, input, button
+export checkbox, dropdown, text_field, image, divider, dialog, tooltip
+export progress, menubar, menubar_rich, menu_separator, menu_with_submenu
+export statusbar, tabs, list_widget, table_widget, table_row
+export tree_widget, tree_node, tree_leaf
+export scroll, textarea
+export build_tree, build_tree_with_title
+export with_flex, with_width, with_height, with_visible
+export with_selected, with_disabled, with_readonly
+export with_error, with_validator, with_required, with_max_length
+export with_tooltip_text
+
+# Style/Theme (style.spl)
+export ThemeColors, Spacing, BorderStyle, FontStyle, UITheme
+export theme_to_css, AnsiTheme
+
+# iOS Design System (design_tokens.spl, ios_theme.spl, ios_css.spl, ios_icons.spl)
+export IOSDesignTokens, IOSColorTokens, IOSTypographyScale
+export IOSRadiusTokens, IOSShadowTokens, IOSSpacingScale
+export IOSAnimationTokens, IOSOpacityTokens, IOSTextStyle
+export ios_light, ios_dark, ios_design_tokens, is_ios_theme
+export generate_ios_css
+export ios_icon, ios_icon_with_fallback
+
+# iOS Widget Builders (ios_builder.spl)
+export navigation_bar, navigation_bar_large
+export tab_bar, tab_item, tab_item_badge
+export card, card_with_subtitle
+export switch_toggle
+export segmented_control
+export search_bar, search_bar_with_cancel
+
+# Tree Diffing (diff.spl)
+export diff_trees, diff_trees_with
+
+# Patch Types (patch.spl)
+export PatchKind, UIPatch
+
+# Reactive State (reactive.spl)
+export ReactiveValue, ReactiveStore, ReactiveUI
+
+# Async Event Loop (async_loop.spl)
+export UIEventBus, new_event_bus, run_async_ui, stop_event_bus, send_event
+
+# Async Reactive (async_reactive.spl)
+export ReactiveChange, AsyncReactiveStore
+export new_async_store, async_define, async_get, async_set
+export async_observe, async_store_close, async_is_dirty, async_clear_dirty
+
+# Async Backend (async_backend.spl)
+export AsyncRenderBackend
+
+# Async State (async_state.spl)
+export AsyncUIState, new_async_state, dispatch, get_current
+export get_current_mode, get_focused_id
+export dispatch_quit, dispatch_key, dispatch_action
+export dispatch_focus_next, dispatch_focus_prev
+
+# Lifecycle (lifecycle.spl)
+export LifecycleEvent, LifecycleHandler, LifecycleRegistry
+export new_lifecycle_registry, new_lifecycle_handler
+export emit_lifecycle_events, emit_action_event, emit_focus_event, emit_blur_event
+export describe_lifecycle_event
+
+# Async Diff Pipeline (async_diff.spl)
+export async_update_tree, async_update_nodes, async_update_tree_with
+
+# Side Effects (effect.spl)
+export Effect, EffectResult, EffectRunner
+export new_effect_runner, new_effect_result, describe_effect
+
+# Lifecycle Builder Modifiers (builder.spl)
+export with_on_mount, with_on_unmount, with_on_update
+export with_on_action, with_on_focus, with_on_blur
+
+# Widget Store (widget_store.spl)
+export WidgetStore, new_widget_store
+
+# Viewport (viewport.spl)
+export Viewport, default_viewport, new_viewport
+
+# ChangeLog (changelog.spl)
+export ChangeLog, new_changelog, default_changelog
+
+# Surface (surface.spl)
+export SurfaceEntry, SurfaceHandle, SurfaceManager, new_surface_manager
+
+# Session (session.spl)
+export UISession, new_session
+
+# App (app.spl)
+export UnifiedApp, AppConfig
+
+# Backend Factory (backend_factory.spl)
+export create_backend, create_sync_backend
+
+# Profile / Responsive (profile.spl)
+export Orientation, SizeClass, LayoutProfile, Breakpoints
+export ProfileSet, ProfileSetEntry, ProfileResolver
+export detect_orientation, classify, compute_profile
+export default_breakpoints, terminal_breakpoints, breakpoints_for_backend
+export default_profile
+
+# Adaptive Builders (builder.spl)
+export adaptive, with_profile, adaptive_stack, adaptive_sidebar
+export adaptive_grid, responsive, responsive_if_wide

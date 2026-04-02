@@ -1,0 +1,249 @@
+# ARM32 Interrupt Controller — GICv2 Implementation
+#
+# Implements GICv2 (Generic Interrupt Controller v2) for QEMU virt machine.
+# Same GICv2 hardware as ARM64 — the register interface is 32-bit MMIO
+# and identical regardless of CPU bitness.
+#
+# GICv2 has two main components:
+#   GICD (Distributor) at 0x08000000 — routes IRQs to CPUs
+#   GICC (CPU Interface) at 0x08010000 — per-CPU interrupt handling
+#
+# Interrupt number ranges:
+#   0-15:    SGI (Software Generated Interrupts) — IPI
+#   16-31:   PPI (Private Peripheral Interrupts) — per-CPU timers, etc.
+#   32-1019: SPI (Shared Peripheral Interrupts) — device IRQs
+#
+# Key GICv2 registers:
+#   GICD_CTLR      (+0x000): Distributor control (enable/disable)
+#   GICD_ISENABLER (+0x100): Set enable bits (one bit per IRQ)
+#   GICD_ICENABLER (+0x180): Clear enable bits
+#   GICD_IPRIORITYR(+0x400): Priority (one byte per IRQ, 0=highest)
+#   GICD_ITARGETSR (+0x800): CPU target (one byte per IRQ, bit mask)
+#   GICD_ICFGR     (+0xC00): Configuration (edge/level, 2 bits per IRQ)
+#   GICC_CTLR      (+0x000): CPU interface control
+#   GICC_PMR       (+0x004): Priority mask (only IRQs < PMR are delivered)
+#   GICC_IAR       (+0x00C): Interrupt acknowledge (read = get IRQ number)
+#   GICC_EOIR      (+0x010): End of interrupt (write = signal completion)
+
+use os.kernel.boot.mmio.{mmio_read32, mmio_write32}
+use os.kernel.arch.arm32.console.{uart_writeln}
+
+# ============================================================================
+# GIC Base Addresses (QEMU virt machine)
+# ============================================================================
+
+val GICD_BASE: u32 = 0x08000000   # GICv2 Distributor
+val GICC_BASE: u32 = 0x08010000   # GICv2 CPU Interface
+
+# ============================================================================
+# GICD (Distributor) Register Offsets
+# ============================================================================
+
+val GICD_CTLR: u32 = 0x000        # Distributor Control
+val GICD_TYPER: u32 = 0x004       # Interrupt Controller Type
+val GICD_ISENABLER: u32 = 0x100   # Interrupt Set-Enable (array, 32 IRQs per register)
+val GICD_ICENABLER: u32 = 0x180   # Interrupt Clear-Enable
+val GICD_ISPENDR: u32 = 0x200     # Interrupt Set-Pending
+val GICD_ICPENDR: u32 = 0x280     # Interrupt Clear-Pending
+val GICD_IPRIORITYR: u32 = 0x400  # Interrupt Priority (array, 4 IRQs per register)
+val GICD_ITARGETSR: u32 = 0x800   # Interrupt Processor Targets (array, 4 IRQs per register)
+val GICD_ICFGR: u32 = 0xC00       # Interrupt Configuration (array, 16 IRQs per register)
+
+# ============================================================================
+# GICC (CPU Interface) Register Offsets
+# ============================================================================
+
+val GICC_CTLR: u32 = 0x000        # CPU Interface Control
+val GICC_PMR: u32 = 0x004         # Interrupt Priority Mask
+val GICC_BPR: u32 = 0x008         # Binary Point
+val GICC_IAR: u32 = 0x00C         # Interrupt Acknowledge
+val GICC_EOIR: u32 = 0x010        # End of Interrupt
+val GICC_RPR: u32 = 0x014         # Running Priority
+val GICC_HPPIR: u32 = 0x018       # Highest Priority Pending Interrupt
+
+# ============================================================================
+# GIC Constants
+# ============================================================================
+
+val GIC_SPURIOUS_IRQ: u32 = 1023   # Spurious interrupt number
+val GIC_MAX_IRQS: u32 = 1020       # Maximum supported IRQ number
+
+# IRQ number for ARM Generic Timer (PPI)
+val IRQ_TIMER: u32 = 30            # Non-secure physical timer (PPI #14, IRQ 16+14=30)
+
+# ============================================================================
+# IRQ Handler Table
+# ============================================================================
+
+# Simple handler table — stores function addresses for each IRQ
+# Maximum 256 IRQs for initial implementation
+val MAX_HANDLERS: u32 = 256
+var g_irq_handlers: [u32; 256] = [0; 256]
+
+# ============================================================================
+# Arm32Interrupt
+# ============================================================================
+
+struct Arm32Interrupt:
+    """ARM32 GICv2 interrupt controller management.
+
+    Manages the GICv2 Distributor (GICD) and CPU Interface (GICC)
+    for interrupt routing, priority, enable/disable, and acknowledgment.
+    Identical register interface to ARM64 GICv2 (MMIO is 32-bit).
+    """
+    pass_dn
+
+impl Arm32Interrupt:
+    fn init():
+        """Initialize GICv2 — enable Distributor and CPU Interface.
+
+        Steps:
+        1. Disable Distributor during setup
+        2. Set all SPIs to target CPU 0, level-triggered, default priority
+        3. Enable Distributor
+        4. Set priority mask to accept all priorities (0xFF)
+        5. Enable CPU Interface
+        """
+        uart_writeln("[GIC] Initializing GICv2...")
+
+        # Step 1: Disable distributor
+        mmio_write32(GICD_BASE as u64 + GICD_CTLR as u64, 0)
+
+        # Read number of supported interrupt lines
+        val typer = mmio_read32(GICD_BASE as u64 + GICD_TYPER as u64)
+        val it_lines = (typer & 0x1F) as u32   # ITLinesNumber field
+        val max_irqs = (it_lines + 1) * 32
+        uart_writeln("[GIC] Max IRQs: {max_irqs}")
+
+        # Step 2: Configure all SPIs (IRQ 32+)
+        # Set priority to default (0xA0) for all IRQs
+        var i: u32 = 32
+        while i < max_irqs:
+            val reg_offset = GICD_IPRIORITYR + (i / 4) * 4
+            mmio_write32(GICD_BASE as u64 + reg_offset as u64, 0xA0A0A0A0)
+            i = i + 4
+
+        # Set all SPIs to target CPU 0
+        i = 32
+        while i < max_irqs:
+            val reg_offset = GICD_ITARGETSR + (i / 4) * 4
+            mmio_write32(GICD_BASE as u64 + reg_offset as u64, 0x01010101)
+            i = i + 4
+
+        # Set all SPIs to level-triggered
+        i = 32
+        while i < max_irqs:
+            val reg_offset = GICD_ICFGR + (i / 16) * 4
+            mmio_write32(GICD_BASE as u64 + reg_offset as u64, 0)
+            i = i + 16
+
+        # Disable all interrupts initially
+        i = 0
+        while i < max_irqs:
+            val reg_offset = GICD_ICENABLER + (i / 32) * 4
+            mmio_write32(GICD_BASE as u64 + reg_offset as u64, 0xFFFFFFFF)
+            i = i + 32
+
+        # Step 3: Enable distributor (Group 0 + Group 1)
+        mmio_write32(GICD_BASE as u64 + GICD_CTLR as u64, 1)
+
+        # Step 4: Set CPU Interface priority mask to accept all
+        mmio_write32(GICC_BASE as u64 + GICC_PMR as u64, 0xFF)
+
+        # Step 5: Enable CPU Interface
+        mmio_write32(GICC_BASE as u64 + GICC_CTLR as u64, 1)
+
+        uart_writeln("[GIC] GICv2 initialized — distributor and CPU interface enabled")
+
+    fn enable_irq(irq: u32):
+        """Enable a specific IRQ line in the GIC Distributor."""
+        val reg_index = (irq / 32) as u32
+        val bit = 1 << (irq % 32)
+        mmio_write32(GICD_BASE as u64 + GICD_ISENABLER as u64 + reg_index as u64 * 4, bit)
+
+    fn disable_irq(irq: u32):
+        """Disable a specific IRQ line in the GIC Distributor."""
+        val reg_index = (irq / 32) as u32
+        val bit = 1 << (irq % 32)
+        mmio_write32(GICD_BASE as u64 + GICD_ICENABLER as u64 + reg_index as u64 * 4, bit)
+
+    fn acknowledge() -> u32:
+        """Acknowledge the highest-priority pending interrupt.
+
+        Reads GICC_IAR to get the IRQ number. Returns GIC_SPURIOUS_IRQ (1023)
+        if no interrupt is pending (spurious).
+        """
+        mmio_read32(GICC_BASE as u64 + GICC_IAR as u64)
+
+    fn end_of_interrupt(irq: u32):
+        """Signal end of interrupt processing."""
+        mmio_write32(GICC_BASE as u64 + GICC_EOIR as u64, irq)
+
+    fn set_handler(irq: u32, handler: u32):
+        """Store an interrupt handler function address for the given IRQ."""
+        if irq >= MAX_HANDLERS:
+            uart_writeln("[GIC] WARNING: IRQ {irq} exceeds handler table size")
+            return
+        g_irq_handlers[irq as i64] = handler
+
+    fn get_handler(irq: u32) -> u32:
+        """Get the registered handler for the given IRQ, or 0 if none."""
+        if irq >= MAX_HANDLERS:
+            return 0
+        g_irq_handlers[irq as i64]
+
+    fn set_priority(irq: u32, priority: u32):
+        """Set the priority level for a specific IRQ.
+
+        Priority is 0-255 where 0 is highest priority.
+        """
+        val reg_offset = GICD_IPRIORITYR + (irq / 4) * 4
+        val byte_offset = irq % 4
+        val shift = byte_offset * 8
+
+        var reg_val = mmio_read32(GICD_BASE as u64 + reg_offset as u64)
+        val mask = ~(0xFF << shift)
+        reg_val = (reg_val & mask as u32) | ((priority & 0xFF) << shift)
+        mmio_write32(GICD_BASE as u64 + reg_offset as u64, reg_val)
+
+    fn set_target(irq: u32, cpu_mask: u32):
+        """Set the target CPU mask for a specific SPI.
+
+        cpu_mask is a bitmask where bit N = CPU N.
+        Only applies to SPIs (IRQ >= 32).
+        """
+        if irq < 32:
+            return  # SGI/PPI targets are read-only
+
+        val reg_offset = GICD_ITARGETSR + (irq / 4) * 4
+        val byte_offset = irq % 4
+        val shift = byte_offset * 8
+
+        var reg_val = mmio_read32(GICD_BASE as u64 + reg_offset as u64)
+        val mask = ~(0xFF << shift)
+        reg_val = (reg_val & mask as u32) | ((cpu_mask & 0xFF) << shift)
+        mmio_write32(GICD_BASE as u64 + reg_offset as u64, reg_val)
+
+# ============================================================================
+# Module-Level Convenience Functions
+# ============================================================================
+
+fn gic_init():
+    """Initialize GICv2 (module-level convenience)."""
+    var gic = Arm32Interrupt()
+    gic.init()
+
+fn gic_enable_irq(irq: u32):
+    """Enable an IRQ (module-level convenience)."""
+    val gic = Arm32Interrupt()
+    gic.enable_irq(irq)
+
+fn gic_acknowledge() -> u32:
+    """Acknowledge pending interrupt (module-level convenience)."""
+    val gic = Arm32Interrupt()
+    gic.acknowledge()
+
+fn gic_eoi(irq: u32):
+    """Signal end of interrupt (module-level convenience)."""
+    val gic = Arm32Interrupt()
+    gic.end_of_interrupt(irq)

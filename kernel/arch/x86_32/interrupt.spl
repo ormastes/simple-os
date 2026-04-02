@@ -1,0 +1,244 @@
+# x86_32 Interrupt HAL — IDT + PIC 8259
+#
+# Implements the x86 32-bit interrupt subsystem using the PIC 8259
+# (not APIC like x86_64). The 32-bit IDT uses 8-byte entries
+# (compared to 16-byte entries in x86_64 long mode).
+#
+# PIC remapping:
+#   IRQ 0-7  -> CPU vectors 32-39 (master PIC, port 0x20/0x21)
+#   IRQ 8-15 -> CPU vectors 40-47 (slave PIC, port 0xA0/0xA1)
+#
+# IDT entry format (32-bit, 8 bytes):
+#   Bytes 0-1: Handler offset (low 16 bits)
+#   Bytes 2-3: Code segment selector (GDT_KERNEL_CODE)
+#   Byte  4:   Zero (reserved)
+#   Byte  5:   Type/attributes (present, DPL, gate type)
+#   Bytes 6-7: Handler offset (high 16 bits)
+
+use os.kernel.arch.x86_32.cpu.{port_outb, port_outb_wait, port_inb, cli, sti}
+use os.kernel.arch.x86_32.cpu.{GDT_KERNEL_CODE}
+
+# ============================================================================
+# PIC 8259 Port Addresses
+# ============================================================================
+
+val PIC1_COMMAND: u16 = 0x20      # Master PIC command port
+val PIC1_DATA: u16 = 0x21         # Master PIC data port
+val PIC2_COMMAND: u16 = 0xA0      # Slave PIC command port
+val PIC2_DATA: u16 = 0xA1         # Slave PIC data port
+
+# PIC commands
+val PIC_EOI: u8 = 0x20            # End of Interrupt
+val PIC_ICW1_INIT: u8 = 0x11      # Init + ICW4 needed
+val PIC_ICW4_8086: u8 = 0x01      # 8086/88 mode
+
+# IRQ vector offsets after remapping
+val PIC1_VECTOR_OFFSET: u8 = 32   # IRQ 0-7 -> vectors 32-39
+val PIC2_VECTOR_OFFSET: u8 = 40   # IRQ 8-15 -> vectors 40-47
+
+# ============================================================================
+# IDT Constants
+# ============================================================================
+
+val IDT_ENTRIES: u32 = 256
+val IDT_ENTRY_SIZE: u32 = 8       # 8 bytes per 32-bit IDT entry
+
+# IDT gate type attributes
+val IDT_GATE_INT32: u8 = 0x8E     # Present, DPL=0, 32-bit interrupt gate
+val IDT_GATE_TRAP32: u8 = 0x8F    # Present, DPL=0, 32-bit trap gate
+val IDT_GATE_USER: u8 = 0xEE      # Present, DPL=3, 32-bit interrupt gate (user-callable)
+
+# ============================================================================
+# IDT Entry Structure
+# ============================================================================
+
+@repr("C")
+struct IdtEntry32:
+    """32-bit IDT entry (Interrupt Gate Descriptor).
+
+    8 bytes total:
+    - offset_low: lower 16 bits of handler address
+    - selector: GDT code segment selector
+    - zero: reserved, must be 0
+    - type_attr: gate type and attributes (present, DPL, gate type)
+    - offset_high: upper 16 bits of handler address
+    """
+    offset_low: u16
+    selector: u16
+    zero: u8
+    type_attr: u8
+    offset_high: u16
+
+@repr("C")
+struct IdtPointer32:
+    """32-bit IDTR register structure for LIDT instruction."""
+    limit: u16              # Size of IDT - 1
+    base: u32               # Linear address of IDT
+
+# ============================================================================
+# IDT Storage
+# ============================================================================
+
+# Static IDT array (256 entries * 8 bytes = 2048 bytes)
+var g_idt: [IdtEntry32; 256] = []
+var g_idtr: IdtPointer32 = IdtPointer32(limit: 0, base: 0)
+
+# ============================================================================
+# PIC 8259 Functions
+# ============================================================================
+
+fn _pic_remap():
+    """Remap PIC to vectors 32-47 (avoid conflict with CPU exceptions 0-31).
+
+    Initialization Command Words (ICW) sequence for both PICs:
+    ICW1: Begin init (sent to command ports)
+    ICW2: Vector offset (sent to data ports)
+    ICW3: Cascading (master: slave on IRQ2, slave: cascade identity 2)
+    ICW4: 8086 mode
+    """
+    # Save current masks
+    val mask1 = port_inb(PIC1_DATA)
+    val mask2 = port_inb(PIC2_DATA)
+
+    # ICW1: begin initialization (cascade mode, ICW4 needed)
+    port_outb_wait(PIC1_COMMAND, PIC_ICW1_INIT)
+    port_outb_wait(PIC2_COMMAND, PIC_ICW1_INIT)
+
+    # ICW2: vector offsets
+    port_outb_wait(PIC1_DATA, PIC1_VECTOR_OFFSET)
+    port_outb_wait(PIC2_DATA, PIC2_VECTOR_OFFSET)
+
+    # ICW3: cascading
+    port_outb_wait(PIC1_DATA, 0x04)   # Slave on IRQ2 (bit 2)
+    port_outb_wait(PIC2_DATA, 0x02)   # Cascade identity 2
+
+    # ICW4: 8086/88 mode
+    port_outb_wait(PIC1_DATA, PIC_ICW4_8086)
+    port_outb_wait(PIC2_DATA, PIC_ICW4_8086)
+
+    # Restore saved masks
+    port_outb(PIC1_DATA, mask1)
+    port_outb(PIC2_DATA, mask2)
+
+fn _pic_send_eoi(irq: u32):
+    """Send End-Of-Interrupt to the appropriate PIC(s).
+
+    If the IRQ came from the slave PIC (IRQ 8-15),
+    send EOI to both slave and master.
+    """
+    if irq >= 8:
+        port_outb(PIC2_COMMAND, PIC_EOI)
+    port_outb(PIC1_COMMAND, PIC_EOI)
+
+fn _pic_set_mask(irq: u32, masked: bool):
+    """Mask or unmask a specific IRQ line on the PIC."""
+    var port: u16 = PIC1_DATA
+    var line: u32 = irq
+
+    if irq >= 8:
+        port = PIC2_DATA
+        line = irq - 8
+
+    val current = port_inb(port)
+    if masked:
+        # Set the bit to mask
+        port_outb(port, current | ((1 << line) as u8))
+    else:
+        # Clear the bit to unmask
+        port_outb(port, current & (((1 << line) ^ 0xFF) as u8))
+
+fn _pic_disable():
+    """Disable all IRQs on both PICs (mask all lines)."""
+    port_outb(PIC1_DATA, 0xFF)
+    port_outb(PIC2_DATA, 0xFF)
+
+# ============================================================================
+# IDT Functions
+# ============================================================================
+
+fn _idt_set_entry(vector: u32, handler_addr: u32, selector: u16, type_attr: u8):
+    """Set a single IDT entry."""
+    g_idt[vector] = IdtEntry32(
+        offset_low: (handler_addr & 0xFFFF) as u16,
+        selector: selector,
+        zero: 0,
+        type_attr: type_attr,
+        offset_high: ((handler_addr >> 16) & 0xFFFF) as u16
+    )
+
+fn _idt_load():
+    """Load the IDT via LIDT instruction."""
+    extern fn rt_lidt(idtr_addr: u32)
+
+    g_idtr = IdtPointer32(
+        limit: ((IDT_ENTRIES * IDT_ENTRY_SIZE) - 1) as u16,
+        base: &g_idt as u32
+    )
+    rt_lidt(&g_idtr as u32)
+
+# ============================================================================
+# X86_32Interrupt
+# ============================================================================
+
+struct X86_32Interrupt:
+    """x86_32 interrupt management (IDT + PIC 8259).
+
+    Uses the legacy PIC 8259 for interrupt routing.
+    IRQs are remapped to vectors 32-47 to avoid conflict with
+    CPU exception vectors 0-31.
+    """
+    pass_dn
+
+impl X86_32Interrupt:
+    fn init():
+        """Initialize IDT and remap PIC 8259."""
+        # Disable interrupts during setup
+        cli()
+
+        # Remap PIC to vectors 32-47
+        _pic_remap()
+
+        # Mask all IRQs initially
+        _pic_disable()
+
+        # Load IDT
+        _idt_load()
+
+    fn enable():
+        """Enable interrupts (STI)."""
+        sti()
+
+    fn disable():
+        """Disable interrupts (CLI)."""
+        cli()
+
+    fn register_handler(vector: u32, handler_addr: u32):
+        """Register an interrupt handler for a given vector number."""
+        _idt_set_entry(vector, handler_addr, GDT_KERNEL_CODE, IDT_GATE_INT32)
+        # Reload IDT to pick up changes
+        _idt_load()
+
+    fn unregister_handler(vector: u32):
+        """Remove interrupt handler for a given vector number."""
+        _idt_set_entry(vector, 0, 0, 0)
+        _idt_load()
+
+    fn send_eoi(irq: u32):
+        """Send End-Of-Interrupt for given IRQ."""
+        _pic_send_eoi(irq)
+
+    fn set_irq_mask(irq: u32, masked: bool):
+        """Mask or unmask a hardware IRQ line."""
+        _pic_set_mask(irq, masked)
+
+    fn acknowledge(irq: u32):
+        """Acknowledge the current interrupt (send EOI to PIC)."""
+        _pic_send_eoi(irq)
+
+    fn enable_irq(irq: u32):
+        """Unmask a specific IRQ line."""
+        _pic_set_mask(irq, false)
+
+    fn disable_irq(irq: u32):
+        """Mask a specific IRQ line."""
+        _pic_set_mask(irq, true)

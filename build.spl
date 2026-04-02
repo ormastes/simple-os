@@ -1,0 +1,72 @@
+# SimpleOS Build Script — Multi-Architecture Kernel Builder
+#
+# Builds the example OS kernel for all supported architectures.
+# Detects available cross-compilers and skips unavailable targets.
+#
+# Usage:
+#   bin/simple run examples/simple_os/build.spl
+#   bin/simple run examples/simple_os/build.spl -- --arch=arm64
+
+use os.qemu_runner.{get_target, get_all_targets, arch_from_name, arch_display_name, build_os}
+use os.kernel.arch.arch_context.{Architecture}
+
+extern fn rt_process_run_timeout(cmd: text, args: [text], timeout_ms: i64) -> (text, text, i32)
+extern fn rt_args() -> [text]
+
+fn check_qemu_available(qemu_bin: text) -> bool:
+    """Check if a QEMU system binary is available on PATH."""
+    val result = rt_process_run_timeout("which", [qemu_bin], 5000)
+    result[2] == 0
+
+fn main():
+    """Build SimpleOS for all 4 target architectures."""
+    val args = rt_args()
+
+    # Parse --arch= argument if provided
+    var target_arch: text = "all"
+    for arg in args:
+        if arg.starts_with("--arch="):
+            target_arch = arg.substr(7)
+
+    val arches: [Architecture] = [
+        Architecture.Arm64,
+        Architecture.X86_64,
+        Architecture.Riscv32,
+        Architecture.Riscv64
+    ]
+
+    print "SimpleOS Builder"
+    print "================"
+    print ""
+
+    var built: u64 = 0
+    var skipped: u64 = 0
+    var failed: u64 = 0
+
+    for arch in arches:
+        val name = arch_display_name(arch)
+        if target_arch != "all" and target_arch != name:
+            continue
+
+        val target = get_target(arch)
+        print "--- Building {name} ---"
+
+        # Check QEMU availability (informational)
+        if check_qemu_available(target.qemu_system):
+            print "  QEMU: {target.qemu_system} (available)"
+        else:
+            print "  QEMU: {target.qemu_system} (not found, tests will be skipped)"
+
+        val ok = build_os(target)
+        if ok:
+            print "  [OK] Built: {target.output}"
+            built = built + 1
+        else:
+            print "  [FAIL] Build failed for {name}"
+            failed = failed + 1
+        print ""
+
+    print "================"
+    print "Results: {built} built, {failed} failed, {skipped} skipped"
+
+main()

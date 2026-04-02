@@ -1,0 +1,47 @@
+# Re-exported from allocator.spl
+export BumpAllocator, FreeListAllocator, FixedBlockAllocator, MultiPoolAllocator
+export heap_init, heap_stats, heap_check
+
+# Re-exported from interrupt.spl
+export nvic_enable_irq, nvic_disable_irq, nvic_set_priority
+export nvic_get_priority, nvic_set_pending, nvic_clear_pending, nvic_is_active
+export nvic_set_vector_table, nvic_system_reset
+export plic_enable_irq, plic_disable_irq, plic_set_priority
+export plic_set_threshold, plic_claim, plic_complete
+export apic_enable_irq, apic_disable_irq
+export apic_enable, apic_eoi, apic_get_id
+export enable_interrupts, disable_interrupts, interrupts_enabled, read_processor_status
+export with_interrupts_disabled, dispatch_interrupt
+export register_interrupt_handler, unregister_interrupt_handler
+export InterruptHandler
+
+# Re-exported from semihost_config.spl
+export SemihostTransportConfig
+export semihost_config_default, semihost_init, semihost_init_default
+
+# Re-exported from semihost_transport.spl
+export TRANSPORT_WRITEC, TRANSPORT_WRITE0, TRANSPORT_WRITE
+export TRANSPORT_BATCH_N, TRANSPORT_BUFFERED, TRANSPORT_UART
+export TRANSPORT_RAW_BINARY, TRANSPORT_INTERNED
+export semihost_set_transport, semihost_get_transport
+export semihost_send_bytes, semihost_send_string, semihost_send_byte
+export semihost_open_stdout
+export semihost_set_batch_size, semihost_set_uart_base
+export semihost_buffer_init, semihost_buffer_flush
+export semihost_uart_init, semihost_uart_write_byte
+export semihost_write_raw_string
+export CAP_WRITEC, CAP_WRITE0, CAP_WRITE, CAP_UART, CAP_INTERNED
+export semihost_probe_capabilities, uart_probe_lsr
+export semihost_auto_select, semihost_get_capabilities
+export RAW_BINARY_MAGIC
+
+# Re-exported from syscall.spl
+export semi_open, semi_close, semi_write, semi_read
+export semi_write_string, semi_read_line, semi_exit, semi_clock, semi_time
+export uart_init, uart_write_byte, uart_read_byte, uart_write_string
+export uart_read_available, uart_write_ready
+export timer_init, timer_read, timer_delay_ms, timer_delay_us
+export debug_putc, debug_puts
+export mem_read_u32, mem_write_u32, mem_read_u8, mem_write_u8
+export mem_set_bit, mem_clear_bit, mem_test_bit, mem_modify_bits
+export MODE_READ, MODE_WRITE, MODE_APPEND

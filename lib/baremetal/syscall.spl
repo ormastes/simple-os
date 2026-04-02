@@ -1,0 +1,558 @@
+@allow(unnamed_duplicate_typed_args)
+@allow(primitive_api)
+# Bare-Metal Syscall Wrappers
+#
+# System call wrappers for bare-metal targets.
+# Provides I/O, timing, and debugging via:
+# - Semihosting (ARM, RISC-V)
+# - UART serial I/O
+# - Timer access (platform-specific)
+#
+# Usage:
+#   # Semihosting (debugging with GDB/QEMU)
+#   semi_write_string("Hello, world!\n")
+#   semi_exit(0)
+#
+#   # UART (real hardware)
+#   uart_init(0x40011000, 115200)  # USART1 on STM32
+#   uart_write_string("Debug output\n")
+
+
+# ============================================================================
+# Semihosting Operations (ARM/RISC-V)
+# ============================================================================
+
+# Semihosting operation codes
+val SYS_OPEN: i32 = 0x01
+val SYS_CLOSE: i32 = 0x02
+val SYS_WRITEC: i32 = 0x03
+val SYS_WRITE0: i32 = 0x04
+val SYS_WRITE: i32 = 0x05
+val SYS_READ: i32 = 0x06
+val SYS_READC: i32 = 0x07
+val SYS_ISERROR: i32 = 0x08
+val SYS_ISTTY: i32 = 0x09
+val SYS_SEEK: i32 = 0x0A
+val SYS_FLEN: i32 = 0x0C
+val SYS_REMOVE: i32 = 0x0E
+val SYS_RENAME: i32 = 0x0F
+val SYS_CLOCK: i32 = 0x10
+val SYS_TIME: i32 = 0x11
+val SYS_EXIT: i32 = 0x18
+
+# File open modes
+val MODE_READ: i32 = 0
+val MODE_WRITE: i32 = 4
+val MODE_APPEND: i32 = 8
+
+/*
+ * Semihosting Call
+ *
+ * Execute a semihosting operation using platform-specific instruction:
+ * - ARM Thumb: BKPT #0xAB
+ * - ARM mode: SVC #0x123456
+ * - RISC-V: EBREAK with magic sequence
+ * - x86_64: Not supported (falls back to stub)
+ */
+fn semi_host_call(operation: i32, param: u32) -> i32:
+    """Execute semihosting call.
+
+    Args:
+        operation: Semihosting operation code (SYS_*)
+        param: Parameter (address of parameter block)
+
+    Returns:
+        Result code (operation-specific)
+    """
+    # LIMITATION: Requires inline assembly (SFFI not available)
+    # Platform-specific implementation via @cfg attribute
+    0
+
+fn semi_open(path: text, mode: i32) -> i32:
+    """Open file on host filesystem.
+
+    Args:
+        path: File path on host
+        mode: Open mode (MODE_READ, MODE_WRITE, MODE_APPEND)
+
+    Returns:
+        File descriptor (>= 0), or -1 on error
+    """
+    # Parameter block: [path_addr, mode, path_len]
+    # LIMITATION: Multi-register syscall requires inline assembly (SFFI not available)
+    -1
+
+fn semi_close(fd: i32) -> bool:
+    """Close file.
+
+    Args:
+        fd: File descriptor from semi_open
+
+    Returns:
+        true on success, false on error
+    """
+    val result = semi_host_call(SYS_CLOSE, fd)
+    result == 0
+
+fn semi_write(fd: i32, buffer: [u8], length: u32) -> i32:
+    """Write bytes to file.
+
+    Args:
+        fd: File descriptor
+        buffer: Data to write
+        length: Number of bytes
+
+    Returns:
+        Number of bytes NOT written (0 = success)
+    """
+    # Parameter block: [fd, buffer_addr, length]
+    # LIMITATION: Multi-register syscall requires inline assembly (SFFI not available)
+    0
+
+fn semi_read(fd: i32, buffer: [u8], length: u32) -> i32:
+    """Read bytes from file.
+
+    Args:
+        fd: File descriptor
+        buffer: Buffer to read into
+        length: Number of bytes to read
+
+    Returns:
+        Number of bytes read (0 = EOF)
+    """
+    # Parameter block: [fd, buffer_addr, length]
+    # LIMITATION: Multi-register syscall requires inline assembly (SFFI not available)
+    0
+
+fn semi_write_string(message: text):
+    """Write string to debug console (semihosting).
+
+    Uses SYS_WRITE0 for null-terminated strings.
+    Simpler than semi_write but less flexible.
+    """
+    semi_host_call(SYS_WRITE0, message as u32)
+
+fn semi_read_line() -> text:
+    """Read line from debug console (semihosting).
+
+    Returns:
+        Line of text (without newline)
+    """
+    # LIMITATION: Line buffering requires SFFI for getline()
+    ""
+
+fn semi_exit(status: i32):
+    """Exit program with status code.
+
+    In semihosting mode, this terminates the debugger session.
+    On real hardware, this typically halts the CPU.
+    """
+    semi_host_call(SYS_EXIT, status)
+
+fn semi_clock() -> i32:
+    """Get elapsed time in centiseconds since start.
+
+    Returns:
+        Time in centiseconds (100ths of a second)
+    """
+    semi_host_call(SYS_CLOCK, 0)
+
+fn semi_time() -> i32:
+    """Get current time in seconds since Unix epoch.
+
+    Returns:
+        Unix timestamp
+    """
+    semi_host_call(SYS_TIME, 0)
+
+# ============================================================================
+# UART (Serial) I/O
+# ============================================================================
+
+struct UartConfig:
+    """UART peripheral configuration."""
+    base_addr: u32     # UART peripheral base address
+    baudrate: u32      # Baud rate (e.g., 115200)
+    data_bits: u8      # Data bits (7 or 8)
+    stop_bits: u8      # Stop bits (1 or 2)
+    parity: u8         # Parity (0=none, 1=odd, 2=even)
+
+# UART register offsets (generic 16550-style)
+val UART_RBR: u32 = 0x00  # Receiver Buffer Register (read)
+val UART_THR: u32 = 0x00  # Transmitter Holding Register (write)
+val UART_IER: u32 = 0x04  # Interrupt Enable Register
+val UART_FCR: u32 = 0x08  # FIFO Control Register
+val UART_LCR: u32 = 0x0C  # Line Control Register
+val UART_MCR: u32 = 0x10  # Modem Control Register
+val UART_LSR: u32 = 0x14  # Line Status Register
+val UART_MSR: u32 = 0x18  # Modem Status Register
+
+# Line Status Register bits
+val LSR_DATA_READY: u8 = 0x01      # Data ready
+val LSR_OVERRUN_ERROR: u8 = 0x02   # Overrun error
+val LSR_PARITY_ERROR: u8 = 0x04    # Parity error
+val LSR_FRAMING_ERROR: u8 = 0x08   # Framing error
+val LSR_BREAK_INTERRUPT: u8 = 0x10 # Break interrupt
+val LSR_THR_EMPTY: u8 = 0x20       # Transmitter holding register empty
+val LSR_TRANSMITTER_EMPTY: u8 = 0x40 # Transmitter empty
+
+fn uart_init(base_addr: u32, baudrate: u32):
+    """Initialize UART peripheral.
+
+    Configures a 16550-style UART for 8N1 with FIFO enabled.
+    Assumes a 115200 Hz input clock for divisor calculation.
+
+    Args:
+        base_addr: UART peripheral base address
+        baudrate: Baud rate (e.g., 9600, 115200)
+
+    Example:
+        # STM32F4 USART1 at 0x40011000
+        uart_init(0x40011000, 115200)
+    """
+    # Calculate divisor: clock_freq / baudrate (assume 115200 base clock)
+    val divisor: u32 = 115200 / baudrate
+
+    # Set DLAB bit (bit 7) in LCR to access divisor latch registers
+    val lcr_val = mem_read_u8(base_addr + UART_LCR)
+    mem_write_u8(base_addr + UART_LCR, lcr_val | 0x80)
+
+    # Write divisor low byte to RBR offset (DLL when DLAB=1)
+    val divisor_low: u8 = (divisor & 0xFF) as u8
+    mem_write_u8(base_addr + UART_RBR, divisor_low)
+
+    # Write divisor high byte to IER offset (DLM when DLAB=1)
+    val divisor_high: u8 = ((divisor >> 8) & 0xFF) as u8
+    mem_write_u8(base_addr + UART_IER, divisor_high)
+
+    # Clear DLAB and set 8N1: 8 data bits, no parity, 1 stop bit (LCR = 0x03)
+    mem_write_u8(base_addr + UART_LCR, 0x03)
+
+    # Enable FIFO and clear both RX/TX FIFOs (FCR = 0x07)
+    mem_write_u8(base_addr + UART_FCR, 0x07)
+
+fn uart_write_byte(base_addr: u32, byte: u8):
+    """Write single byte to UART.
+
+    Blocks until transmitter is ready.
+    """
+    # Wait for THR empty
+    while true:
+        val lsr = mem_read_u8(base_addr + UART_LSR)
+        if (lsr & LSR_THR_EMPTY) != 0:
+            break
+
+    # Write byte
+    mem_write_u8(base_addr + UART_THR, byte)
+
+fn uart_read_byte(base_addr: u32) -> u8:
+    """Read single byte from UART.
+
+    Blocks until data is available.
+    """
+    # Wait for data ready
+    while true:
+        val lsr = mem_read_u8(base_addr + UART_LSR)
+        if (lsr & LSR_DATA_READY) != 0:
+            break
+
+    # Read byte
+    mem_read_u8(base_addr + UART_RBR)
+
+fn uart_write_string(base_addr: u32, message: text):
+    """Write string to UART.
+
+    Args:
+        base_addr: UART peripheral base address
+        message: String to write
+    """
+    val bytes = message.bytes()
+    var i = 0
+    while i < bytes.len():
+        uart_write_byte(base_addr, bytes[i])
+        i = i + 1
+
+fn uart_read_available(base_addr: u32) -> bool:
+    """Check if UART has data available to read.
+
+    Returns:
+        true if data is available, false otherwise
+    """
+    val lsr = mem_read_u8(base_addr + UART_LSR)
+    (lsr & LSR_DATA_READY) != 0
+
+fn uart_write_ready(base_addr: u32) -> bool:
+    """Check if UART is ready to transmit.
+
+    Returns:
+        true if ready to write, false otherwise
+    """
+    val lsr = mem_read_u8(base_addr + UART_LSR)
+    (lsr & LSR_THR_EMPTY) != 0
+
+# ============================================================================
+# Timer Access
+# ============================================================================
+
+struct TimerConfig:
+    """Hardware timer configuration."""
+    base_addr: u32     # Timer peripheral base address
+    frequency: u32     # Timer frequency in Hz
+    prescaler: u32     # Prescaler value
+
+# Timer register offsets (generic)
+val TIMER_CNT: u32 = 0x24     # Counter value
+val TIMER_PSC: u32 = 0x28     # Prescaler
+val TIMER_ARR: u32 = 0x2C     # Auto-reload register
+val TIMER_CR1: u32 = 0x00     # Control register 1
+
+fn timer_init(base_addr: u32, frequency: u32):
+    """Initialize hardware timer.
+
+    Configures prescaler from a 1 MHz system clock, sets auto-reload
+    to maximum range, and enables the timer.
+
+    Args:
+        base_addr: Timer peripheral base address
+        frequency: Desired timer frequency in Hz
+
+    Example:
+        # STM32 TIM2 at 0x40000000, 1MHz
+        timer_init(0x40000000, 1000000)
+    """
+    # Calculate prescaler: assumes 1 MHz system clock
+    val prescaler: u32 = (1000000 / frequency) - 1
+    mem_write_u32(base_addr + TIMER_PSC, prescaler)
+
+    # Set auto-reload to maximum range
+    mem_write_u32(base_addr + TIMER_ARR, 0xFFFFFFFF)
+
+    # Enable timer by setting bit 0 in CR1
+    val cr1 = mem_read_u32(base_addr + TIMER_CR1)
+    mem_write_u32(base_addr + TIMER_CR1, cr1 | 0x01)
+
+fn timer_read(base_addr: u32) -> u32:
+    """Read current timer counter value.
+
+    Returns:
+        Current counter value
+    """
+    mem_read_u32(base_addr + TIMER_CNT)
+
+fn timer_delay_ms(base_addr: u32, milliseconds: u32):
+    """Delay for specified milliseconds using timer.
+
+    Blocking busy-wait delay using timer counter.
+    Assumes 1 MHz tick rate after prescaler (1 tick = 1 us).
+
+    Args:
+        base_addr: Timer peripheral base address
+        milliseconds: Delay duration in milliseconds
+    """
+    val start = mem_read_u32(base_addr + TIMER_CNT)
+    # 1 ms = 1000 ticks at 1 MHz
+    val target_ticks: u32 = milliseconds * 1000
+    while true:
+        val current = mem_read_u32(base_addr + TIMER_CNT)
+        val elapsed = current - start
+        if elapsed >= target_ticks:
+            break
+
+fn timer_delay_us(base_addr: u32, microseconds: u32):
+    """Delay for specified microseconds using timer.
+
+    Blocking busy-wait delay using timer counter.
+    Assumes 1 MHz tick rate after prescaler (1 tick = 1 us).
+
+    Args:
+        base_addr: Timer peripheral base address
+        microseconds: Delay duration in microseconds
+    """
+    val start = mem_read_u32(base_addr + TIMER_CNT)
+    # At 1 MHz, 1 tick = 1 microsecond
+    val target_ticks: u32 = microseconds
+    while true:
+        val current = mem_read_u32(base_addr + TIMER_CNT)
+        val elapsed = current - start
+        if elapsed >= target_ticks:
+            break
+
+# ============================================================================
+# Debug Output Helpers
+# ============================================================================
+
+fn debug_putc(c: u8):
+    """Write single character to debug output.
+
+    Uses semihosting SYS_WRITEC to write a single character.
+    """
+    semi_host_call(SYS_WRITEC, c as u32)
+
+fn debug_puts(message: text):
+    """Write string to debug output.
+
+    Uses semihosting if available, otherwise UART.
+    """
+    semi_write_string(message)
+
+fn debug_printf_u32_to_dec(value: u32) -> text:
+    """Convert u32 to decimal string for debug_printf."""
+    if value == 0:
+        return "0"
+    var result = ""
+    var remaining = value
+    while remaining > 0:
+        val digit = remaining % 10
+        val hex_chars = "0123456789"
+        result = "{hex_chars[digit]}" + result
+        remaining = remaining / 10
+    result
+
+fn debug_printf_u32_to_hex(value: u32) -> text:
+    """Convert u32 to hexadecimal string for debug_printf."""
+    if value == 0:
+        return "0"
+    var result = ""
+    var remaining = value
+    while remaining > 0:
+        val nibble = remaining % 16
+        val hex_chars = "0123456789ABCDEF"
+        result = "{hex_chars[nibble]}" + result
+        remaining = remaining / 16
+    result
+
+fn debug_printf(format: text, args: [u32]):
+    """Formatted debug output (simple printf).
+
+    Supports: %d (decimal), %x (hex), %s (string), %c (char)
+
+    Args:
+        format: Format string with % specifiers
+        args: Array of u32 arguments consumed in order
+    """
+    val fmt_bytes = format.bytes()
+    val fmt_len = fmt_bytes.len()
+    var i = 0
+    var arg_idx = 0
+    while i < fmt_len:
+        val ch = fmt_bytes[i]
+        if ch == 0x25:
+            # '%' character — check next char for specifier
+            i = i + 1
+            if i < fmt_len:
+                val spec = fmt_bytes[i]
+                if spec == 0x64:
+                    # %d — decimal
+                    if arg_idx < args.len():
+                        semi_write_string(debug_printf_u32_to_dec(args[arg_idx]))
+                        arg_idx = arg_idx + 1
+                elif spec == 0x78:
+                    # %x — hexadecimal
+                    if arg_idx < args.len():
+                        semi_write_string(debug_printf_u32_to_hex(args[arg_idx]))
+                        arg_idx = arg_idx + 1
+                elif spec == 0x73:
+                    # %s — treat arg as string address, output placeholder
+                    if arg_idx < args.len():
+                        semi_write_string("<str@" + debug_printf_u32_to_hex(args[arg_idx]) + ">")
+                        arg_idx = arg_idx + 1
+                elif spec == 0x63:
+                    # %c — character
+                    if arg_idx < args.len():
+                        val char_byte = (args[arg_idx] & 0xFF) as u8
+                        debug_putc(char_byte)
+                        arg_idx = arg_idx + 1
+                elif spec == 0x25:
+                    # %% — literal percent
+                    debug_putc(0x25)
+        else:
+            # Regular character — output directly
+            debug_putc(ch)
+        i = i + 1
+
+# ============================================================================
+# Memory-Mapped I/O Helpers
+# ============================================================================
+
+extern fn rt_mmio_read_u32(addr: u64) -> u32
+extern fn rt_mmio_write_u32(addr: u64, value: u32)
+extern fn rt_mmio_read_u16(addr: u64) -> u16
+extern fn rt_mmio_write_u16(addr: u64, value: u16)
+extern fn rt_mmio_read_u8(addr: u64) -> u8
+extern fn rt_mmio_write_u8(addr: u64, value: u8)
+
+fn mem_read_u32(addr: u32) -> u32:
+    """Read 32-bit value from memory address (volatile)."""
+    rt_mmio_read_u32(addr.to_u64())
+
+fn mem_write_u32(addr: u32, value: u32):
+    """Write 32-bit value to memory address (volatile)."""
+    rt_mmio_write_u32(addr.to_u64(), value)
+
+fn mem_read_u16(addr: u32) -> u16:
+    """Read 16-bit value from memory address (volatile)."""
+    rt_mmio_read_u16(addr.to_u64())
+
+fn mem_write_u16(addr: u32, value: u16):
+    """Write 16-bit value to memory address (volatile)."""
+    rt_mmio_write_u16(addr.to_u64(), value)
+
+fn mem_read_u8(addr: u32) -> u8:
+    """Read 8-bit value from memory address (volatile)."""
+    rt_mmio_read_u8(addr.to_u64())
+
+fn mem_write_u8(addr: u32, value: u8):
+    """Write 8-bit value to memory address (volatile)."""
+    rt_mmio_write_u8(addr.to_u64(), value)
+
+fn mem_modify_bits(addr: u32, clear_mask: u32, set_mask: u32):
+    """Modify specific bits in memory register (read-modify-write).
+
+    Args:
+        addr: Register address
+        clear_mask: Bits to clear (1 = clear)
+        set_mask: Bits to set (1 = set)
+
+    Example:
+        # Set bit 5, clear bit 3
+        mem_modify_bits(0x40021000, 0x08, 0x20)
+    """
+    val value = mem_read_u32(addr)
+    val modified = (value & ~clear_mask) | set_mask
+    mem_write_u32(addr, modified)
+
+fn mem_set_bit(addr: u32, bit: u8):
+    """Set specific bit in memory register.
+
+    Args:
+        addr: Register address
+        bit: Bit number (0-31)
+    """
+    val mask: u32 = 1 << bit
+    val value = mem_read_u32(addr)
+    mem_write_u32(addr, value | mask)
+
+fn mem_clear_bit(addr: u32, bit: u8):
+    """Clear specific bit in memory register.
+
+    Args:
+        addr: Register address
+        bit: Bit number (0-31)
+    """
+    val mask: u32 = 1 << bit
+    val value = mem_read_u32(addr)
+    mem_write_u32(addr, value & ~mask)
+
+fn mem_test_bit(addr: u32, bit: u8) -> bool:
+    """Test if specific bit is set.
+
+    Args:
+        addr: Register address
+        bit: Bit number (0-31)
+
+    Returns:
+        true if bit is set, false otherwise
+    """
+    val mask: u32 = 1 << bit
+    val value = mem_read_u32(addr)
+    (value & mask) != 0

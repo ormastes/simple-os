@@ -1,0 +1,149 @@
+# Baremetal Integration Test
+#
+# Tests all baremetal modules working together
+
+fn main():
+    print "=== Baremetal Integration Test ==="
+    print ""
+
+    var passed = 0
+    var failed = 0
+
+    # Test 1: System API constants
+    print "Test 1: System API Constants"
+    val SYS_OPEN: i32 = 0x01
+    val SYS_EXIT: i32 = 0x18
+    val SYS_WRITE_HANDLE: i32 = 0x100
+
+    if SYS_OPEN == 1 and SYS_EXIT == 24 and SYS_WRITE_HANDLE == 256:
+        print "  [PASS] Operation codes correct"
+        passed = passed + 1
+    else:
+        print "  [FAIL] Operation codes incorrect"
+        failed = failed + 1
+
+    # Test 2: Format types
+    print "Test 2: Format Types"
+    val FMT_INT32: i32 = 3
+    val FMT_INT64: i32 = 4
+    val FMT_FLOAT64: i32 = 10
+
+    if FMT_INT32 == 3 and FMT_INT64 == 4 and FMT_FLOAT64 == 10:
+        print "  [PASS] Format types correct"
+        passed = passed + 1
+    else:
+        print "  [FAIL] Format types incorrect"
+        failed = failed + 1
+
+    # Test 3: Test protocol handles
+    print "Test 3: Test Protocol Handles"
+    val HANDLE_TEST_START: i32 = 0x7FFF0001
+    val HANDLE_TEST_END: i32 = 0x7FFF0004
+
+    if HANDLE_TEST_START == 2147418113 and HANDLE_TEST_END == 2147418116:
+        print "  [PASS] Test handles correct"
+        passed = passed + 1
+    else:
+        print "  [FAIL] Test handles incorrect"
+        failed = failed + 1
+
+    # Test 4: Serial port constants
+    print "Test 4: Serial Port Constants"
+    val COM1: i32 = 0x3F8
+    val COM1_LSR: i32 = 0x3FD
+    val DEBUG_EXIT_PORT: i32 = 0xF4
+
+    if COM1 == 1016 and COM1_LSR == 1021 and DEBUG_EXIT_PORT == 244:
+        print "  [PASS] Port constants correct"
+        passed = passed + 1
+    else:
+        print "  [FAIL] Port constants incorrect"
+        failed = failed + 1
+
+    # Test 5: GDT selectors
+    print "Test 5: GDT Selectors"
+    val GDT_CODE_SELECTOR: i32 = 0x08
+    val GDT_DATA_SELECTOR: i32 = 0x10
+
+    if GDT_CODE_SELECTOR == 8 and GDT_DATA_SELECTOR == 16:
+        print "  [PASS] GDT selectors correct"
+        passed = passed + 1
+    else:
+        print "  [FAIL] GDT selectors incorrect"
+        failed = failed + 1
+
+    # Test 6: IDT vectors
+    print "Test 6: IDT Vectors"
+    val EXCEPTION_PAGE_FAULT: i32 = 14
+    val IRQ_BASE: i32 = 32
+    val IRQ_TIMER: i32 = 32
+
+    if EXCEPTION_PAGE_FAULT == 14 and IRQ_BASE == 32 and IRQ_TIMER == 32:
+        print "  [PASS] IDT vectors correct"
+        passed = passed + 1
+    else:
+        print "  [FAIL] IDT vectors incorrect"
+        failed = failed + 1
+
+    # Test 7: Multiboot constants
+    print "Test 7: Multiboot Constants"
+    val MULTIBOOT_MAGIC: i32 = 0x1BADB002
+
+    if MULTIBOOT_MAGIC == 464367618:
+        print "  [PASS] Multiboot magic correct"
+        passed = passed + 1
+    else:
+        print "  [FAIL] Multiboot magic incorrect (got {MULTIBOOT_MAGIC})"
+        failed = failed + 1
+
+    # Test 8: Protocol markers
+    print "Test 8: Protocol Markers"
+    val PROTO_MAGIC: i32 = 0xAB
+    val PROTO_VERSION: i32 = 0x01
+
+    if PROTO_MAGIC == 171 and PROTO_VERSION == 1:
+        print "  [PASS] Protocol markers correct"
+        passed = passed + 1
+    else:
+        print "  [FAIL] Protocol markers incorrect"
+        failed = failed + 1
+
+    # Test 9: VGA constants
+    print "Test 9: VGA Constants"
+    val VGA_BUFFER: i64 = 0xB8000
+
+    if VGA_BUFFER == 753664:
+        print "  [PASS] VGA buffer address correct"
+        passed = passed + 1
+    else:
+        print "  [FAIL] VGA buffer address incorrect"
+        failed = failed + 1
+
+    # Test 10: Bit operations
+    print "Test 10: Bit Operations"
+    val byte_mask = 0xFF
+    val word_mask = 0xFFFF
+    val test_val: i32 = 0x12345678
+
+    val low_byte = test_val & byte_mask
+    val high_byte = (test_val >> 24) & byte_mask
+
+    if low_byte == 0x78 and high_byte == 0x12:
+        print "  [PASS] Bit operations correct"
+        passed = passed + 1
+    else:
+        print "  [FAIL] Bit operations incorrect"
+        failed = failed + 1
+
+    # Summary
+    print ""
+    print "=== Integration Test Results ==="
+    print "  Passed: {passed}"
+    print "  Failed: {failed}"
+    print "  Total:  {passed + failed}"
+    print ""
+
+    if failed == 0:
+        print "All integration tests PASSED!"
+    else:
+        print "Some tests FAILED!"

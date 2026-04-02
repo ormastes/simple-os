@@ -1,0 +1,145 @@
+# Standalone Test for system_api module
+# Tests that all 32-bit constants have correct values
+
+fn main():
+    print "=== Semihosting System API Test (32-bit values) ==="
+
+    # Test operation code values (matching system_api.spl)
+    val SYS_OPEN: i32 = 0x01
+    val SYS_CLOSE: i32 = 0x02
+    val SYS_WRITE: i32 = 0x05
+    val SYS_READ: i32 = 0x06
+    val SYS_EXIT: i32 = 0x18
+    val SYS_CLOCK: i32 = 0x10
+    val SYS_WRITE_HANDLE: i32 = 0x100
+
+    print ""
+    print "Testing operation codes:"
+    print "  SYS_OPEN = {SYS_OPEN} (expected: 1)"
+    print "  SYS_CLOSE = {SYS_CLOSE} (expected: 2)"
+    print "  SYS_WRITE = {SYS_WRITE} (expected: 5)"
+    print "  SYS_READ = {SYS_READ} (expected: 6)"
+    print "  SYS_EXIT = {SYS_EXIT} (expected: 24)"
+    print "  SYS_CLOCK = {SYS_CLOCK} (expected: 16)"
+    print "  SYS_WRITE_HANDLE = {SYS_WRITE_HANDLE} (expected: 256)"
+
+    # Test format type values
+    val FMT_NONE: i32 = 0
+    val FMT_INT32: i32 = 3
+    val FMT_INT64: i32 = 4
+    val FMT_FLOAT64: i32 = 10
+    val FMT_BOOL: i32 = 11
+
+    print ""
+    print "Testing format types:"
+    print "  FMT_NONE = {FMT_NONE} (expected: 0)"
+    print "  FMT_INT32 = {FMT_INT32} (expected: 3)"
+    print "  FMT_INT64 = {FMT_INT64} (expected: 4)"
+    print "  FMT_FLOAT64 = {FMT_FLOAT64} (expected: 10)"
+    print "  FMT_BOOL = {FMT_BOOL} (expected: 11)"
+
+    # Test mode values
+    val MODE_READ: i32 = 0
+    val MODE_WRITE: i32 = 4
+
+    print ""
+    print "Testing file modes:"
+    print "  MODE_READ = {MODE_READ} (expected: 0)"
+    print "  MODE_WRITE = {MODE_WRITE} (expected: 4)"
+
+    # Test handle values (high values to avoid collision)
+    val HANDLE_TEST_START: i32 = 0x7FFF0001
+    val HANDLE_TEST_PASS: i32 = 0x7FFF0002
+    val HANDLE_TEST_FAIL: i32 = 0x7FFF0003
+    val HANDLE_TEST_END: i32 = 0x7FFF0004
+
+    print ""
+    print "Testing test handles:"
+    print "  HANDLE_TEST_START = {HANDLE_TEST_START} (expected: 2147418113)"
+    print "  HANDLE_TEST_PASS = {HANDLE_TEST_PASS} (expected: 2147418114)"
+    print "  HANDLE_TEST_FAIL = {HANDLE_TEST_FAIL} (expected: 2147418115)"
+    print "  HANDLE_TEST_END = {HANDLE_TEST_END} (expected: 2147418116)"
+
+    # Verify values are correct
+    var passed = 0
+    var failed = 0
+
+    if SYS_OPEN == 1:
+        passed = passed + 1
+    else:
+        failed = failed + 1
+        print "FAIL: SYS_OPEN"
+
+    if SYS_CLOSE == 2:
+        passed = passed + 1
+    else:
+        failed = failed + 1
+        print "FAIL: SYS_CLOSE"
+
+    if SYS_WRITE == 5:
+        passed = passed + 1
+    else:
+        failed = failed + 1
+        print "FAIL: SYS_WRITE"
+
+    if SYS_READ == 6:
+        passed = passed + 1
+    else:
+        failed = failed + 1
+        print "FAIL: SYS_READ"
+
+    if SYS_EXIT == 24:
+        passed = passed + 1
+    else:
+        failed = failed + 1
+        print "FAIL: SYS_EXIT"
+
+    if SYS_CLOCK == 16:
+        passed = passed + 1
+    else:
+        failed = failed + 1
+        print "FAIL: SYS_CLOCK"
+
+    if SYS_WRITE_HANDLE == 256:
+        passed = passed + 1
+    else:
+        failed = failed + 1
+        print "FAIL: SYS_WRITE_HANDLE"
+
+    if FMT_INT32 == 3:
+        passed = passed + 1
+    else:
+        failed = failed + 1
+        print "FAIL: FMT_INT32"
+
+    if FMT_INT64 == 4:
+        passed = passed + 1
+    else:
+        failed = failed + 1
+        print "FAIL: FMT_INT64"
+
+    if FMT_FLOAT64 == 10:
+        passed = passed + 1
+    else:
+        failed = failed + 1
+        print "FAIL: FMT_FLOAT64"
+
+    if MODE_READ == 0:
+        passed = passed + 1
+    else:
+        failed = failed + 1
+        print "FAIL: MODE_READ"
+
+    if MODE_WRITE == 4:
+        passed = passed + 1
+    else:
+        failed = failed + 1
+        print "FAIL: MODE_WRITE"
+
+    print ""
+    print "=== Results: {passed} passed, {failed} failed ==="
+
+    if failed == 0:
+        print "All 32-bit constant tests passed!"
+    else:
+        print "Some tests failed!"

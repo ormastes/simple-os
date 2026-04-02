@@ -1,0 +1,143 @@
+@allow(primitive_api)
+# Mouse Cursor Renderer
+#
+# Renders a 12x19 arrow cursor bitmap onto the framebuffer.
+# Uses mask for black outline and bitmap for white fill.
+
+use os.drivers.framebuffer.fb_driver.{FramebufferDriver, Color}
+
+# ============================================================================
+# Cursor Constants
+# ============================================================================
+
+val CURSOR_WIDTH: i32 = 12
+val CURSOR_HEIGHT: i32 = 19
+
+# ============================================================================
+# Cursor State
+# ============================================================================
+
+struct CursorState:
+    """Tracks cursor position, visibility, and hotspot offset."""
+    x: i32
+    y: i32
+    visible: bool
+    hotspot_x: i32   # Click point offset from top-left
+    hotspot_y: i32
+
+fn default_cursor_state() -> CursorState:
+    """Create a default cursor state at (0, 0) with standard arrow hotspot."""
+    CursorState(
+        x: 0,
+        y: 0,
+        visible: true,
+        hotspot_x: 1,
+        hotspot_y: 1
+    )
+
+# ============================================================================
+# Cursor Bitmap — 12x19 Arrow
+# ============================================================================
+
+fn get_cursor_bitmap() -> [i64]:
+    """Get the white fill bitmap for the arrow cursor.
+
+    Each row is a 12-bit bitmask. MSB (bit 11) = leftmost pixel.
+    1 = white fill pixel.
+    """
+    [
+        0b100000000000,
+        0b110000000000,
+        0b111000000000,
+        0b111100000000,
+        0b111110000000,
+        0b111111000000,
+        0b111111100000,
+        0b111111110000,
+        0b111111111000,
+        0b111111111100,
+        0b111111000000,
+        0b110111000000,
+        0b100011100000,
+        0b000011100000,
+        0b000001110000,
+        0b000001110000,
+        0b000000111000,
+        0b000000111000,
+        0b000000000000
+    ]
+
+fn get_cursor_mask() -> [i64]:
+    """Get the outline mask for the arrow cursor.
+
+    Slightly larger than the bitmap to produce a 1px black border.
+    Pixels in mask but NOT in bitmap are drawn as black outline.
+    """
+    [
+        0b110000000000,
+        0b111000000000,
+        0b111100000000,
+        0b111110000000,
+        0b111111000000,
+        0b111111100000,
+        0b111111110000,
+        0b111111111000,
+        0b111111111100,
+        0b111111111110,
+        0b111111111110,
+        0b111111100000,
+        0b111011110000,
+        0b110011110000,
+        0b000001111000,
+        0b000001111000,
+        0b000000111100,
+        0b000000111100,
+        0b000000111100
+    ]
+
+# ============================================================================
+# Cursor Drawing
+# ============================================================================
+
+fn draw_cursor(fb: FramebufferDriver, screen_width: i32, screen_height: i32, cursor: CursorState):
+    """Draw the mouse cursor onto the framebuffer at the cursor position.
+
+    Uses mask for black outline, bitmap for white fill.
+    Clips to screen bounds. Drawn after all windows for topmost visibility.
+    """
+    if not cursor.visible:
+        return
+
+    val bitmap = get_cursor_bitmap()
+    val mask = get_cursor_mask()
+    val cx = cursor.x - cursor.hotspot_x
+    val cy = cursor.y - cursor.hotspot_y
+
+    val white = Color.white()
+    val black = Color.rgb(0, 0, 0)
+
+    var row: i32 = 0
+    while row < CURSOR_HEIGHT:
+        val py = cy + row
+        if py >= 0 and py < screen_height:
+            var col: i32 = 0
+            while col < CURSOR_WIDTH:
+                val px = cx + col
+                if px >= 0 and px < screen_width:
+                    val bit_shift = 11 - col
+                    val bit = 1 << bit_shift.to_i64()
+                    val mask_row = mask[row.to_i64()]
+                    val bitmap_row = bitmap[row.to_i64()]
+                    val mask_hit = (mask_row & bit) != 0
+                    if mask_hit:
+                        val bitmap_hit = (bitmap_row & bit) != 0
+                        val px_u32 = px.to_u32()
+                        val py_u32 = py.to_u32()
+                        if bitmap_hit:
+                            # White fill
+                            fb.fill_rect(px_u32, py_u32, 1, 1, white)
+                        else:
+                            # Black outline
+                            fb.fill_rect(px_u32, py_u32, 1, 1, black)
+                col = col + 1
+        row = row + 1

@@ -1,0 +1,83 @@
+# SimpleOS Test Runner — Multi-Architecture QEMU Tests
+#
+# Runs boot smoke tests on all 4 architectures.
+#
+# Usage:
+#   bin/simple run examples/simple_os/run_tests.spl
+#   bin/simple run examples/simple_os/run_tests.spl -- --arch=riscv64
+
+use os.qemu_runner.{get_target, arch_from_name, arch_display_name, build_os, test_os}
+use os.kernel.arch.arch_context.{Architecture}
+
+extern fn rt_args() -> [text]
+extern fn rt_process_run_timeout(cmd: text, args: [text], timeout_ms: i64) -> (text, text, i32)
+
+fn check_qemu_available(qemu_bin: text) -> bool:
+    val result = rt_process_run_timeout("which", [qemu_bin], 5000)
+    result[2] == 0
+
+fn main():
+    """Run SimpleOS QEMU tests for all or specified architectures."""
+    val args = rt_args()
+
+    var target_arch: text = "all"
+    for arg in args:
+        if arg.starts_with("--arch="):
+            target_arch = arg.substr(7)
+
+    val arches: [Architecture] = [
+        Architecture.Arm64,
+        Architecture.X86_64,
+        Architecture.Riscv32,
+        Architecture.Riscv64
+    ]
+
+    val timeout_ms: u64 = 15000
+
+    print "SimpleOS QEMU Test Suite"
+    print "========================"
+    print ""
+
+    var passed: u64 = 0
+    var failed: u64 = 0
+    var skipped: u64 = 0
+
+    for arch in arches:
+        val name = arch_display_name(arch)
+        if target_arch != "all" and target_arch != name:
+            continue
+
+        val target = get_target(arch)
+        print "--- {name} ---"
+
+        # Check QEMU
+        if not check_qemu_available(target.qemu_system):
+            print "  [SKIP] {target.qemu_system} not available"
+            skipped = skipped + 1
+            print ""
+            continue
+
+        # Build
+        print "  Building..."
+        val built = build_os(target)
+        if not built:
+            print "  [FAIL] Build failed"
+            failed = failed + 1
+            print ""
+            continue
+
+        # Test
+        print "  Running QEMU test (timeout: {timeout_ms}ms)..."
+        val ok = test_os(target, timeout_ms)
+        if ok:
+            print "  [PASS] {name} boot smoke test"
+            passed = passed + 1
+        else:
+            print "  [FAIL] {name} boot smoke test"
+            failed = failed + 1
+        print ""
+
+    print "========================"
+    print "Results: {passed} passed, {failed} failed, {skipped} skipped"
+
+main()

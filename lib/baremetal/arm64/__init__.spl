@@ -1,0 +1,8 @@
+# Re-exported from mod.spl
+export test_support
+
+# Re-exported from test_support.spl
+export ExceptionVector, create_vector_table, validate_vector_table
+export check_exception_level, check_vbar_alignment
+export check_stack_alignment, STACK_SIZE
+export EL3, EL2, EL1, EL0

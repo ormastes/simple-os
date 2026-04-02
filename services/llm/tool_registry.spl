@@ -1,0 +1,626 @@
+# MCP Tool Registry — OS Tool Definitions
+#
+# Registers all SimpleOS MCP tools with their schemas.
+# Uses the same JSON builder pattern as the existing MCP SDK
+# (std.nogc_async_mut.mcp.helpers_compat).
+#
+# Tools are grouped by category:
+#   File:    file_read, file_write, file_list, file_search
+#   Process: process_list, process_spawn, process_kill
+#   Window:  window_create, window_close, window_list, window_focus
+#   Widget:  widget_set, widget_read, widget_action
+#   Screen:  screenshot, screen_read_text
+#   System:  system_info, system_exec
+
+use std.nogc_async_mut.mcp.core.{ToolHandler, create_tool_handler}
+use std.nogc_async_mut.mcp.handler_registry.{register_tool_handler}
+
+# =========================================================================
+# JSON Helpers (inlined for isolation, same pattern as api_tools.spl)
+# =========================================================================
+
+fn _js(s: text) -> text:
+    "\"" + s + "\""
+
+fn _jp(key: text, value: text) -> text:
+    "\"" + key + "\":" + value
+
+fn _jo1(p1: text) -> text:
+    "{" + p1 + "}"
+
+fn _jo2(p1: text, p2: text) -> text:
+    "{" + p1 + "," + p2 + "}"
+
+fn _jo3(p1: text, p2: text, p3: text) -> text:
+    "{" + p1 + "," + p2 + "," + p3 + "}"
+
+fn _jo4(p1: text, p2: text, p3: text, p4: text) -> text:
+    "{" + p1 + "," + p2 + "," + p3 + "," + p4 + "}"
+
+# =========================================================================
+# Registration Entry Point
+# =========================================================================
+
+fn register_os_tools():
+    """Register all OS MCP tools with the handler registry.
+
+    Called during init service startup (service #5: LLM MCP server)."""
+    # File tools
+    register_tool_handler(create_tool_handler(
+        "file_read", "Read file contents from the OS filesystem",
+        schema_file_read(), "os.services.llm.mcp_os_server", "tool_file_read"
+    ))
+    register_tool_handler(create_tool_handler(
+        "file_write", "Write content to a file on the OS filesystem",
+        schema_file_write(), "os.services.llm.mcp_os_server", "tool_file_write"
+    ))
+    register_tool_handler(create_tool_handler(
+        "file_list", "List directory contents",
+        schema_file_list(), "os.services.llm.mcp_os_server", "tool_file_list"
+    ))
+    register_tool_handler(create_tool_handler(
+        "file_search", "Search files by name pattern",
+        schema_file_search(), "os.services.llm.mcp_os_server", "tool_file_search"
+    ))
+
+    # Process tools
+    register_tool_handler(create_tool_handler(
+        "process_list", "List running processes with PID, name, state, and CPU%",
+        schema_process_list(), "os.services.llm.mcp_os_server", "tool_process_list"
+    ))
+    register_tool_handler(create_tool_handler(
+        "process_spawn", "Spawn a new process from a binary path",
+        schema_process_spawn(), "os.services.llm.mcp_os_server", "tool_process_spawn"
+    ))
+    register_tool_handler(create_tool_handler(
+        "process_kill", "Kill a running process by PID",
+        schema_process_kill(), "os.services.llm.mcp_os_server", "tool_process_kill"
+    ))
+
+    # Window tools
+    register_tool_handler(create_tool_handler(
+        "window_create", "Create a new window with title and dimensions",
+        schema_window_create(), "os.services.llm.mcp_os_server", "tool_window_create"
+    ))
+    register_tool_handler(create_tool_handler(
+        "window_close", "Close a window by ID",
+        schema_window_close(), "os.services.llm.mcp_os_server", "tool_window_close"
+    ))
+    register_tool_handler(create_tool_handler(
+        "window_list", "List all open windows with ID, title, size, and focus state",
+        schema_window_list(), "os.services.llm.mcp_os_server", "tool_window_list"
+    ))
+    register_tool_handler(create_tool_handler(
+        "window_focus", "Focus a window by ID",
+        schema_window_focus(), "os.services.llm.mcp_os_server", "tool_window_focus"
+    ))
+
+    # Widget tools (LLM-friendly GUI)
+    register_tool_handler(create_tool_handler(
+        "widget_set", "Set window contents using widget DSL. Renders to both GUI and CLI.",
+        schema_widget_set(), "os.services.llm.mcp_os_server", "tool_widget_set"
+    ))
+    register_tool_handler(create_tool_handler(
+        "widget_read", "Read current widget tree as text description. LLM can inspect UI state.",
+        schema_widget_read(), "os.services.llm.mcp_os_server", "tool_widget_read"
+    ))
+    register_tool_handler(create_tool_handler(
+        "widget_action", "Trigger a UI action (button click, menu select) on a window",
+        schema_widget_action(), "os.services.llm.mcp_os_server", "tool_widget_action"
+    ))
+
+    # Screen tools
+    register_tool_handler(create_tool_handler(
+        "screenshot", "Get text description of entire screen: windows, positions, widget summaries",
+        schema_screenshot(), "os.services.llm.mcp_os_server", "tool_screenshot"
+    ))
+    register_tool_handler(create_tool_handler(
+        "screen_read_text", "Extract all visible text from screen (accessibility)",
+        schema_screen_read_text(), "os.services.llm.mcp_os_server", "tool_screen_read_text"
+    ))
+
+    # System tools
+    register_tool_handler(create_tool_handler(
+        "system_info", "Get system information: memory, CPU, uptime, hostname",
+        schema_system_info(), "os.services.llm.mcp_os_server", "tool_system_info"
+    ))
+    register_tool_handler(create_tool_handler(
+        "system_exec", "Execute a shell command and return output",
+        schema_system_exec(), "os.services.llm.mcp_os_server", "tool_system_exec"
+    ))
+
+# =========================================================================
+# Tool Schemas — File Tools
+# =========================================================================
+
+fn schema_file_read() -> text:
+    """Schema for file_read tool."""
+    val p_path = _jo2(
+        _jp("type", _js("string")),
+        _jp("description", _js("Absolute path to the file to read"))
+    )
+    val props = _jo1(_jp("path", p_path))
+    val required = "[" + _js("path") + "]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "true"),
+        _jp("destructiveHint", "false"),
+        _jp("idempotentHint", "true")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("file_read"))
+    result = result + "," + _jp("description", _js("Read file contents from the OS filesystem"))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result
+
+fn schema_file_write() -> text:
+    """Schema for file_write tool."""
+    val p_path = _jo2(
+        _jp("type", _js("string")),
+        _jp("description", _js("Absolute path to the file to write"))
+    )
+    val p_content = _jo2(
+        _jp("type", _js("string")),
+        _jp("description", _js("Content to write to the file"))
+    )
+    val props = "{" + _jp("path", p_path) + "," + _jp("content", p_content) + "}"
+    val required = "[" + _js("path") + "," + _js("content") + "]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "false"),
+        _jp("destructiveHint", "true"),
+        _jp("idempotentHint", "false")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("file_write"))
+    result = result + "," + _jp("description", _js("Write content to a file on the OS filesystem"))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result
+
+fn schema_file_list() -> text:
+    """Schema for file_list tool."""
+    val p_path = _jo2(
+        _jp("type", _js("string")),
+        _jp("description", _js("Directory path to list"))
+    )
+    val props = _jo1(_jp("path", p_path))
+    val required = "[" + _js("path") + "]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "true"),
+        _jp("destructiveHint", "false"),
+        _jp("idempotentHint", "true")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("file_list"))
+    result = result + "," + _jp("description", _js("List directory contents"))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result
+
+fn schema_file_search() -> text:
+    """Schema for file_search tool."""
+    val p_path = _jo2(
+        _jp("type", _js("string")),
+        _jp("description", _js("Directory path to search in"))
+    )
+    val p_pattern = _jo2(
+        _jp("type", _js("string")),
+        _jp("description", _js("Filename pattern to match (substring)"))
+    )
+    val props = "{" + _jp("path", p_path) + "," + _jp("pattern", p_pattern) + "}"
+    val required = "[" + _js("path") + "," + _js("pattern") + "]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "true"),
+        _jp("destructiveHint", "false"),
+        _jp("idempotentHint", "true")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("file_search"))
+    result = result + "," + _jp("description", _js("Search files by name pattern in a directory"))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result
+
+# =========================================================================
+# Tool Schemas — Process Tools
+# =========================================================================
+
+fn schema_process_list() -> text:
+    """Schema for process_list tool."""
+    val props = "{}"
+    val required = "[]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "true"),
+        _jp("destructiveHint", "false"),
+        _jp("idempotentHint", "true")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("process_list"))
+    result = result + "," + _jp("description", _js("List running processes with PID, name, state, and CPU%"))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result
+
+fn schema_process_spawn() -> text:
+    """Schema for process_spawn tool."""
+    val p_binary = _jo2(
+        _jp("type", _js("string")),
+        _jp("description", _js("Path to the binary to execute"))
+    )
+    val props = _jo1(_jp("binary", p_binary))
+    val required = "[" + _js("binary") + "]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "false"),
+        _jp("destructiveHint", "false"),
+        _jp("idempotentHint", "false")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("process_spawn"))
+    result = result + "," + _jp("description", _js("Spawn a new process from a binary path"))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result
+
+fn schema_process_kill() -> text:
+    """Schema for process_kill tool."""
+    val p_pid = _jo2(
+        _jp("type", _js("number")),
+        _jp("description", _js("PID of the process to kill"))
+    )
+    val props = _jo1(_jp("pid", p_pid))
+    val required = "[" + _js("pid") + "]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "false"),
+        _jp("destructiveHint", "true"),
+        _jp("idempotentHint", "true")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("process_kill"))
+    result = result + "," + _jp("description", _js("Kill a running process by PID"))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result
+
+# =========================================================================
+# Tool Schemas — Window Tools
+# =========================================================================
+
+fn schema_window_create() -> text:
+    """Schema for window_create tool."""
+    val p_title = _jo2(
+        _jp("type", _js("string")),
+        _jp("description", _js("Window title"))
+    )
+    val p_width = _jo2(
+        _jp("type", _js("number")),
+        _jp("description", _js("Window width in pixels"))
+    )
+    val p_height = _jo2(
+        _jp("type", _js("number")),
+        _jp("description", _js("Window height in pixels"))
+    )
+    val props = "{" + _jp("title", p_title) + "," + _jp("width", p_width) + "," + _jp("height", p_height) + "}"
+    val required = "[" + _js("title") + "]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "false"),
+        _jp("destructiveHint", "false"),
+        _jp("idempotentHint", "false")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("window_create"))
+    result = result + "," + _jp("description", _js("Create a new window with title and dimensions"))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result
+
+fn schema_window_close() -> text:
+    """Schema for window_close tool."""
+    val p_id = _jo2(
+        _jp("type", _js("number")),
+        _jp("description", _js("Window ID to close"))
+    )
+    val props = _jo1(_jp("id", p_id))
+    val required = "[" + _js("id") + "]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "false"),
+        _jp("destructiveHint", "true"),
+        _jp("idempotentHint", "true")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("window_close"))
+    result = result + "," + _jp("description", _js("Close a window by ID"))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result
+
+fn schema_window_list() -> text:
+    """Schema for window_list tool."""
+    val props = "{}"
+    val required = "[]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "true"),
+        _jp("destructiveHint", "false"),
+        _jp("idempotentHint", "true")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("window_list"))
+    result = result + "," + _jp("description", _js("List all open windows with ID, title, size, and focus state"))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result
+
+fn schema_window_focus() -> text:
+    """Schema for window_focus tool."""
+    val p_id = _jo2(
+        _jp("type", _js("number")),
+        _jp("description", _js("Window ID to focus"))
+    )
+    val props = _jo1(_jp("id", p_id))
+    val required = "[" + _js("id") + "]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "false"),
+        _jp("destructiveHint", "false"),
+        _jp("idempotentHint", "true")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("window_focus"))
+    result = result + "," + _jp("description", _js("Focus a window by ID"))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result
+
+# =========================================================================
+# Tool Schemas — Widget Tools
+# =========================================================================
+
+fn schema_widget_set() -> text:
+    """Schema for widget_set tool."""
+    val p_wid = _jo2(
+        _jp("type", _js("number")),
+        _jp("description", _js("Window ID to set widget tree for"))
+    )
+    val p_dsl = _jo2(
+        _jp("type", _js("string")),
+        _jp("description", _js("Widget DSL string. Indentation-based format: column:/row:/panel(title: ...) with text(), button(), progress(), table(), etc."))
+    )
+    val props = "{" + _jp("window_id", p_wid) + "," + _jp("widget_dsl", p_dsl) + "}"
+    val required = "[" + _js("window_id") + "," + _js("widget_dsl") + "]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "false"),
+        _jp("destructiveHint", "false"),
+        _jp("idempotentHint", "true")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("widget_set"))
+    result = result + "," + _jp("description", _js("Set window contents using widget DSL. Renders to both GUI and CLI. The DSL supports: column, row, panel, text, label, button, input, progress, table, statusbar, list, checkbox, divider, image, heading."))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result
+
+fn schema_widget_read() -> text:
+    """Schema for widget_read tool."""
+    val p_wid = _jo2(
+        _jp("type", _js("number")),
+        _jp("description", _js("Window ID to read widget tree from"))
+    )
+    val props = _jo1(_jp("window_id", p_wid))
+    val required = "[" + _js("window_id") + "]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "true"),
+        _jp("destructiveHint", "false"),
+        _jp("idempotentHint", "true")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("widget_read"))
+    result = result + "," + _jp("description", _js("Read current widget tree as text description. LLM can inspect UI state to understand what the user sees."))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result
+
+fn schema_widget_action() -> text:
+    """Schema for widget_action tool."""
+    val p_wid = _jo2(
+        _jp("type", _js("number")),
+        _jp("description", _js("Window ID"))
+    )
+    val p_action = _jo2(
+        _jp("type", _js("string")),
+        _jp("description", _js("Action name to trigger (matches button action property)"))
+    )
+    val props = "{" + _jp("window_id", p_wid) + "," + _jp("action", p_action) + "}"
+    val required = "[" + _js("window_id") + "," + _js("action") + "]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "false"),
+        _jp("destructiveHint", "false"),
+        _jp("idempotentHint", "false")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("widget_action"))
+    result = result + "," + _jp("description", _js("Trigger a UI action on a window (button click, menu select)"))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result
+
+# =========================================================================
+# Tool Schemas — Screen Tools
+# =========================================================================
+
+fn schema_screenshot() -> text:
+    """Schema for screenshot tool."""
+    val props = "{}"
+    val required = "[]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "true"),
+        _jp("destructiveHint", "false"),
+        _jp("idempotentHint", "true")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("screenshot"))
+    result = result + "," + _jp("description", _js("Get text description of entire screen state: all windows, positions, and widget tree summaries"))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result
+
+fn schema_screen_read_text() -> text:
+    """Schema for screen_read_text tool."""
+    val props = "{}"
+    val required = "[]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "true"),
+        _jp("destructiveHint", "false"),
+        _jp("idempotentHint", "true")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("screen_read_text"))
+    result = result + "," + _jp("description", _js("Extract all visible text from screen for accessibility or LLM reading"))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result
+
+# =========================================================================
+# Tool Schemas — System Tools
+# =========================================================================
+
+fn schema_system_info() -> text:
+    """Schema for system_info tool."""
+    val props = "{}"
+    val required = "[]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "true"),
+        _jp("destructiveHint", "false"),
+        _jp("idempotentHint", "true")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("system_info"))
+    result = result + "," + _jp("description", _js("Get system information: hostname, uptime, process count, window count"))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result
+
+fn schema_system_exec() -> text:
+    """Schema for system_exec tool."""
+    val p_cmd = _jo2(
+        _jp("type", _js("string")),
+        _jp("description", _js("Shell command to execute"))
+    )
+    val props = _jo1(_jp("command", p_cmd))
+    val required = "[" + _js("command") + "]"
+    val schema = _jo3(
+        _jp("type", _js("object")),
+        _jp("properties", props),
+        _jp("required", required)
+    )
+    val annot = _jo3(
+        _jp("readOnlyHint", "false"),
+        _jp("destructiveHint", "true"),
+        _jp("idempotentHint", "false")
+    )
+    var result = "{"
+    result = result + _jp("name", _js("system_exec"))
+    result = result + "," + _jp("description", _js("Execute a shell command and return output"))
+    result = result + "," + _jp("inputSchema", schema)
+    result = result + "," + _jp("annotations", annot)
+    result = result + "}"
+    return result

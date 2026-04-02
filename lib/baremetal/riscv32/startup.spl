@@ -1,0 +1,394 @@
+# RISC-V 32-bit Machine Mode Startup Code
+#
+# Boot entry point and trap handling for bare-metal RV32IM systems.
+# Adapted from baremetal/riscv/startup.spl for 32-bit targets.
+#
+# Key differences from 64-bit:
+#   - All registers are 32-bit (u32 instead of u64)
+#   - Uses lw/sw instead of ld/sd
+#   - Trap frame offsets are 4 bytes apart (not 8)
+#   - CAUSE_INTERRUPT_BIT is bit 31 (0x80000000) not bit 63
+#   - Stack frame sizes adjusted for 32-bit
+#
+# Tested on:
+#   - QEMU virt machine (RV32)
+#
+# Memory Layout (QEMU virt):
+#   0x80000000 - RAM base (128MB default)
+#   0x0C000000 - PLIC (Platform-Level Interrupt Controller)
+#   0x10000000 - UART0
+
+
+# Memory configuration
+val RAM_BASE: u32 = 0x80000000
+val RAM_SIZE: u32 = 128 * 1024 * 1024  # 128MB
+val STACK_SIZE: u32 = 65536  # 64KB per hart
+
+# MMIO device addresses (QEMU virt)
+val UART_BASE: u32 = 0x10000000
+val PLIC_BASE: u32 = 0x0C000000
+
+# CSR addresses
+val CSR_MSTATUS: u32 = 0x300
+val CSR_MISA: u32 = 0x301
+val CSR_MIE: u32 = 0x304
+val CSR_MTVEC: u32 = 0x305
+val CSR_MSCRATCH: u32 = 0x340
+val CSR_MEPC: u32 = 0x341
+val CSR_MCAUSE: u32 = 0x342
+val CSR_MTVAL: u32 = 0x343
+val CSR_MIP: u32 = 0x344
+val CSR_MHARTID: u32 = 0xF14
+
+# Exception/Interrupt codes (RV32: bit 31 is interrupt flag)
+val CAUSE_INTERRUPT_BIT: u32 = 0x80000000
+val CAUSE_M_SOFTWARE: u32 = CAUSE_INTERRUPT_BIT | 3
+val CAUSE_M_TIMER: u32 = CAUSE_INTERRUPT_BIT | 7
+val CAUSE_M_EXTERNAL: u32 = CAUSE_INTERRUPT_BIT | 11
+
+# MSTATUS bits
+val MSTATUS_MIE: u32 = 0x08   # Machine Interrupt Enable
+val MSTATUS_MPIE: u32 = 0x80  # Machine Previous Interrupt Enable
+
+# MIE bits
+val MIE_MSIE: u32 = 0x08   # Machine Software Interrupt Enable
+val MIE_MTIE: u32 = 0x80   # Machine Timer Interrupt Enable
+val MIE_MEIE: u32 = 0x800  # Machine External Interrupt Enable
+
+# Stack allocation (per-hart)
+# @align(16)
+var stack_buffer: [u8; STACK_SIZE * 4]  # Support up to 4 harts
+
+# Trap frame save area (per-hart)
+# @align(16)
+var trap_frames: [TrapFrame32; 4]
+
+# Trap frame structure (32-bit registers)
+# @repr(C)
+struct TrapFrame32:
+    """Saved register state during trap (RV32 - 32-bit registers)."""
+    x1: u32    # ra
+    x2: u32    # sp
+    x3: u32    # gp
+    x4: u32    # tp
+    x5: u32    # t0
+    x6: u32    # t1
+    x7: u32    # t2
+    x8: u32    # s0/fp
+    x9: u32    # s1
+    x10: u32   # a0
+    x11: u32   # a1
+    x12: u32   # a2
+    x13: u32   # a3
+    x14: u32   # a4
+    x15: u32   # a5
+    x16: u32   # a6
+    x17: u32   # a7
+    x18: u32   # s2
+    x19: u32   # s3
+    x20: u32   # s4
+    x21: u32   # s5
+    x22: u32   # s6
+    x23: u32   # s7
+    x24: u32   # s8
+    x25: u32   # s9
+    x26: u32   # s10
+    x27: u32   # s11
+    x28: u32   # t3
+    x29: u32   # t4
+    x30: u32   # t5
+    x31: u32   # t6
+    mepc: u32
+    mstatus: u32
+
+# Entry point - loaded at 0x80000000 by bootloader
+# @entry
+# @naked
+# @noreturn
+fn _start():
+    """RISC-V 32-bit machine mode entry point."""
+    unsafe:
+        asm volatile:
+            # Disable interrupts during setup
+            "csrw mie, zero"
+
+            # Read hart ID
+            "csrr t0, mhartid"
+
+            # Only hart 0 initializes, others wait
+            "bnez t0, .Lwait_for_init"
+
+            # Hart 0: Set up stack (32-bit address calculation)
+            "la sp, stack_buffer"
+            "li t1, {stack_size}"
+            "add sp, sp, t1"
+
+            # Set up trap vector
+            "la t0, trap_vector"
+            "csrw mtvec, t0"
+
+            # Enable interrupts in mstatus
+            "li t0, {mstatus_mie}"
+            "csrs mstatus, t0"
+
+            # Enable machine external, timer, and software interrupts
+            "li t0, {mie_all}"
+            "csrw mie, t0"
+
+            # Call main
+            "call {main}"
+
+            # If main returns, park this hart
+            "j .Lpark"
+
+            # Secondary harts wait here
+            ".Lwait_for_init:"
+            "wfi"
+            "j .Lwait_for_init"
+
+            # Park hart (low-power wait)
+            ".Lpark:"
+            "wfi"
+            "j .Lpark"
+
+            in(reg) STACK_SIZE
+            in(reg) MSTATUS_MIE
+            in(reg) MIE_MSIE | MIE_MTIE | MIE_MEIE
+            in(reg) main as u32
+
+# Trap vector - aligned to 4 bytes
+# @align(4)
+# @naked
+fn trap_vector():
+    """Trap vector entry point - saves context and dispatches (RV32)."""
+    unsafe:
+        asm volatile:
+            # Save context to trap frame
+            # Use mscratch to get trap frame pointer
+            "csrrw sp, mscratch, sp"  # Swap sp with mscratch
+
+            # Save all registers (using sw for 32-bit stores)
+            "sw x1, 0(sp)"
+            "sw x2, 4(sp)"
+            "sw x3, 8(sp)"
+            "sw x4, 12(sp)"
+            "sw x5, 16(sp)"
+            "sw x6, 20(sp)"
+            "sw x7, 24(sp)"
+            "sw x8, 28(sp)"
+            "sw x9, 32(sp)"
+            "sw x10, 36(sp)"
+            "sw x11, 40(sp)"
+            "sw x12, 44(sp)"
+            "sw x13, 48(sp)"
+            "sw x14, 52(sp)"
+            "sw x15, 56(sp)"
+            "sw x16, 60(sp)"
+            "sw x17, 64(sp)"
+            "sw x18, 68(sp)"
+            "sw x19, 72(sp)"
+            "sw x20, 76(sp)"
+            "sw x21, 80(sp)"
+            "sw x22, 84(sp)"
+            "sw x23, 88(sp)"
+            "sw x24, 92(sp)"
+            "sw x25, 96(sp)"
+            "sw x26, 100(sp)"
+            "sw x27, 104(sp)"
+            "sw x28, 108(sp)"
+            "sw x29, 112(sp)"
+            "sw x30, 116(sp)"
+            "sw x31, 120(sp)"
+
+            # Save mepc and mstatus
+            "csrr t0, mepc"
+            "sw t0, 124(sp)"
+            "csrr t0, mstatus"
+            "sw t0, 128(sp)"
+
+            # Call trap handler
+            "mv a0, sp"  # Pass trap frame pointer
+            "call {handler}"
+
+            # Restore mepc and mstatus
+            "lw t0, 124(sp)"
+            "csrw mepc, t0"
+            "lw t0, 128(sp)"
+            "csrw mstatus, t0"
+
+            # Restore all registers (using lw for 32-bit loads)
+            "lw x1, 0(sp)"
+            "lw x3, 8(sp)"
+            "lw x4, 12(sp)"
+            "lw x5, 16(sp)"
+            "lw x6, 20(sp)"
+            "lw x7, 24(sp)"
+            "lw x8, 28(sp)"
+            "lw x9, 32(sp)"
+            "lw x10, 36(sp)"
+            "lw x11, 40(sp)"
+            "lw x12, 44(sp)"
+            "lw x13, 48(sp)"
+            "lw x14, 52(sp)"
+            "lw x15, 56(sp)"
+            "lw x16, 60(sp)"
+            "lw x17, 64(sp)"
+            "lw x18, 68(sp)"
+            "lw x19, 72(sp)"
+            "lw x20, 76(sp)"
+            "lw x21, 80(sp)"
+            "lw x22, 84(sp)"
+            "lw x23, 88(sp)"
+            "lw x24, 92(sp)"
+            "lw x25, 96(sp)"
+            "lw x26, 100(sp)"
+            "lw x27, 104(sp)"
+            "lw x28, 108(sp)"
+            "lw x29, 112(sp)"
+            "lw x30, 116(sp)"
+            "lw x31, 120(sp)"
+
+            # Restore original sp
+            "csrrw sp, mscratch, sp"
+
+            # Return from trap
+            "mret"
+
+            in(reg) machine_trap_handler as u32
+
+# Machine trap handler - dispatches based on mcause
+fn machine_trap_handler(frame: ptr<TrapFrame32>):
+    """Handle machine-mode trap (exception or interrupt) on RV32."""
+    unsafe:
+        # Read trap cause
+        var mcause: u32
+        asm volatile:
+            "csrr {0}, mcause"
+            out(reg) mcause
+
+        if mcause & CAUSE_INTERRUPT_BIT:
+            # Interrupt (bit 31 set on RV32)
+            val interrupt_code = mcause & 0x7FFFFFFF
+            handle_interrupt_code(interrupt_code, frame)
+        else:
+            # Exception
+            val exception_code = mcause
+            handle_exception(exception_code, frame)
+
+# Handle interrupt
+fn handle_interrupt_code(code: u32, frame: ptr<TrapFrame32>):
+    """Dispatch interrupt to handler."""
+    match code:
+        case 3:  # M-mode software interrupt
+            handle_software_interrupt()
+
+        case 7:  # M-mode timer interrupt
+            handle_timer_interrupt()
+
+        case 11:  # M-mode external interrupt
+            handle_external_interrupt()
+
+        case _:
+            # Unknown interrupt
+            print "[TRAP] Unknown interrupt: {code}"
+
+# Handle exception
+fn handle_exception(code: u32, frame: ptr<TrapFrame32>):
+    """Handle synchronous exception on RV32."""
+    unsafe:
+        var mepc: u32
+        var mtval: u32
+        asm volatile:
+            "csrr {0}, mepc"
+            "csrr {1}, mtval"
+            out(reg) mepc
+            out(reg) mtval
+
+        print "[EXCEPTION] Code {code} at PC 0x{mepc:x}, tval=0x{mtval:x}"
+
+        # Hang on exception
+        loop:
+            asm volatile: "wfi"
+
+# Interrupt handlers
+
+fn handle_software_interrupt():
+    """Handle software interrupt (IPI)."""
+    # Clear software interrupt pending bit
+    unsafe:
+        asm volatile:
+            "csrc mip, {msie}"
+            in(reg) MIE_MSIE
+
+fn handle_timer_interrupt():
+    """Handle timer interrupt."""
+    # Clear timer interrupt by setting mtimecmp
+    # (QEMU: mtimecmp at 0x2004000 + hartid*8)
+    pass
+
+fn handle_external_interrupt():
+    """Handle external interrupt via PLIC."""
+    # Read PLIC claim register
+    pass
+
+# Main entry point - override this
+fn main():
+    """Default main function for RV32 bare-metal."""
+    # Get hart ID
+    var hart_id: u32
+    unsafe:
+        asm volatile:
+            "csrr {0}, mhartid"
+            out(reg) hart_id
+
+    if hart_id == 0:
+        # Primary hart
+        print "[BOOT] Hart 0 starting (RV32IM)..."
+
+        # Initialize UART
+        uart_init()
+
+        print "[KERNEL] RISC-V 32-bit bare-metal kernel started"
+
+    # Park in low-power loop
+    loop:
+        unsafe:
+            asm volatile: "wfi"
+
+# UART driver (simple polling mode)
+
+fn uart_init():
+    """Initialize UART0 (16550-compatible)."""
+    # Disable interrupts
+    uart_write_reg(1, 0x00)
+
+    # Set baud rate (divisor latch)
+    uart_write_reg(3, 0x80)  # Enable DLAB
+    uart_write_reg(0, 0x03)  # Divisor LSB (38400 baud)
+    uart_write_reg(1, 0x00)  # Divisor MSB
+    uart_write_reg(3, 0x03)  # 8N1, disable DLAB
+
+fn uart_write_reg(offset: u32, value: u8):
+    """Write to UART register."""
+    unsafe:
+        val addr = @address(UART_BASE + offset) @volatile var: u8
+        addr = value
+
+fn uart_read_reg(offset: u32) -> u8:
+    """Read from UART register."""
+    unsafe:
+        val addr = @address(UART_BASE + offset) @volatile val: u8
+        addr
+
+fn uart_putc(c: u8):
+    """Write character to UART."""
+    # Wait for transmitter holding register empty
+    while (uart_read_reg(5) & 0x20) == 0:
+        pass
+
+    uart_write_reg(0, c)
+
+fn uart_puts(s: text):
+    """Write string to UART."""
+    for c in s:
+        uart_putc(c as u8)

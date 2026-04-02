@@ -1,0 +1,177 @@
+# ARM64 Context Switch — Register Save/Restore
+#
+# Implements context switching for AArch64. Context saving/restoring
+# involves the following register groups:
+#
+#   General purpose: x0-x30 (31 registers, 64-bit each)
+#   Stack pointer:   SP_EL1 (or SP_EL0 depending on SPSel)
+#   Saved PC:        ELR_EL1 (Exception Link Register)
+#   Saved PSTATE:    SPSR_EL1 (Saved Program Status Register)
+#
+# AArch64 calling convention (AAPCS64):
+#   x0-x7:   Arguments / return values (caller-saved)
+#   x8:      Indirect result location (caller-saved)
+#   x9-x15:  Temporary (caller-saved)
+#   x16-x17: Intra-procedure call (linker scratch, caller-saved)
+#   x18:     Platform register (reserved, varies by OS)
+#   x19-x28: Callee-saved
+#   x29:     Frame pointer (callee-saved)
+#   x30:     Link register (LR, return address)
+#   SP:      Stack pointer (16-byte aligned)
+#
+# For context switch we save ALL registers (x0-x30) plus SP, ELR_EL1,
+# and SPSR_EL1 because we need to fully restore interrupt contexts,
+# not just voluntary switches.
+#
+# SPSR_EL1 initial value for new tasks:
+#   0x3C5 = EL1h mode (SP_EL1), DAIF all masked
+#   Bits: M[4:0]=0b00101 (EL1h), D=1, A=1, I=1, F=1
+
+use os.kernel.arch.arch_context.{Arm64Context, ArchContext}
+use os.kernel.arch.arm64.console.{uart_writeln}
+
+# ============================================================================
+# SPSR Constants
+# ============================================================================
+
+# SPSR_EL1 value for new kernel tasks:
+# M[4:0] = 0b00101 = EL1h (use SP_EL1)
+# D = 1, A = 1, I = 1, F = 1 (all exceptions masked initially)
+val SPSR_EL1H_DAIF_MASKED: u64 = 0x3C5
+
+# SPSR_EL1 value for new user tasks:
+# M[4:0] = 0b00000 = EL0t (use SP_EL0)
+# D = 0, A = 0, I = 0, F = 0 (no exceptions masked)
+val SPSR_EL0T: u64 = 0x000
+
+# ============================================================================
+# Context Save/Restore (extern — implemented in assembly)
+# ============================================================================
+
+extern fn rt_arm64_context_save(ctx_ptr: u64)
+extern fn rt_arm64_context_restore(ctx_ptr: u64)
+extern fn rt_arm64_context_switch(from_ptr: u64, to_ptr: u64)
+
+# ============================================================================
+# Arm64ContextSwitch
+# ============================================================================
+
+struct Arm64ContextSwitch:
+    """ARM64 context switching implementation.
+
+    Provides save/restore/init operations for AArch64 register state.
+    The actual register manipulation is done in assembly via extern
+    functions — this struct provides the Simple-level interface.
+
+    Named Arm64ContextSwitch (not Arm64Context) to avoid collision
+    with the Arm64Context register state struct in arch_context.spl.
+    """
+    pass_dn
+
+impl Arm64ContextSwitch:
+    fn init():
+        """Initialize context switching subsystem."""
+        uart_writeln("[CTX] ARM64 context switch initialized")
+
+    fn create_kernel(entry_point: u64, stack_top: u64) -> Arm64Context:
+        """Create a new kernel-mode context.
+
+        Sets up register state so that when restored:
+        - Execution begins at entry_point (via ELR_EL1)
+        - Stack is at stack_top (SP)
+        - Running in EL1h mode with DAIF masked
+        - x0 = 0 (no argument)
+        """
+        _create_context(entry_point, stack_top, 0, SPSR_EL1H_DAIF_MASKED)
+
+    fn create_kernel_with_arg(entry_point: u64, stack_top: u64, arg: u64) -> Arm64Context:
+        """Create a new kernel-mode context with an argument in x0."""
+        _create_context(entry_point, stack_top, arg, SPSR_EL1H_DAIF_MASKED)
+
+    fn create_user(entry_point: u64, stack_top: u64) -> Arm64Context:
+        """Create a new user-mode context.
+
+        Sets up register state for EL0 execution.
+        """
+        _create_context(entry_point, stack_top, 0, SPSR_EL0T)
+
+    fn create(entry_point: u64, stack_top: u64, user_mode: bool) -> Arm64Context:
+        """Create a new context (kernel or user mode)."""
+        if user_mode:
+            self.create_user(entry_point, stack_top)
+        else:
+            self.create_kernel(entry_point, stack_top)
+
+    fn switch(from_ctx: Arm64Context, to_ctx: Arm64Context):
+        """Switch from one context to another.
+
+        Saves current register state into from_ctx, loads to_ctx.
+        Implemented in assembly — performs STP/LDP of all registers
+        and ERET to restore the target context.
+        """
+        pass_todo("assembly: save x0-x30,SP,ELR,SPSR to from_ctx; load from to_ctx; ERET")
+
+    fn save_current() -> Arm64Context:
+        """Save the current CPU register state and return it."""
+        pass_todo("assembly: read all registers into Arm64Context")
+
+    fn restore(ctx: Arm64Context):
+        """Restore a previously saved CPU register state.
+
+        Loads all registers from ctx and executes ERET to return
+        to the saved PC (ELR_EL1) with saved PSTATE (SPSR_EL1).
+        """
+        pass_todo("assembly: load all registers from ctx, ERET")
+
+# ============================================================================
+# Context Creation Helper
+# ============================================================================
+
+fn _create_context(entry: u64, stack: u64, arg: u64, spsr: u64) -> Arm64Context:
+    """Create an Arm64Context with specified entry point, stack, argument, and SPSR.
+
+    All general-purpose registers are zeroed except:
+    - x0 = arg (first function argument)
+    - x29 = 0 (frame pointer, NULL for initial frame)
+    - x30 = entry (link register, for the initial 'ret' path)
+    - sp = stack (stack pointer, must be 16-byte aligned)
+    - elr_el1 = entry (exception return address)
+    - spsr_el1 = spsr (saved program status)
+    """
+    Arm64Context(
+        x0: arg,
+        x1: 0,
+        x2: 0,
+        x3: 0,
+        x4: 0,
+        x5: 0,
+        x6: 0,
+        x7: 0,
+        x8: 0,
+        x9: 0,
+        x10: 0,
+        x11: 0,
+        x12: 0,
+        x13: 0,
+        x14: 0,
+        x15: 0,
+        x16: 0,
+        x17: 0,
+        x18: 0,
+        x19: 0,
+        x20: 0,
+        x21: 0,
+        x22: 0,
+        x23: 0,
+        x24: 0,
+        x25: 0,
+        x26: 0,
+        x27: 0,
+        x28: 0,
+        x29: 0,              # Frame pointer (NULL for initial frame)
+        x30: entry,           # Link register (return address)
+        sp: stack,            # Stack pointer (16-byte aligned)
+        elr_el1: entry,       # Exception return address
+        spsr_el1: spsr,       # Saved program status register
+        fpu_state: 0          # No FPU state initially
+    )

@@ -1,0 +1,52 @@
+# SimpleOS Kernel Entry — Minimal Boot
+#
+# The absolute minimum: init serial, print message, halt.
+# Uses Multiboot2 via existing crt0.s → runtime_minimal.c → __simple_main()
+#
+# Build: bin/simple native-build --entry src/os/kernel/boot/kernel_entry.spl -o build/simpleos.elf
+# Run:   qemu-system-x86_64 -kernel build/simpleos.elf -serial stdio -display none
+
+# x86 port I/O via C runtime
+extern fn rt_port_outb(port: u16, value: u8)
+extern fn rt_port_inb(port: u16) -> u8
+
+val COM1: u16 = 0x3F8
+
+fn serial_init():
+    """Initialize COM1 at 115200 baud, 8N1."""
+    rt_port_outb(COM1 + 1, 0)      # Disable interrupts
+    rt_port_outb(COM1 + 3, 0x80)   # DLAB on
+    rt_port_outb(COM1, 1)          # Divisor low (115200)
+    rt_port_outb(COM1 + 1, 0)      # Divisor high
+    rt_port_outb(COM1 + 3, 0x03)   # 8N1, DLAB off
+    rt_port_outb(COM1 + 2, 0xC7)   # FIFO on
+    rt_port_outb(COM1 + 4, 0x0B)   # RTS/DSR set
+
+fn serial_putc(c: u8):
+    """Write one byte to COM1."""
+    # Wait for transmit ready
+    var ready = rt_port_inb(COM1 + 5)
+    while (ready & 0x20) == 0:
+        ready = rt_port_inb(COM1 + 5)
+    rt_port_outb(COM1, c)
+
+fn serial_puts(s: text):
+    """Write string to COM1."""
+    for ch in s:
+        val b = ch.to_u8()
+        serial_putc(b)
+
+fn serial_println(s: text):
+    serial_puts(s)
+    serial_putc(10)  # newline
+
+fn main():
+    """Entry point called by runtime_minimal.c → __simple_main()."""
+    serial_init()
+    serial_println("Hello from SimpleOS")
+    serial_println("Kernel booted via Multiboot2 on x86_64")
+    serial_println("Serial output working on COM1 at 115200 baud")
+
+    # Halt — cli + hlt loop
+    # In a real kernel, we'd continue to memory_init() etc.
+    serial_println("Halting.")

@@ -1,0 +1,69 @@
+@allow(unnamed_duplicate_typed_args)
+# x86 Port I/O
+#
+# Low-level port I/O instructions for x86 bare-metal programming.
+# These are used to communicate with hardware devices via I/O ports.
+#
+# Uses inline assembly for direct hardware access.
+# These functions are only meaningful on bare-metal x86 targets.
+
+# Write a byte to an I/O port
+fn outb(port: i32, value: i32):
+    asm """
+        mov dx, {port}
+        mov al, {value}
+        out dx, al
+    """
+
+# Read a byte from an I/O port
+fn inb(port: i32) -> i32:
+    var result = 0
+    asm """
+        mov dx, {port}
+        in al, dx
+        movzx eax, al
+        mov {result}, eax
+    """
+    result
+
+# Write a word (16-bit) to an I/O port
+fn outw(port: i32, value: i32):
+    asm """
+        mov dx, {port}
+        mov ax, {value}
+        out dx, ax
+    """
+
+# Read a word (16-bit) from an I/O port
+fn inw(port: i32) -> i32:
+    var result = 0
+    asm """
+        mov dx, {port}
+        in ax, dx
+        movzx eax, ax
+        mov {result}, eax
+    """
+    result
+
+# Write a double word (32-bit) to an I/O port
+fn outl(port: i32, value: i32):
+    asm """
+        mov dx, {port}
+        mov eax, {value}
+        out dx, eax
+    """
+
+# Read a double word (32-bit) from an I/O port
+fn inl(port: i32) -> i32:
+    var result = 0
+    asm """
+        mov dx, {port}
+        in eax, dx
+        mov {result}, eax
+    """
+    result
+
+# I/O wait (short delay) by writing to unused port
+# Port 0x80 is traditionally used for POST codes and causes a small delay
+fn io_wait():
+    outb(0x80, 0)

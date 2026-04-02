@@ -1,0 +1,32 @@
+# RISC-V 32 Entry — Boot shim for RV32 QEMU virt
+#
+# Performs REAL hardware initialization:
+# 1. 16550 UART init via MMIO at 0x10000000 (real register writes)
+# 2. QEMU virt memory map construction (RAM at 0x80000000)
+# 3. Hands off to kernel_main() which runs real PMM + scheduler code
+
+use os.kernel.arch.riscv32.console.{Riscv32Console, uart_init, uart_writeln}
+use os.kernel.arch.riscv32.boot.{Riscv32Boot}
+use os.kernel.arch.riscv32.sbi.{sbi_console_putchar}
+
+fn _start():
+    """RISC-V 32 entry point — called from M-mode startup.
+
+    Initializes 16550 UART via real MMIO register writes or SBI
+    console fallback, constructs BootOutputPort from QEMU virt
+    memory map, then calls kernel_main() for PMM/scheduler init.
+    """
+    # Real UART init: configures 16550 at 0x10000000 via MMIO,
+    # or falls back to SBI putchar for earliest output
+    uart_init()
+    uart_writeln("SimpleOS RISC-V 32 boot")
+    uart_writeln("[BOOT] UART initialized via SBI")
+
+    # Real memory map: RAM at 0x80000000, kernel + usable regions
+    val boot_info = Riscv32Boot.build_boot_output()
+    uart_writeln("[BOOT] Memory map parsed")
+
+    # Call real kernel main — runs PMM bitmap init, scheduler ReadyQueue creation
+    kernel_main(boot_info)
+
+    uart_writeln("[BOOT] RISC-V 32 boot complete")

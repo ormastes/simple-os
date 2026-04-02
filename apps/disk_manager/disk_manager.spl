@@ -1,0 +1,484 @@
+# Disk Manager — Disk and Partition Management Utility
+#
+# Displays storage devices and their partitions with usage
+# visualizations, health indicators, and property details.
+# Renders as a widget tree using the existing UI builder DSL.
+#
+# MDSOC: feature dimension, disk_manager layer
+
+use common.ui.builder.{column, row, panel, button, text_widget, label, statusbar, menubar, table_widget, with_flex, with_width, build_tree_with_title}
+use common.ui.widget.{WidgetNode, UITree, UIEvent}
+use common.ui.session.{UISession}
+use os.services.vfs.vfs.{VfsManager}
+
+# =========================================================================
+# Data Models
+# =========================================================================
+
+struct DiskInfo:
+    """Storage device information for display."""
+    name: text
+    device: text
+    total_bytes: u64
+    used_bytes: u64
+    free_bytes: u64
+    filesystem: text
+    mount_point: text
+    health: text
+
+struct PartitionInfo:
+    """Partition information for display."""
+    name: text
+    size_bytes: u64
+    filesystem: text
+    mount_point: text
+    label_text: text
+    used_percent: i32
+
+# =========================================================================
+# Disk Manager
+# =========================================================================
+
+class DiskManager:
+    """Disk and partition management utility.
+
+    Displays storage devices with usage bars, health indicators,
+    and partition details. Supports keyboard navigation and
+    property inspection.
+    """
+    disks: [DiskInfo]
+    partitions: [PartitionInfo]
+    selected_disk: i32
+    selected_partition: i32
+    view_panel: text
+    status_message: text
+    vfs: VfsManager?
+
+impl DiskManager:
+
+    static fn new() -> DiskManager:
+        """Create a disk manager with default state."""
+        var dm = DiskManager(
+            disks: [],
+            partitions: [],
+            selected_disk: 0,
+            selected_partition: 0,
+            view_panel: "disks",
+            status_message: "Ready",
+            vfs: nil
+        )
+        dm.refresh()
+        return dm
+
+    static fn with_vfs(vfs: VfsManager) -> DiskManager:
+        """Create a disk manager connected to a VFS."""
+        var dm = DiskManager(
+            disks: [],
+            partitions: [],
+            selected_disk: 0,
+            selected_partition: 0,
+            view_panel: "disks",
+            status_message: "Ready",
+            vfs: vfs
+        )
+        dm.refresh()
+        return dm
+
+    # -- Data ----------------------------------------------------------------
+
+    me refresh():
+        """Populate disk and partition lists with current data."""
+        self._load_disk_info()
+        self._load_partition_info()
+        self.status_message = "Refreshed — {self.disks.len()} disks, {self.partitions.len()} partitions"
+
+    me _load_disk_info():
+        """Load disk information (simulated — no real hardware API yet)."""
+        self.disks = []
+        # /dev/sda — 120 GB SSD
+        val sda_total: u64 = 128849018880  # 120 GB
+        val sda_used: u64 = 68719476736   # 64 GB
+        self.disks = self.disks.push(DiskInfo(
+            name: "System SSD",
+            device: "/dev/sda",
+            total_bytes: sda_total,
+            used_bytes: sda_used,
+            free_bytes: sda_total - sda_used,
+            filesystem: "ext4",
+            mount_point: "/",
+            health: "Good"
+        ))
+        # /dev/sdb — 500 GB HDD
+        val sdb_total: u64 = 536870912000  # 500 GB
+        val sdb_used: u64 = 322122547200  # ~300 GB
+        self.disks = self.disks.push(DiskInfo(
+            name: "Data HDD",
+            device: "/dev/sdb",
+            total_bytes: sdb_total,
+            used_bytes: sdb_used,
+            free_bytes: sdb_total - sdb_used,
+            filesystem: "ext4",
+            mount_point: "/home",
+            health: "Good"
+        ))
+        # /dev/sdc — 32 GB USB
+        val sdc_total: u64 = 34359738368  # 32 GB
+        val sdc_used: u64 = 8589934592   # 8 GB
+        self.disks = self.disks.push(DiskInfo(
+            name: "USB Drive",
+            device: "/dev/sdc",
+            total_bytes: sdc_total,
+            used_bytes: sdc_used,
+            free_bytes: sdc_total - sdc_used,
+            filesystem: "fat32",
+            mount_point: "/media/usb",
+            health: "Good"
+        ))
+
+    me _load_partition_info():
+        """Load partition information for the selected disk."""
+        self.partitions = []
+        if self.selected_disk < 0 or self.selected_disk >= self.disks.len():
+            return
+        val disk = self.disks[self.selected_disk]
+        # Generate partitions based on selected disk
+        match disk.device:
+            "/dev/sda":
+                self.partitions = self.partitions.push(PartitionInfo(
+                    name: "/dev/sda1",
+                    size_bytes: 536870912,  # 512 MB
+                    filesystem: "fat32",
+                    mount_point: "/boot/efi",
+                    label_text: "EFI",
+                    used_percent: 12
+                ))
+                self.partitions = self.partitions.push(PartitionInfo(
+                    name: "/dev/sda2",
+                    size_bytes: 2147483648,  # 2 GB
+                    filesystem: "swap",
+                    mount_point: "[swap]",
+                    label_text: "Swap",
+                    used_percent: 35
+                ))
+                self.partitions = self.partitions.push(PartitionInfo(
+                    name: "/dev/sda3",
+                    size_bytes: 126164664320,  # ~117.5 GB
+                    filesystem: "ext4",
+                    mount_point: "/",
+                    label_text: "Root",
+                    used_percent: 53
+                ))
+            "/dev/sdb":
+                self.partitions = self.partitions.push(PartitionInfo(
+                    name: "/dev/sdb1",
+                    size_bytes: 536870912000,  # 500 GB
+                    filesystem: "ext4",
+                    mount_point: "/home",
+                    label_text: "Home",
+                    used_percent: 60
+                ))
+            "/dev/sdc":
+                self.partitions = self.partitions.push(PartitionInfo(
+                    name: "/dev/sdc1",
+                    size_bytes: 34359738368,  # 32 GB
+                    filesystem: "fat32",
+                    mount_point: "/media/usb",
+                    label_text: "USB_DRIVE",
+                    used_percent: 25
+                ))
+            _:
+                pass_dn
+
+    # -- Display Helpers -----------------------------------------------------
+
+    fn _format_bytes(bytes: u64) -> text:
+        """Format byte count in human-readable form (KB/MB/GB/TB)."""
+        if bytes < 1024:
+            return "{bytes} B"
+        val kb = bytes / 1024
+        if kb < 1024:
+            return "{kb} KB"
+        val mb = kb / 1024
+        if mb < 1024:
+            return "{mb} MB"
+        val gb = mb / 1024
+        if gb < 1024:
+            return "{gb} GB"
+        val tb = gb / 1024
+        return "{tb} TB"
+
+    fn _usage_bar(used: u64, total: u64, width: i32) -> text:
+        """Build an ASCII progress bar like [########....] 67%."""
+        if total == 0:
+            return "[" + _repeat_char(".", width) + "] 0%"
+        val percent = ((used * 100) / total).to_i32()
+        val filled = (percent * width) / 100
+        val empty = width - filled
+        var bar = "["
+        bar = bar + _repeat_char("#", filled)
+        bar = bar + _repeat_char(".", empty)
+        bar = bar + "] {percent}%"
+        return bar
+
+    fn _health_indicator(health: text) -> text:
+        """Format health status with indicator prefix."""
+        match health:
+            "Good" => "[OK] Good"
+            "Warning" => "[!!] Warning"
+            "Critical" => "[XX] Critical"
+            "Unknown" => "[??] Unknown"
+            _ => "[--] {health}"
+
+    # -- Selection -----------------------------------------------------------
+
+    me select_next_disk():
+        """Move disk selection down."""
+        if self.selected_disk < self.disks.len() - 1:
+            self.selected_disk = self.selected_disk + 1
+            self.selected_partition = 0
+            self._load_partition_info()
+
+    me select_prev_disk():
+        """Move disk selection up."""
+        if self.selected_disk > 0:
+            self.selected_disk = self.selected_disk - 1
+            self.selected_partition = 0
+            self._load_partition_info()
+
+    me select_next_partition():
+        """Move partition selection down."""
+        if self.selected_partition < self.partitions.len() - 1:
+            self.selected_partition = self.selected_partition + 1
+
+    me select_prev_partition():
+        """Move partition selection up."""
+        if self.selected_partition > 0:
+            self.selected_partition = self.selected_partition - 1
+
+    # -- Properties ----------------------------------------------------------
+
+    fn get_disk_properties() -> text:
+        """Get formatted properties for the selected disk."""
+        if self.selected_disk < 0 or self.selected_disk >= self.disks.len():
+            return "No disk selected"
+        val disk = self.disks[self.selected_disk]
+        val total_str = self._format_bytes(disk.total_bytes)
+        val used_str = self._format_bytes(disk.used_bytes)
+        val free_str = self._format_bytes(disk.free_bytes)
+        val bar = self._usage_bar(disk.used_bytes, disk.total_bytes, 20)
+        val health_str = self._health_indicator(disk.health)
+        return "Name: {disk.name}\nDevice: {disk.device}\nFilesystem: {disk.filesystem}\nMount: {disk.mount_point}\nTotal: {total_str}\nUsed: {used_str}\nFree: {free_str}\nUsage: {bar}\nHealth: {health_str}"
+
+    fn get_partition_properties() -> text:
+        """Get formatted properties for the selected partition."""
+        if self.selected_partition < 0 or self.selected_partition >= self.partitions.len():
+            return "No partition selected"
+        val part = self.partitions[self.selected_partition]
+        val size_str = self._format_bytes(part.size_bytes)
+        val bar = _make_percent_bar(part.used_percent, 20)
+        return "Name: {part.name}\nLabel: {part.label_text}\nFilesystem: {part.filesystem}\nMount: {part.mount_point}\nSize: {size_str}\nUsed: {bar}"
+
+    # -- Input Handling ------------------------------------------------------
+
+    me handle_key(key: text):
+        """Handle keyboard input.
+
+        Keys: up/down = select, tab = switch panel, r = refresh,
+              p = properties, Enter = view details
+        """
+        match key:
+            "up":
+                if self.view_panel == "disks":
+                    self.select_prev_disk()
+                else:
+                    self.select_prev_partition()
+            "down":
+                if self.view_panel == "disks":
+                    self.select_next_disk()
+                else:
+                    self.select_next_partition()
+            "tab":
+                if self.view_panel == "disks":
+                    self.view_panel = "partitions"
+                    self.status_message = "Partition view"
+                else:
+                    self.view_panel = "disks"
+                    self.status_message = "Disk view"
+            "r":
+                self.refresh()
+            "p":
+                if self.view_panel == "disks":
+                    self.status_message = self.get_disk_properties()
+                else:
+                    self.status_message = self.get_partition_properties()
+            "Enter":
+                if self.view_panel == "disks":
+                    self.view_panel = "partitions"
+                    self._load_partition_info()
+                    self.status_message = "Viewing partitions for {self.disks[self.selected_disk].name}"
+            _:
+                pass_dn
+
+    me handle_action(action: text):
+        """Handle button actions dispatched from the UI."""
+        match action:
+            "refresh" => self.refresh()
+            "view_disks":
+                self.view_panel = "disks"
+                self.status_message = "Disk view"
+            "view_partitions":
+                self.view_panel = "partitions"
+                self._load_partition_info()
+                self.status_message = "Partition view"
+            "properties":
+                if self.view_panel == "disks":
+                    self.status_message = self.get_disk_properties()
+                else:
+                    self.status_message = self.get_partition_properties()
+            _ => pass_dn
+
+    # -- UI Construction -----------------------------------------------------
+
+    fn build_ui() -> UISession:
+        """Build the disk manager UI.
+
+        Layout:
+          Menubar: Disk | View | Help
+          Row:
+            Column (left, flex):
+              Panel: Disk list table (Name, Device, Total, Used, Free, FS, Health)
+              Panel: Usage bars (ASCII bar graph per disk)
+              Panel: Partition table (Name, Size, FS, Mount, Label, Used%)
+            Panel (right, 30w): Properties detail
+          Statusbar: selected info | total storage summary
+        """
+        # -- Disk table --
+        val disk_headers = ["Name", "Device", "Total", "Used", "Free", "FS", "Health"]
+        var disk_rows: [[text]] = []
+        var didx = 0
+        for disk in self.disks:
+            val prefix = if didx == self.selected_disk: "> " else: "  "
+            disk_rows = disk_rows.push([
+                "{prefix}{disk.name}",
+                disk.device,
+                self._format_bytes(disk.total_bytes),
+                self._format_bytes(disk.used_bytes),
+                self._format_bytes(disk.free_bytes),
+                disk.filesystem,
+                self._health_indicator(disk.health)
+            ])
+            didx = didx + 1
+        val disk_table = table_widget("dm_disk_table", disk_headers, disk_rows)
+
+        # -- Usage bars --
+        var bar_widgets: [WidgetNode] = []
+        for disk in self.disks:
+            val bar = self._usage_bar(disk.used_bytes, disk.total_bytes, 30)
+            bar_widgets = bar_widgets.push(
+                text_widget("dm_bar_{disk.device}", "{disk.name}: {bar}")
+            )
+        val usage_panel = panel("dm_usage_panel", "Storage Usage", bar_widgets)
+
+        # -- Partition table --
+        val part_headers = ["Name", "Size", "FS", "Mount", "Label", "Used%"]
+        var part_rows: [[text]] = []
+        var pidx = 0
+        for part in self.partitions:
+            val prefix = if pidx == self.selected_partition: "> " else: "  "
+            val pct_bar = _make_percent_bar(part.used_percent, 10)
+            part_rows = part_rows.push([
+                "{prefix}{part.name}",
+                self._format_bytes(part.size_bytes),
+                part.filesystem,
+                part.mount_point,
+                part.label_text,
+                pct_bar
+            ])
+            pidx = pidx + 1
+        val part_table = table_widget("dm_part_table", part_headers, part_rows)
+
+        # -- Details panel --
+        val details_text = if self.view_panel == "disks":
+            self.get_disk_properties()
+        else:
+            self.get_partition_properties()
+        val details_panel = panel("dm_details", "Properties", [
+            text_widget("dm_details_text", details_text)
+        ])
+
+        # -- Action buttons --
+        val actions = row("dm_actions", [
+            button("dm_btn_refresh", "Refresh", "refresh"),
+            button("dm_btn_disks", "Disks", "view_disks"),
+            button("dm_btn_parts", "Partitions", "view_partitions"),
+            button("dm_btn_props", "Properties", "properties")
+        ])
+
+        # -- Total storage summary --
+        var total_storage: u64 = 0
+        var total_used: u64 = 0
+        for disk in self.disks:
+            total_storage = total_storage + disk.total_bytes
+            total_used = total_used + disk.used_bytes
+        val total_str = self._format_bytes(total_storage)
+        val used_str = self._format_bytes(total_used)
+
+        # -- Selected item info --
+        val selected_info = if self.view_panel == "disks":
+            if self.selected_disk >= 0 and self.selected_disk < self.disks.len():
+                val d = self.disks[self.selected_disk]
+                "Disk: {d.name} ({d.device})"
+            else:
+                "No disk selected"
+        else:
+            if self.selected_partition >= 0 and self.selected_partition < self.partitions.len():
+                val p = self.partitions[self.selected_partition]
+                "Partition: {p.name} ({p.label_text})"
+            else:
+                "No partition selected"
+
+        val root = column("dm_root", [
+            menubar("dm_menu", ["Disk", "View", "Help"]),
+            actions,
+            row("dm_content", [
+                with_flex(column("dm_left", [
+                    panel("dm_disk_panel", "Disks", [disk_table]),
+                    usage_panel,
+                    panel("dm_part_panel", "Partitions", [part_table])
+                ]), 1),
+                with_width(details_panel, 30)
+            ]),
+            statusbar("dm_status",
+                selected_info,
+                "Total: {used_str} / {total_str}"
+            )
+        ])
+
+        val tree = build_tree_with_title(root, "Disk Manager", "dark")
+        return UISession.new(tree)
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn _repeat_char(ch: text, count: i32) -> text:
+    """Repeat a character count times."""
+    var result = ""
+    var i = 0
+    while i < count:
+        result = "{result}{ch}"
+        i = i + 1
+    return result
+
+fn _make_percent_bar(percent: i32, width: i32) -> text:
+    """Build a percent bar like [####....] 25%."""
+    val clamped = if percent < 0: 0
+        elif percent > 100: 100
+        else: percent
+    val filled = (clamped * width) / 100
+    val empty = width - filled
+    var bar = "["
+    bar = bar + _repeat_char("#", filled)
+    bar = bar + _repeat_char(".", empty)
+    bar = bar + "] {clamped}%"
+    return bar

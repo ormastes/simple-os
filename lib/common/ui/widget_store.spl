@@ -1,0 +1,127 @@
+# Widget Store — Session-Scoped Registry
+#
+# Encapsulates the global mutable registries (_widget_registry, _widget_props_store)
+# into an instance-scoped WidgetStore class. Each store holds its own registry
+# of WidgetRecords and WidgetProps, enabling session isolation for multi-window
+# and testing scenarios.
+
+use common.ui.widget.{WidgetRecord, WidgetProp, WidgetNode, encode_child_ids, decode_child_ids, default_widget_record}
+
+# =========================================================================
+# WidgetStore
+# =========================================================================
+
+class WidgetStore:
+    registry: [WidgetRecord]
+    props: [WidgetProp]
+
+    static fn new() -> WidgetStore:
+        return WidgetStore(
+            registry: [],
+            props: []
+        )
+
+# =========================================================================
+# Constructor Shorthand
+# =========================================================================
+
+fn new_widget_store() -> WidgetStore:
+    """Create a new empty widget store."""
+    return WidgetStore.new()
+
+# =========================================================================
+# WidgetStore Methods
+# =========================================================================
+
+impl WidgetStore:
+
+    # -- Record operations ---------------------------------------------------
+
+    me upsert_record(record: WidgetRecord):
+        """Insert or replace a widget record by id."""
+        var updated: [WidgetRecord] = []
+        var replaced = false
+        for existing in self.registry:
+            if existing.id == record.id:
+                updated = updated.push(record)
+                replaced = true
+            else:
+                updated = updated.push(existing)
+        if not replaced:
+            updated = updated.push(record)
+        self.registry = updated
+
+    fn get_record(id: text) -> WidgetRecord?:
+        """Look up a widget record by id."""
+        for record in self.registry:
+            if record.id == id:
+                return record
+        return nil
+
+    fn require_record(id: text) -> WidgetRecord:
+        """Get a widget record, creating a default panel if missing."""
+        val found = self.get_record(id)
+        if found != nil:
+            return found
+        val fallback = default_widget_record(id, "panel")
+        self.upsert_record(fallback)
+        return fallback
+
+    fn record_count() -> i32:
+        """Number of registered widget records."""
+        return self.registry.len()
+
+    # -- Prop operations -----------------------------------------------------
+
+    fn get_prop(node_id: text, key: text) -> text:
+        """Get a property value, returning empty string if not found."""
+        for prop in self.props:
+            if prop.node_id == node_id and prop.key == key:
+                return prop.value
+        return ""
+
+    me set_prop(node_id: text, key: text, value: text):
+        """Set a property, inserting or replacing as needed."""
+        var updated: [WidgetProp] = []
+        var replaced = false
+        for prop in self.props:
+            if prop.node_id == node_id and prop.key == key:
+                updated = updated.push(WidgetProp(node_id: node_id, key: key, value: value))
+                replaced = true
+            else:
+                updated = updated.push(prop)
+        if not replaced:
+            updated = updated.push(WidgetProp(node_id: node_id, key: key, value: value))
+        self.props = updated
+
+    fn all_props() -> [WidgetProp]:
+        """Return all stored props."""
+        return self.props
+
+    fn prop_count() -> i32:
+        """Number of stored props."""
+        return self.props.len()
+
+    # -- Child operations ----------------------------------------------------
+
+    fn get_child_ids(node_id: text) -> [text]:
+        """Get the child IDs for a node."""
+        return decode_child_ids(self.get_prop(node_id, "ui_children"))
+
+    me register_child(parent_id: text, child_id: text):
+        """Register a child under a parent, avoiding duplicates."""
+        val existing = decode_child_ids(self.get_prop(parent_id, "ui_children"))
+        for current_id in existing:
+            if current_id == child_id:
+                return
+        val updated = existing + [child_id]
+        self.set_prop(parent_id, "ui_children", encode_child_ids(updated))
+
+    # -- Node operations -----------------------------------------------------
+
+    fn get_node(id: text) -> WidgetNode?:
+        """Get a WidgetNode handle if the record exists."""
+        val record = self.get_record(id)
+        if record == nil:
+            return nil
+        return WidgetNode(id: id)

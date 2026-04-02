@@ -1,0 +1,15 @@
+# @platform: baremetal
+#
+# Bare-Metal Support Module
+#
+# Provides bare-metal programming support including:
+# - Semihosting System API
+# - Architecture-specific backends (ARM, RISC-V, x86)
+# - String interning for optimized print output
+#
+# Usage:
+#   use std.baremetal.system_api (semi_print, semi_exit)
+#   use std.baremetal.string_intern (StringInternTable)
+
+# Module exports are handled by individual files
+# This file serves as documentation only

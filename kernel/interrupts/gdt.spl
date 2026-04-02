@@ -1,0 +1,234 @@
+# Global Descriptor Table (GDT) — Interrupts Layer
+#
+# x86_64 GDT with Task State Segment for kernel/user mode transitions.
+# Provides flat memory model with 64-bit long mode segments.
+#
+# Segments:
+#   0: Null descriptor
+#   1: Kernel code (64-bit, ring 0, execute/read)
+#   2: Kernel data (ring 0, read/write)
+#   3: User code (64-bit, ring 3, execute/read)
+#   4: User data (ring 3, read/write)
+#   5: TSS descriptor (16-byte, 64-bit TSS)
+
+use std.baremetal.x86.io.{outb}
+
+# --- Segment Selectors (byte offsets into GDT) ---
+
+val GDT_NULL_SEL: u16    = 0x00
+val GDT_KERNEL_CS: u16   = 0x08    # Index 1
+val GDT_KERNEL_DS: u16   = 0x10    # Index 2
+val GDT_USER_CS: u16     = 0x18    # Index 3
+val GDT_USER_DS: u16     = 0x20    # Index 4
+val GDT_TSS_SEL: u16     = 0x28    # Index 5 (16 bytes wide)
+
+# --- GDT Access Byte Flags ---
+
+val ACCESS_PRESENT: u8     = 0x80   # Segment present
+val ACCESS_DPL0: u8        = 0x00   # Ring 0
+val ACCESS_DPL3: u8        = 0x60   # Ring 3
+val ACCESS_CODE_DATA: u8   = 0x10   # Code/data segment (not system)
+val ACCESS_EXECUTABLE: u8  = 0x08   # Code segment
+val ACCESS_READABLE: u8    = 0x02   # Readable code / Writable data
+val ACCESS_TSS_TYPE: u8    = 0x09   # 64-bit TSS (Available)
+
+# --- Granularity Flags ---
+
+val GRAN_LONG_MODE: u8    = 0x20   # L bit: 64-bit code segment
+val GRAN_4K_PAGES: u8     = 0x80   # G bit: 4KB granularity
+
+# --- Structs ---
+
+@repr("C")
+struct GdtEntry:
+    """Single 8-byte GDT descriptor entry."""
+    limit_low: u16
+    base_low: u16
+    base_mid: u8
+    access: u8
+    granularity: u8
+    base_high: u8
+
+@repr("C")
+struct TssEntry:
+    """64-bit Task State Segment.
+    Used for stack switching on privilege level changes and IST entries."""
+    reserved0: u32
+    rsp0: u64           # Kernel stack for privilege level 0
+    rsp1: u64           # Stack for privilege level 1 (unused)
+    rsp2: u64           # Stack for privilege level 2 (unused)
+    reserved1: u64
+    ist1: u64           # Interrupt Stack Table 1 (double fault)
+    ist2: u64           # Interrupt Stack Table 2 (NMI)
+    ist3: u64           # Interrupt Stack Table 3
+    ist4: u64           # Interrupt Stack Table 4
+    ist5: u64           # Interrupt Stack Table 5
+    ist6: u64           # Interrupt Stack Table 6
+    ist7: u64           # Interrupt Stack Table 7
+    reserved2: u64
+    reserved3: u16
+    iomap_base: u16
+
+@repr("C")
+struct GdtPtr:
+    """GDTR register value: limit (size - 1) and base address."""
+    limit: u16
+    base: u64
+
+# --- Module State ---
+
+# GDT: 5 normal entries (8 bytes each) + 1 TSS entry (16 bytes) = 6 slots, 48 + 16 = 56 bytes
+# We store 7 GdtEntry slots (56 bytes) to accommodate the 16-byte TSS descriptor.
+var gdt_entries: [GdtEntry; 7]
+var tss: TssEntry
+var gdt_pointer: GdtPtr
+
+# --- Internal Helpers ---
+
+fn _make_null_entry() -> GdtEntry:
+    """Create null descriptor (all zeros)."""
+    GdtEntry(limit_low: 0, base_low: 0, base_mid: 0,
+             access: 0, granularity: 0, base_high: 0)
+
+fn _make_code_entry(dpl: u8) -> GdtEntry:
+    """Create 64-bit code segment descriptor.
+    Long mode ignores base/limit for code segments."""
+    val access = ACCESS_PRESENT | dpl | ACCESS_CODE_DATA | ACCESS_EXECUTABLE | ACCESS_READABLE
+    GdtEntry(limit_low: 0xFFFF, base_low: 0, base_mid: 0,
+             access: access, granularity: GRAN_LONG_MODE | 0x0F,
+             base_high: 0)
+
+fn _make_data_entry(dpl: u8) -> GdtEntry:
+    """Create data segment descriptor.
+    Long mode ignores base/limit for data segments."""
+    val access = ACCESS_PRESENT | dpl | ACCESS_CODE_DATA | ACCESS_READABLE
+    GdtEntry(limit_low: 0xFFFF, base_low: 0, base_mid: 0,
+             access: access, granularity: 0x0F,
+             base_high: 0)
+
+fn _make_tss_low(base: u64, limit: u32) -> GdtEntry:
+    """Create lower 8 bytes of 16-byte TSS descriptor."""
+    val access = ACCESS_PRESENT | ACCESS_TSS_TYPE
+    val base_lo = (base & 0xFFFF) as u16
+    val base_mi = ((base >> 16) & 0xFF) as u8
+    val base_hi = ((base >> 24) & 0xFF) as u8
+    val limit_lo = (limit & 0xFFFF) as u16
+    val gran = ((limit >> 16) & 0x0F) as u8
+    GdtEntry(limit_low: limit_lo, base_low: base_lo, base_mid: base_mi,
+             access: access, granularity: gran, base_high: base_hi)
+
+fn _make_tss_high(base: u64) -> GdtEntry:
+    """Create upper 8 bytes of 16-byte TSS descriptor.
+    Stores bits 32-63 of base address; rest is reserved/zero."""
+    val base_upper = ((base >> 32) & 0xFFFFFFFF) as u32
+    val low16 = (base_upper & 0xFFFF) as u16
+    val high16 = ((base_upper >> 16) & 0xFFFF) as u16
+    GdtEntry(limit_low: low16, base_low: high16, base_mid: 0,
+             access: 0, granularity: 0, base_high: 0)
+
+# --- Public API ---
+
+fn gdt_init():
+    """Initialize GDT with kernel/user segments and TSS, then load GDTR.
+
+    Segment layout:
+      [0] Null
+      [1] Kernel Code  0x08
+      [2] Kernel Data  0x10
+      [3] User Code    0x18
+      [4] User Data    0x20
+      [5-6] TSS        0x28 (16 bytes)
+    """
+    # Initialize TSS to zero state
+    tss = TssEntry(
+        reserved0: 0,
+        rsp0: 0, rsp1: 0, rsp2: 0,
+        reserved1: 0,
+        ist1: 0, ist2: 0, ist3: 0, ist4: 0,
+        ist5: 0, ist6: 0, ist7: 0,
+        reserved2: 0,
+        reserved3: 0,
+        iomap_base: 104   # Size of TSS struct (no IO permission bitmap)
+    )
+
+    # Build GDT entries
+    gdt_entries[0] = _make_null_entry()
+    gdt_entries[1] = _make_code_entry(ACCESS_DPL0)    # Kernel CS
+    gdt_entries[2] = _make_data_entry(ACCESS_DPL0)    # Kernel DS
+    gdt_entries[3] = _make_code_entry(ACCESS_DPL3)    # User CS
+    gdt_entries[4] = _make_data_entry(ACCESS_DPL3)    # User DS
+
+    # TSS descriptor (16 bytes = 2 GdtEntry slots)
+    val tss_addr = &tss as u64
+    val tss_limit = 103 as u32    # sizeof(TssEntry) - 1
+    gdt_entries[5] = _make_tss_low(tss_addr, tss_limit)
+    gdt_entries[6] = _make_tss_high(tss_addr)
+
+    # Set up GDTR pointer
+    gdt_pointer = GdtPtr(
+        limit: 55,    # 7 * 8 - 1 = 55 bytes
+        base: &gdt_entries as u64
+    )
+
+    # Load GDT register
+    _gdt_load()
+
+    # Reload segment registers
+    gdt_reload_segments()
+
+    # Load TSS
+    _tss_load()
+
+fn gdt_set_kernel_stack(stack: u64):
+    """Set kernel stack pointer in TSS.rsp0.
+    Called during context switch to set the kernel stack for syscall/interrupt entry."""
+    tss.rsp0 = stack
+
+fn gdt_set_ist(index: u8, stack: u64):
+    """Set Interrupt Stack Table entry in TSS.
+    index: 1-7 (IST1 through IST7)."""
+    match index:
+        1: tss.ist1 = stack
+        2: tss.ist2 = stack
+        3: tss.ist3 = stack
+        4: tss.ist4 = stack
+        5: tss.ist5 = stack
+        6: tss.ist6 = stack
+        7: tss.ist7 = stack
+        _: pass   # Invalid index, ignore
+
+fn gdt_reload_segments():
+    """Reload CS via far return and DS/SS/ES/FS/GS with kernel data selector.
+    Must be called after loading a new GDT."""
+    asm """
+        # Reload data segments with kernel data selector (0x10)
+        mov ax, 0x10
+        mov ds, ax
+        mov es, ax
+        mov fs, ax
+        mov gs, ax
+        mov ss, ax
+
+        # Reload CS via far return
+        # Push kernel code selector and return address, then retfq
+        lea rax, [rip + .Lreload_cs_done]
+        push 0x08
+        push rax
+        retfq
+    .Lreload_cs_done:
+    """
+
+# --- Private Helpers ---
+
+fn _gdt_load():
+    """Execute lgdt instruction to load the GDT register."""
+    asm """
+        lgdt [{gdt_pointer}]
+    """
+
+fn _tss_load():
+    """Execute ltr instruction to load the TSS selector."""
+    asm """
+        mov ax, 0x28
+        ltr ax
+    """

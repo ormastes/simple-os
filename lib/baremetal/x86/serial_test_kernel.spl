@@ -1,0 +1,17 @@
+# Minimal Serial Test Kernel
+#
+# Boots and outputs "SERIAL_OK" via COM1 serial port.
+# Used to verify serial I/O pipeline with QEMU.
+
+use std.baremetal.x86.serial.{serial_init, serial_println}
+
+@entry
+@noreturn
+fn _start():
+    serial_init()
+    serial_println("SERIAL_OK")
+    # Halt the CPU
+    asm """
+        cli
+        hlt
+    """

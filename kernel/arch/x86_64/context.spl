@@ -1,0 +1,59 @@
+# x86_64 Context Switch HAL — Register Save/Restore Stub
+#
+# Stub implementation for x86_64 context switching.
+# Context switching on x86_64 involves saving/restoring:
+#   - General purpose registers (rax..r15)
+#   - Stack pointer (rsp), instruction pointer (rip)
+#   - Flags (rflags)
+#   - Segment registers (cs, ss)
+#   - FPU/SSE state (fxsave/fxrstor or xsave/xrstor)
+#   - CR3 (page table base, for address space switch)
+#
+# The actual register save/restore is done in assembly.
+# See os.kernel.arch.arch_context.X86_64Context for the register state layout.
+
+use os.kernel.arch.arch_context.{X86_64Context}
+
+# ============================================================================
+# X86ContextSwitch
+# ============================================================================
+
+struct X86ContextSwitch:
+    """x86_64 context switching implementation.
+
+    Stub -- will implement assembly-based register save/restore
+    for preemptive multitasking.
+
+    Named X86ContextSwitch (not X86Context) to avoid collision
+    with the X86_64Context register state struct in arch_context.spl.
+    """
+    pass_dn
+
+impl X86ContextSwitch:
+    fn init():
+        """Initialize context switching (set up initial kernel stack frame)."""
+        pass_todo("set up initial kernel thread context")
+
+    fn create(entry_point: u64, stack_top: u64, user_mode: bool) -> X86_64Context:
+        """Create a new CPU context for a thread.
+
+        Sets up the register state so that when switched to,
+        execution begins at entry_point with the given stack.
+        """
+        pass_todo("construct X86_64Context with entry_point as rip, stack_top as rsp")
+
+    fn switch(from_ctx: X86_64Context, to_ctx: X86_64Context):
+        """Switch from one context to another.
+
+        Saves current register state into from_ctx, loads to_ctx.
+        This is the core context switch — implemented in assembly.
+        """
+        pass_todo("assembly: save regs to from_ctx, load regs from to_ctx, ret")
+
+    fn save_fpu(ctx: X86_64Context):
+        """Save FPU/SSE/AVX state for context."""
+        pass_todo("fxsave or xsave to ctx.fpu_state region")
+
+    fn restore_fpu(ctx: X86_64Context):
+        """Restore FPU/SSE/AVX state for context."""
+        pass_todo("fxrstor or xrstor from ctx.fpu_state region")

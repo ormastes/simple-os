@@ -1,0 +1,11 @@
+# SimpleOS Core Types — Entity Dimension
+#
+# Pure types with no behavior. Shared across all kernel features.
+# These form the vocabulary that all kernel subsystems speak.
+
+use os.kernel.types.memory_types.*
+use os.kernel.types.task_types.*
+use os.kernel.types.capability_types.*
+use os.kernel.types.ipc_types.*
+use os.kernel.types.syscall_types.*
+use os.kernel.types.fs_types.*

@@ -1,0 +1,408 @@
+# Calculator App — Windows-Style Calculator
+#
+# Provides a standard calculator with arithmetic operations,
+# memory functions, and keyboard input support. Follows the
+# Windows calculator layout and behavior.
+#
+# MDSOC: feature dimension, apps layer
+
+use common.ui.builder.{
+    column, row, panel, button, text_widget, label,
+    statusbar, menubar, build_tree_with_title,
+    with_flex, with_width
+}
+use common.ui.widget.{WidgetNode, UITree, UIEvent}
+use common.ui.session.{UISession}
+
+# =========================================================================
+# Calculator Operation
+# =========================================================================
+
+enum CalcOp:
+    """Pending arithmetic operation."""
+    Add
+    Subtract
+    Multiply
+    Divide
+    None
+
+# =========================================================================
+# Calculator
+# =========================================================================
+
+class Calculator:
+    """Windows-style calculator application.
+
+    Supports basic arithmetic, memory operations, percent,
+    negate, backspace, and keyboard input.
+    """
+    display: text
+    expression: text
+    accumulator: f64
+    current_input: text
+    pending_op: CalcOp
+    memory: f64
+    has_memory: bool
+    new_input: bool
+    error: bool
+
+impl Calculator:
+
+    static fn new() -> Calculator:
+        """Create a calculator in its initial state."""
+        Calculator(
+            display: "0",
+            expression: "",
+            accumulator: 0.0,
+            current_input: "0",
+            pending_op: CalcOp.None,
+            memory: 0.0,
+            has_memory: false,
+            new_input: true,
+            error: false
+        )
+
+    # -- Digit and decimal input ---------------------------------------------
+
+    me digit(d: text):
+        """Append a digit to the current input."""
+        if self.error:
+            self.clear()
+        if self.new_input:
+            self.current_input = d
+            self.new_input = false
+        else:
+            if self.current_input == "0":
+                self.current_input = d
+            else:
+                self.current_input = "{self.current_input}{d}"
+        self.display = self.current_input
+
+    me decimal():
+        """Add a decimal point if not already present."""
+        if self.error:
+            self.clear()
+        if self.new_input:
+            self.current_input = "0."
+            self.new_input = false
+        else:
+            if not self.current_input.contains("."):
+                self.current_input = "{self.current_input}."
+        self.display = self.current_input
+
+    # -- Arithmetic operations -----------------------------------------------
+
+    me operator(op: CalcOp):
+        """Set the pending operation, evaluating any prior one first."""
+        if self.error:
+            return
+        val current_val = self.current_input.parse_f64()
+        match self.pending_op:
+            CalcOp.None:
+                self.accumulator = current_val
+            _:
+                self.accumulator = self._evaluate()
+                if self.error:
+                    return
+        self.pending_op = op
+        val op_symbol = match op:
+            CalcOp.Add: "+"
+            CalcOp.Subtract: "-"
+            CalcOp.Multiply: "*"
+            CalcOp.Divide: "/"
+            CalcOp.None: ""
+        self.expression = "{_format_number(self.accumulator)} {op_symbol}"
+        self.display = _format_number(self.accumulator)
+        self.new_input = true
+
+    me equals():
+        """Evaluate the pending operation and display the result."""
+        if self.error:
+            return
+        match self.pending_op:
+            CalcOp.None:
+                pass_dn
+            _:
+                val result = self._evaluate()
+                if self.error:
+                    return
+                self.accumulator = result
+                self.display = _format_number(result)
+                self.expression = ""
+                self.pending_op = CalcOp.None
+                self.new_input = true
+
+    # -- Clear and edit ------------------------------------------------------
+
+    me clear():
+        """Reset all calculator state (AC)."""
+        self.display = "0"
+        self.expression = ""
+        self.accumulator = 0.0
+        self.current_input = "0"
+        self.pending_op = CalcOp.None
+        self.new_input = true
+        self.error = false
+
+    me clear_entry():
+        """Clear only the current input (CE)."""
+        if self.error:
+            self.clear()
+            return
+        self.current_input = "0"
+        self.display = "0"
+        self.new_input = true
+
+    me backspace():
+        """Remove the last character from the current input."""
+        if self.error or self.new_input:
+            return
+        if self.current_input.len() <= 1:
+            self.current_input = "0"
+            self.new_input = true
+        else:
+            self.current_input = self.current_input.slice(0, self.current_input.len() - 1)
+            # Handle case where only a minus sign remains
+            if self.current_input == "-" or self.current_input == "":
+                self.current_input = "0"
+                self.new_input = true
+        self.display = self.current_input
+
+    me negate():
+        """Toggle the sign of the current input."""
+        if self.error:
+            return
+        val val_now = self.current_input.parse_f64()
+        if val_now != 0.0:
+            val negated = val_now * -1.0
+            self.current_input = _format_number(negated)
+            self.display = self.current_input
+
+    me percent():
+        """Convert the current input to a percentage of the accumulator."""
+        if self.error:
+            return
+        val val_now = self.current_input.parse_f64()
+        val result = self.accumulator * val_now / 100.0
+        self.current_input = _format_number(result)
+        self.display = self.current_input
+
+    # -- Memory operations ---------------------------------------------------
+
+    me memory_add():
+        """Add current display value to memory."""
+        if self.error:
+            return
+        val val_now = self.current_input.parse_f64()
+        self.memory = self.memory + val_now
+        self.has_memory = true
+
+    me memory_subtract():
+        """Subtract current display value from memory."""
+        if self.error:
+            return
+        val val_now = self.current_input.parse_f64()
+        self.memory = self.memory - val_now
+        self.has_memory = true
+
+    me memory_recall():
+        """Recall the stored memory value to the display."""
+        if self.error:
+            return
+        if self.has_memory:
+            self.current_input = _format_number(self.memory)
+            self.display = self.current_input
+            self.new_input = true
+
+    me memory_clear():
+        """Clear the memory store."""
+        self.memory = 0.0
+        self.has_memory = false
+
+    # -- Input handling ------------------------------------------------------
+
+    me handle_key(key: text):
+        """Map keyboard input to calculator actions."""
+        match key:
+            "0" => self.digit("0")
+            "1" => self.digit("1")
+            "2" => self.digit("2")
+            "3" => self.digit("3")
+            "4" => self.digit("4")
+            "5" => self.digit("5")
+            "6" => self.digit("6")
+            "7" => self.digit("7")
+            "8" => self.digit("8")
+            "9" => self.digit("9")
+            "." => self.decimal()
+            "+" => self.operator(CalcOp.Add)
+            "-" => self.operator(CalcOp.Subtract)
+            "*" => self.operator(CalcOp.Multiply)
+            "/" => self.operator(CalcOp.Divide)
+            "=" => self.equals()
+            "Enter" => self.equals()
+            "Backspace" => self.backspace()
+            "Escape" => self.clear()
+            "Delete" => self.clear_entry()
+            "%" => self.percent()
+            _ => pass_dn
+
+    me handle_action(action: text):
+        """Dispatch button action strings to calculator methods."""
+        match action:
+            "digit_0" => self.digit("0")
+            "digit_1" => self.digit("1")
+            "digit_2" => self.digit("2")
+            "digit_3" => self.digit("3")
+            "digit_4" => self.digit("4")
+            "digit_5" => self.digit("5")
+            "digit_6" => self.digit("6")
+            "digit_7" => self.digit("7")
+            "digit_8" => self.digit("8")
+            "digit_9" => self.digit("9")
+            "decimal" => self.decimal()
+            "add" => self.operator(CalcOp.Add)
+            "subtract" => self.operator(CalcOp.Subtract)
+            "multiply" => self.operator(CalcOp.Multiply)
+            "divide" => self.operator(CalcOp.Divide)
+            "equals" => self.equals()
+            "clear" => self.clear()
+            "clear_entry" => self.clear_entry()
+            "backspace" => self.backspace()
+            "negate" => self.negate()
+            "percent" => self.percent()
+            "mem_add" => self.memory_add()
+            "mem_sub" => self.memory_subtract()
+            "mem_recall" => self.memory_recall()
+            "mem_clear" => self.memory_clear()
+            _ => pass_dn
+
+    # -- Internal helpers ----------------------------------------------------
+
+    me _evaluate() -> f64:
+        """Execute the pending operation on accumulator and current input."""
+        val current_val = self.current_input.parse_f64()
+        val result = match self.pending_op:
+            CalcOp.Add: self.accumulator + current_val
+            CalcOp.Subtract: self.accumulator - current_val
+            CalcOp.Multiply: self.accumulator * current_val
+            CalcOp.Divide:
+                if current_val == 0.0:
+                    self.error = true
+                    self.display = "Error"
+                    self.expression = ""
+                    return 0.0
+                self.accumulator / current_val
+            CalcOp.None: current_val
+        result
+
+    # -- UI Construction -----------------------------------------------------
+
+    fn build_ui() -> UISession:
+        """Build the calculator UI.
+
+        Layout:
+          Menu bar
+          Expression display (small, right-aligned)
+          Result display (large, right-aligned)
+          Memory button row: MC MR M+ M-
+          Button rows (Windows calculator layout):
+            Row 1: C   CE  <-  /
+            Row 2: 7   8   9   *
+            Row 3: 4   5   6   -
+            Row 4: 1   2   3   +
+            Row 5: +/- 0   .   =
+          Status bar
+        """
+        val mem_indicator = if self.has_memory: "M" else: ""
+
+        val root = column("calc_root", [
+            # Menu bar
+            menubar("calc_menu", [
+                "File", "Edit", "Help"
+            ]),
+
+            # Expression display
+            panel("calc_expr_panel", "", [
+                text_widget("calc_expression", self.expression)
+            ]),
+
+            # Main display
+            panel("calc_display_panel", "", [
+                with_flex(text_widget("calc_display", self.display), 1)
+            ]),
+
+            # Memory buttons
+            row("calc_mem_row", [
+                with_flex(button("btn_mc", "MC", "mem_clear"), 1),
+                with_flex(button("btn_mr", "MR", "mem_recall"), 1),
+                with_flex(button("btn_mplus", "M+", "mem_add"), 1),
+                with_flex(button("btn_mminus", "M-", "mem_sub"), 1)
+            ]),
+
+            # Row 1: C CE <- /
+            with_flex(row("calc_row1", [
+                with_flex(button("btn_c", "C", "clear"), 1),
+                with_flex(button("btn_ce", "CE", "clear_entry"), 1),
+                with_flex(button("btn_bs", "<-", "backspace"), 1),
+                with_flex(button("btn_div", "/", "divide"), 1)
+            ]), 1),
+
+            # Row 2: 7 8 9 *
+            with_flex(row("calc_row2", [
+                with_flex(button("btn_7", "7", "digit_7"), 1),
+                with_flex(button("btn_8", "8", "digit_8"), 1),
+                with_flex(button("btn_9", "9", "digit_9"), 1),
+                with_flex(button("btn_mul", "*", "multiply"), 1)
+            ]), 1),
+
+            # Row 3: 4 5 6 -
+            with_flex(row("calc_row3", [
+                with_flex(button("btn_4", "4", "digit_4"), 1),
+                with_flex(button("btn_5", "5", "digit_5"), 1),
+                with_flex(button("btn_6", "6", "digit_6"), 1),
+                with_flex(button("btn_sub", "-", "subtract"), 1)
+            ]), 1),
+
+            # Row 4: 1 2 3 +
+            with_flex(row("calc_row4", [
+                with_flex(button("btn_1", "1", "digit_1"), 1),
+                with_flex(button("btn_2", "2", "digit_2"), 1),
+                with_flex(button("btn_3", "3", "digit_3"), 1),
+                with_flex(button("btn_add", "+", "add"), 1)
+            ]), 1),
+
+            # Row 5: +/- 0 . =
+            with_flex(row("calc_row5", [
+                with_flex(button("btn_neg", "+/-", "negate"), 1),
+                with_flex(button("btn_0", "0", "digit_0"), 1),
+                with_flex(button("btn_dot", ".", "decimal"), 1),
+                with_flex(button("btn_eq", "=", "equals"), 1)
+            ]), 1),
+
+            # Status bar
+            statusbar("calc_status",
+                "Ready",
+                "Calculator {mem_indicator}"
+            )
+        ])
+
+        val tree = build_tree_with_title(root, "Calculator", "dark")
+        UISession.new(tree)
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn _format_number(n: f64) -> text:
+    """Format a number for display, removing unnecessary trailing zeros."""
+    val s = "{n}"
+    # Remove trailing zeros after decimal point
+    if s.contains("."):
+        var trimmed = s
+        while trimmed.ends_with("0"):
+            trimmed = trimmed.slice(0, trimmed.len() - 1)
+        if trimmed.ends_with("."):
+            trimmed = trimmed.slice(0, trimmed.len() - 1)
+        return trimmed
+    s

@@ -1,0 +1,139 @@
+@allow(unnamed_duplicate_typed_args)
+# x86 Serial Port (UART) Driver
+#
+# COM1 serial driver for bare-metal debugging output.
+# Works with QEMU's -serial stdio option.
+#
+# Usage:
+#   serial_init()
+#   serial_print("Hello, QEMU!")
+
+use std.baremetal.x86.io.{outb, inb}
+
+# Standard COM port base addresses
+val COM1: i32 = 0x3F8
+val COM2: i32 = 0x2F8
+val COM3: i32 = 0x3E8
+val COM4: i32 = 0x2E8
+
+# UART register offsets (relative to base address)
+val UART_DATA: i32 = 0         # Data register (R/W)
+val UART_IER: i32 = 1          # Interrupt Enable Register
+val UART_FCR: i32 = 2          # FIFO Control Register (write only)
+val UART_IIR: i32 = 2          # Interrupt Identification (read only)
+val UART_LCR: i32 = 3          # Line Control Register
+val UART_MCR: i32 = 4          # Modem Control Register
+val UART_LSR: i32 = 5          # Line Status Register
+val UART_MSR: i32 = 6          # Modem Status Register
+val UART_SCRATCH: i32 = 7      # Scratch Register
+
+# When DLAB (Divisor Latch Access Bit) is set:
+val UART_DLL: i32 = 0          # Divisor Latch Low byte
+val UART_DLH: i32 = 1          # Divisor Latch High byte
+
+# Line Status Register bits
+val LSR_DATA_READY: i32 = 1     # Data ready to read
+val LSR_OVERRUN_ERR: i32 = 2    # Overrun error
+val LSR_PARITY_ERR: i32 = 4     # Parity error
+val LSR_FRAMING_ERR: i32 = 8    # Framing error
+val LSR_BREAK: i32 = 16         # Break indicator
+val LSR_THRE: i32 = 32          # Transmit Holding Register Empty
+val LSR_TEMT: i32 = 64          # Transmitter Empty
+
+# Line Control Register bits
+val LCR_DLAB: i32 = 128         # Divisor Latch Access Bit
+
+# Common baud rate divisors (for 115200 base clock)
+val BAUD_115200: i32 = 1
+val BAUD_57600: i32 = 2
+val BAUD_38400: i32 = 3
+val BAUD_19200: i32 = 6
+val BAUD_9600: i32 = 12
+
+# Global state
+var g_serial_port: i32 = COM1
+var g_serial_initialized: bool = false
+
+# Initialize serial port with baud rate divisor
+fn serial_init_port(port: i32, baud_divisor: i32):
+    g_serial_port = port
+
+    # Disable interrupts
+    outb(port + UART_IER, 0x00)
+
+    # Enable DLAB to set baud rate
+    outb(port + UART_LCR, LCR_DLAB)
+
+    # Set baud rate divisor
+    outb(port + UART_DLL, baud_divisor & 0xFF)
+    outb(port + UART_DLH, (baud_divisor >> 8) & 0xFF)
+
+    # 8 bits, no parity, one stop bit (8N1)
+    # Also clears DLAB
+    outb(port + UART_LCR, 0x03)
+
+    # Enable FIFO, clear them, with 14-byte threshold
+    outb(port + UART_FCR, 0xC7)
+
+    # IRQs enabled, RTS/DSR set
+    outb(port + UART_MCR, 0x0B)
+
+    # Test serial chip (loopback mode)
+    outb(port + UART_MCR, 0x1E)
+    outb(port + UART_DATA, 0xAE)
+
+    # Check if we receive the same byte
+    # If not, serial port not working, but continue anyway for QEMU
+
+    # Normal operation mode (not loopback)
+    outb(port + UART_MCR, 0x0F)
+
+    g_serial_initialized = true
+
+# Initialize COM1 with default settings (115200 baud)
+fn serial_init():
+    if g_serial_initialized:
+        return
+    serial_init_port(COM1, BAUD_115200)
+
+# Check if transmit buffer is empty
+fn serial_is_transmit_empty() -> bool:
+    (inb(g_serial_port + UART_LSR) & LSR_THRE) != 0
+
+# Wait for transmit buffer to be empty
+fn serial_wait_transmit():
+    while not serial_is_transmit_empty():
+        pass
+
+# Check if data is available to read
+fn serial_has_data() -> bool:
+    (inb(g_serial_port + UART_LSR) & LSR_DATA_READY) != 0
+
+# Write a single byte
+fn serial_write(byte: i32):
+    if not g_serial_initialized:
+        serial_init()
+    serial_wait_transmit()
+    outb(g_serial_port + UART_DATA, byte)
+
+# Read a single byte (blocking)
+fn serial_read() -> i32:
+    if not g_serial_initialized:
+        serial_init()
+    while not serial_has_data():
+        pass
+    inb(g_serial_port + UART_DATA)
+
+# Print a string to serial
+fn serial_print(s: text):
+    if not g_serial_initialized:
+        serial_init()
+    for i in 0..s.len():
+        val ch = s.char_at(i)
+        serial_write(ch)
+
+# Print a line to serial
+fn serial_println(s: text):
+    serial_print(s)
+    serial_write(0x0D)  # '\r'
+    serial_write(0x0A)  # '\n'

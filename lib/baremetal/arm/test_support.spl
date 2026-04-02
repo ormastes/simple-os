@@ -1,0 +1,100 @@
+# ARM32 (Cortex-M) Test Support Functions
+#
+# Helper functions for testing bare-metal ARM Cortex-M boot code.
+
+use nvic.{VectorTable, ExceptionVector}
+use startup.{STACK_TOP}
+
+
+# Create a test vector table
+fn create_vector_table() -> VectorTable:
+    VectorTable(
+        initial_sp: STACK_TOP,
+        reset: 0x08000100,  # Example reset handler address
+        nmi: 0x08000200,
+        hard_fault: 0x08000300,
+        mem_manage: 0x08000400,
+        bus_fault: 0x08000500,
+        usage_fault: 0x08000600,
+        reserved1: 0,
+        reserved2: 0,
+        reserved3: 0,
+        reserved4: 0,
+        svcall: 0x08000700,
+        debug_mon: 0x08000800,
+        reserved5: 0,
+        pendsv: 0x08000900,
+        systick: 0x08000A00
+    )
+
+# Validate vector table structure
+fn validate_vector_table(vt: VectorTable) -> bool:
+    # Check initial SP is valid (should be in RAM)
+    if vt.initial_sp < 0x20000000 or vt.initial_sp > 0x20100000:
+        return false
+
+    # Check reset handler is valid (should be in flash, odd address for Thumb)
+    if vt.reset < 0x08000000 or vt.reset > 0x08100000:
+        return false
+    if (vt.reset & 0x1) == 0:  # Should have Thumb bit set
+        return false
+
+    # Check reserved entries are zero
+    if vt.reserved1 != 0 or vt.reserved2 != 0 or vt.reserved3 != 0:
+        return false
+    if vt.reserved4 != 0 or vt.reserved5 != 0:
+        return false
+
+    true
+
+# Check that all required Cortex-M exceptions are present
+fn check_exception_count() -> i64:
+    # Cortex-M has 16 exception vectors (including reset)
+    # Entry 0: Initial SP
+    # Entries 1-15: Exceptions
+    # Entries 16+: External IRQs
+    16
+
+# Check vector table alignment
+# ARM Cortex-M requires vector table aligned to its size (minimum 128 bytes)
+fn check_vector_alignment(addr: u32) -> bool:
+    # Vector table must be aligned to at least 128 bytes
+    # For larger tables, alignment = next power of 2 >= table size
+    (addr % 128) == 0
+
+# Check stack alignment
+# ARM AAPCS requires 8-byte stack alignment
+fn check_stack_alignment(sp: u32) -> bool:
+    (sp % 8) == 0
+
+# Simulate checking if .data section is initialized
+fn check_data_init(start_addr: u32, end_addr: u32) -> bool:
+    # In a real test, would verify memory contents
+    # For now, just check addresses are reasonable
+    if start_addr < 0x20000000:  # Should be in SRAM
+        return false
+    if end_addr <= start_addr:
+        return false
+    if end_addr > 0x20100000:  # Sanity check
+        return false
+    true
+
+# Simulate checking if .bss section is zeroed
+fn check_bss_init(start_addr: u32, end_addr: u32) -> bool:
+    # In a real test, would verify all bytes are zero
+    # For now, just check addresses are reasonable
+    if start_addr < 0x20000000:  # Should be in SRAM
+        return false
+    if end_addr <= start_addr:
+        return false
+    if end_addr > 0x20100000:  # Sanity check
+        return false
+    true
+
+# Get exception vector number
+fn get_exception_number(vec: ExceptionVector) -> i64:
+    vec.to_i64()
+
+# Get exception name
+fn get_exception_name(vec: ExceptionVector) -> text:
+    vec.name()

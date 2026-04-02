@@ -1,0 +1,59 @@
+# UI State Management
+#
+# Provides state initialization and update helpers
+# for the UI rendering system.
+
+use common.ui.widget.{UIState, UITree, UIMode, UIEvent}
+use common.ui.event.{process_event}
+
+# =========================================================================
+# State Initialization
+# =========================================================================
+
+fn init_state(tree: UITree) -> UIState:
+    """Create initial UIState from a UITree."""
+    return UIState.new(tree)
+
+fn init_state_with_mode(tree: UITree, mode_str: text) -> UIState:
+    """Create initial UIState with a specific mode."""
+    var state = UIState.new(tree)
+    val mode = match mode_str:
+        "normal" => UIMode.Normal
+        "command" => UIMode.Command
+        "insert" => UIMode.Insert
+        "menu" => UIMode.Menu
+        _ => UIMode.Normal
+    return UIState(
+        tree: state.tree,
+        mode: mode,
+        focused_id: state.focused_id,
+        command_buffer: state.command_buffer
+    )
+
+# =========================================================================
+# State Updates
+# =========================================================================
+
+fn update_state(state: UIState, event: UIEvent) -> UIState:
+    """Process an event and return the new state."""
+    return process_event(state, event)
+
+fn update_tree(state: UIState, new_tree: UITree) -> UIState:
+    """Replace the tree in the state (e.g., after file reload)."""
+    return UIState(
+        tree: new_tree,
+        mode: state.mode,
+        focused_id: state.focused_id,
+        command_buffer: state.command_buffer
+    )
+
+fn is_quit_event(event: UIEvent) -> bool:
+    """Check if an event is a quit event."""
+    match event:
+        UIEvent.Quit => return true
+        _ => return false
+
+fn is_quit_command(state: UIState) -> bool:
+    """Check if the current command buffer contains a quit command."""
+    val cmd = state.command_buffer
+    return cmd == "q" or cmd == "quit"

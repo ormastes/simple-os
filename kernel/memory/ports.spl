@@ -1,0 +1,31 @@
+# Memory Layer — Input/Output Ports
+#
+# Input: BootOutputPort (memory map, kernel location)
+# Output: allocation and mapping services for all upper layers.
+
+use os.kernel.types.memory_types.{PhysAddr, VirtAddr, PageFrame, VmMap, VmFlags}
+use os.kernel.boot.ports.{BootOutputPort}
+
+struct MemoryInputPort:
+    """What memory layer needs from boot."""
+    boot_info: BootOutputPort
+
+struct MemoryOutputPort:
+    """What memory layer provides to upper layers."""
+    # Physical memory
+    alloc_page_fn: fn() -> PageFrame?
+    free_page_fn: fn(PageFrame) -> bool
+    alloc_pages_fn: fn(u64) -> PhysAddr?
+
+    # Virtual memory
+    map_page_fn: fn(VirtAddr, PhysAddr, VmFlags) -> bool
+    unmap_page_fn: fn(VirtAddr) -> bool
+    create_address_space_fn: fn() -> u64      # Returns PML4 physical address
+
+    # Kernel heap
+    heap_alloc_fn: fn(u64) -> VirtAddr?
+    heap_free_fn: fn(VirtAddr)
+
+    # Info
+    total_memory: u64
+    free_memory: u64

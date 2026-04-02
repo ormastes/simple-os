@@ -1,0 +1,478 @@
+# RISC-V 32 Paging — Sv32 2-Level Page Table Management
+#
+# Implements RISC-V Sv32 paging (Root Page Table → Leaf Page Table).
+# This is significantly different from rv64's Sv39 (3-level, 512 entries):
+#
+# Sv32 address decomposition (32-bit virtual):
+#   [31:22] VPN[1]  (10 bits, 1024 entries)
+#   [21:12] VPN[0]  (10 bits, 1024 entries)
+#   [11:0]  Offset  (12 bits, 4KB page)
+#
+# Page Table Entry format (32-bit):
+#   [31:10] PPN     (22 bits — physical page number)
+#   [9:8]   RSW     (reserved for software)
+#   [7]     D       (Dirty)
+#   [6]     A       (Accessed)
+#   [5]     G       (Global)
+#   [4]     U       (User)
+#   [3]     X       (eXecute)
+#   [2]     W       (Write)
+#   [1]     R       (Read)
+#   [0]     V       (Valid)
+#
+# SATP register (32-bit):
+#   [31]    Mode    (0=Bare, 1=Sv32)
+#   [30:22] ASID    (9 bits)
+#   [21:0]  PPN     (22 bits — physical page number of root table)
+#
+# Key constants:
+#   - 1024 entries per table (not 512)
+#   - 4 bytes per PTE (not 8)
+#   - Table size = 1024 * 4 = 4096 bytes (same 4KB page)
+#   - Uses mmio_read32/mmio_write32 (not 64-bit variants)
+
+use os.kernel.types.memory_types.{PhysAddr, VirtAddr, PageFrame, VmFlags}
+use os.kernel.boot.mmio.{mmio_read32, mmio_write32}
+use os.kernel.arch.riscv32.cpu.{csrw_satp, sfence_vma_all, sfence_vma}
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+val PAGE_SIZE: u64 = 4096
+val ENTRIES_PER_TABLE: u64 = 1024       # 10-bit VPN fields
+val PTE_SIZE: u64 = 4                   # 4 bytes per PTE (32-bit)
+val TABLE_SIZE: u64 = 4096              # 1024 * 4 bytes
+
+# PTE flag bits (bits 0-7)
+val PTE_V: u32 = 1 << 0                # Valid
+val PTE_R: u32 = 1 << 1                # Read
+val PTE_W: u32 = 1 << 2                # Write
+val PTE_X: u32 = 1 << 3                # Execute
+val PTE_U: u32 = 1 << 4                # User-accessible
+val PTE_G: u32 = 1 << 5                # Global
+val PTE_A: u32 = 1 << 6                # Accessed
+val PTE_D: u32 = 1 << 7                # Dirty
+
+# PPN mask: bits [31:10] of PTE
+val PTE_PPN_MASK: u32 = 0xFFFFFC00
+
+# SATP mode bit: bit 31 = 1 for Sv32
+val SATP_MODE_SV32: u32 = 0x80000000
+
+# Identity map range for QEMU virt: first 128MB (RAM region)
+val IDENTITY_MAP_END: u64 = 0x88000000
+
+# ============================================================================
+# Virtual Memory Manager (Sv32)
+# ============================================================================
+
+struct Rv32VirtMemManager:
+    """Sv32 2-level page table manager.
+
+    Manages root page tables for the kernel and per-process
+    address spaces. Each table has 1024 4-byte entries.
+    """
+    root_phys: u64              # Physical address of kernel root page table
+    hhdm_offset: u64            # Always 0 for rv32 (flat physical)
+
+# Global VMM instance
+var g_vmm: Rv32VirtMemManager = Rv32VirtMemManager(
+    root_phys: 0,
+    hhdm_offset: 0
+)
+
+# ============================================================================
+# Address Decomposition (Sv32)
+# ============================================================================
+
+fn _vpn1(vaddr: u64) -> u64:
+    """Extract VPN[1] from virtual address (bits 31:22) — root table index."""
+    (vaddr >> 22) & 0x3FF
+
+fn _vpn0(vaddr: u64) -> u64:
+    """Extract VPN[0] from virtual address (bits 21:12) — leaf table index."""
+    (vaddr >> 12) & 0x3FF
+
+# ============================================================================
+# PTE Helpers
+# ============================================================================
+
+fn _flags_to_pte_bits(flags: VmFlags) -> u32:
+    """Convert VmFlags to Sv32 PTE bits."""
+    var bits: u32 = 0
+
+    if flags.present:
+        bits = bits | PTE_V
+    if flags.writable:
+        bits = bits | PTE_R | PTE_W
+    else:
+        bits = bits | PTE_R           # Read-only if not writable
+    if flags.user:
+        bits = bits | PTE_U
+    if not flags.no_execute:
+        bits = bits | PTE_X
+
+    # Set accessed and dirty to avoid page faults on first access
+    bits = bits | PTE_A | PTE_D
+
+    bits
+
+fn _read_pte(table_phys: u64, index: u64) -> u32:
+    """Read a 32-bit page table entry from a table at physical address."""
+    val addr = table_phys + (index * PTE_SIZE)
+    mmio_read32(addr)
+
+fn _write_pte(table_phys: u64, index: u64, value: u32):
+    """Write a 32-bit page table entry to a table at physical address."""
+    val addr = table_phys + (index * PTE_SIZE)
+    mmio_write32(addr, value)
+
+fn _pte_is_valid(entry: u32) -> bool:
+    """Check if a PTE has the valid bit set."""
+    (entry & PTE_V) != 0
+
+fn _pte_is_leaf(entry: u32) -> bool:
+    """Check if a PTE is a leaf (has R, W, or X set)."""
+    (entry & (PTE_R | PTE_W | PTE_X)) != 0
+
+fn _pte_phys_addr(entry: u32) -> u64:
+    """Extract physical address from a PTE.
+
+    PPN is in bits [31:10]. Shift right by 10 to get PPN, then
+    shift left by 12 to get physical address.
+    """
+    val ppn = (entry & PTE_PPN_MASK) >> 10
+    (ppn as u64) << 12
+
+fn _phys_to_pte_ppn(phys: u64) -> u32:
+    """Convert a physical address to PTE PPN field (bits 31:10).
+
+    Physical page number = phys >> 12, then shifted left by 10 into PTE.
+    """
+    val ppn = (phys >> 12) as u32
+    ppn << 10
+
+# ============================================================================
+# PMM Interface
+# ============================================================================
+
+extern fn pmm_alloc_page() -> PageFrame?
+extern fn pmm_free_page(frame: PageFrame)
+
+fn _alloc_table_page() -> u64:
+    """Allocate a zeroed page for a new page table.
+
+    Returns physical address of the new table, or 0 on failure.
+    """
+    val frame = pmm_alloc_page()
+    if val Some(f) = frame:
+        val phys = f.pfn * PAGE_SIZE
+
+        # Zero the page table (1024 entries, 4 bytes each)
+        var i: u64 = 0
+        while i < ENTRIES_PER_TABLE:
+            _write_pte(phys, i, 0)
+            i = i + 1
+
+        return phys
+
+    # Allocation failed
+    0
+
+# ============================================================================
+# Page Table Walk & Mapping
+# ============================================================================
+
+fn _ensure_table_entry(table_phys: u64, index: u64) -> u64:
+    """Ensure a PTE at index points to a valid next-level table.
+
+    If the entry is not valid or is a leaf, allocates a new table page.
+    Returns the physical address of the next-level table, or 0 on failure.
+    """
+    val entry = _read_pte(table_phys, index)
+
+    if _pte_is_valid(entry) and not _pte_is_leaf(entry):
+        # Non-leaf valid entry — points to next-level table
+        return _pte_phys_addr(entry)
+
+    # Allocate new table
+    val new_table_phys = _alloc_table_page()
+    if new_table_phys == 0:
+        return 0
+
+    # Write entry: valid, non-leaf (no R/W/X — pointer to next table)
+    val new_entry = _phys_to_pte_ppn(new_table_phys) | PTE_V
+    _write_pte(table_phys, index, new_entry)
+
+    new_table_phys
+
+# ============================================================================
+# Forward declaration for serial debug
+# ============================================================================
+
+extern fn uart_writeln(msg: text)
+
+# ============================================================================
+# VMM Initialization
+# ============================================================================
+
+fn vmm_init(hhdm_offset: u64):
+    """Initialize Sv32 virtual memory manager.
+
+    Creates kernel root page table and identity-maps RAM region.
+    Does NOT switch SATP yet — caller should do that after all mappings.
+    """
+    uart_writeln("[VMM-RV32] Initializing Sv32 virtual memory manager...")
+
+    g_vmm.hhdm_offset = hhdm_offset
+
+    # Allocate root page table
+    val root_phys = _alloc_table_page()
+    if root_phys == 0:
+        uart_writeln("[VMM-RV32] FATAL: Could not allocate root page table")
+        return
+
+    g_vmm.root_phys = root_phys
+    uart_writeln("[VMM-RV32] Root page table at physical 0x{root_phys}")
+
+    # Identity-map RAM region using 4MB megapages
+    uart_writeln("[VMM-RV32] Identity-mapping RAM region...")
+    _identity_map_ram()
+
+    uart_writeln("[VMM-RV32] VMM initialization complete")
+
+fn _identity_map_ram():
+    """Identity-map the RAM region using Sv32 4MB megapages.
+
+    Sv32 supports 4MB megapages at the root level (VPN[1]).
+    A megapage PTE in the root table maps 4MB (2^22 bytes).
+    We map from 0x80000000 to 0x88000000 (128MB = 32 megapages).
+    """
+    val root_phys = g_vmm.root_phys
+
+    # 0x80000000 >> 22 = 512, need entries 512..543 (32 megapages)
+    val start_vpn1 = 0x80000000 >> 22    # = 512
+    val megapage_count = 32              # 128MB / 4MB = 32
+
+    var i: u64 = 0
+    while i < megapage_count:
+        val vpn1_idx = start_vpn1 + i
+        val phys_addr = vpn1_idx << 22   # Each megapage is 4MB aligned
+
+        # Megapage: set R+W+X+V+A+D (leaf entry at root level)
+        val ppn = _phys_to_pte_ppn(phys_addr as u64)
+        val entry = ppn | PTE_V | PTE_R | PTE_W | PTE_X | PTE_A | PTE_D | PTE_G
+        _write_pte(root_phys, vpn1_idx as u64, entry)
+
+        i = i + 1
+
+    # Also map UART MMIO region (0x10000000)
+    val uart_vpn1 = 0x10000000 >> 22     # = 64
+    val uart_ppn = _phys_to_pte_ppn(0x10000000)
+    val uart_entry = uart_ppn | PTE_V | PTE_R | PTE_W | PTE_A | PTE_D | PTE_G
+    _write_pte(root_phys, uart_vpn1 as u64, uart_entry)
+
+    # Map PLIC region (0x0C000000)
+    val plic_vpn1 = 0x0C000000 >> 22     # = 48
+    val plic_ppn = _phys_to_pte_ppn(0x0C000000)
+    val plic_entry = plic_ppn | PTE_V | PTE_R | PTE_W | PTE_A | PTE_D | PTE_G
+    _write_pte(root_phys, plic_vpn1 as u64, plic_entry)
+
+    # Map CLINT region (0x02000000)
+    val clint_vpn1 = 0x02000000 >> 22    # = 8
+    val clint_ppn = _phys_to_pte_ppn(0x02000000)
+    val clint_entry = clint_ppn | PTE_V | PTE_R | PTE_W | PTE_A | PTE_D | PTE_G
+    _write_pte(root_phys, clint_vpn1 as u64, clint_entry)
+
+    uart_writeln("[VMM-RV32] Identity-mapped 128MB RAM + MMIO with 4MB megapages")
+
+# ============================================================================
+# Page Mapping (4KB pages)
+# ============================================================================
+
+fn vmm_map_page(virt: VirtAddr, phys: PhysAddr, flags: VmFlags) -> bool:
+    """Map a single 4KB virtual page to a physical frame.
+
+    Walks the 2-level Sv32 page table (root → leaf), creating the
+    leaf table if needed.
+
+    Returns true on success, false on failure.
+    """
+    val vaddr = virt.addr
+    val paddr = phys.addr
+    val root_phys = g_vmm.root_phys
+
+    # Walk root → leaf table
+    val vpn1 = _vpn1(vaddr)
+    val leaf_phys = _ensure_table_entry(root_phys, vpn1)
+    if leaf_phys == 0:
+        return false
+
+    # Write the leaf PTE
+    val vpn0 = _vpn0(vaddr)
+    val pte_flags = _flags_to_pte_bits(flags)
+    val ppn = _phys_to_pte_ppn(paddr)
+    val entry = ppn | pte_flags
+    _write_pte(leaf_phys, vpn0, entry)
+
+    # Invalidate TLB for this virtual address
+    sfence_vma(vaddr as u32, 0)
+
+    true
+
+fn vmm_unmap_page(virt: VirtAddr) -> bool:
+    """Unmap a single 4KB virtual page.
+
+    Clears the PTE and invalidates the TLB.
+    Does NOT free the physical page — caller must do that.
+
+    Returns true if the page was mapped, false if not.
+    """
+    val vaddr = virt.addr
+    val root_phys = g_vmm.root_phys
+
+    # Check root entry
+    val vpn1 = _vpn1(vaddr)
+    val root_entry = _read_pte(root_phys, vpn1)
+    if not _pte_is_valid(root_entry):
+        return false
+    if _pte_is_leaf(root_entry):
+        return false  # Cannot unmap a single page from a megapage
+
+    val leaf_phys = _pte_phys_addr(root_entry)
+    val vpn0 = _vpn0(vaddr)
+    val leaf_entry = _read_pte(leaf_phys, vpn0)
+    if not _pte_is_valid(leaf_entry):
+        return false
+
+    # Clear the entry
+    _write_pte(leaf_phys, vpn0, 0)
+
+    # Invalidate TLB
+    sfence_vma(vaddr as u32, 0)
+
+    true
+
+# ============================================================================
+# Address Space Management
+# ============================================================================
+
+fn vmm_create_address_space() -> u64:
+    """Create a new address space (root page table) for a process.
+
+    Allocates a fresh root table and copies kernel mappings.
+    Returns the physical address of the new root table, or 0 on failure.
+    """
+    val new_root_phys = _alloc_table_page()
+    if new_root_phys == 0:
+        return 0
+
+    val kernel_root = g_vmm.root_phys
+
+    # Copy kernel-space entries (upper half: indices 512..1023)
+    # This ensures kernel is mapped in every address space
+    var i: u64 = 512
+    while i < ENTRIES_PER_TABLE:
+        val entry = _read_pte(kernel_root, i)
+        _write_pte(new_root_phys, i, entry)
+        i = i + 1
+
+    new_root_phys
+
+fn vmm_switch_address_space(root_phys: u64):
+    """Switch to a different address space by writing SATP.
+
+    SATP format for Sv32:
+      [31]    = 1 (Sv32 mode)
+      [30:22] = ASID (0 for now)
+      [21:0]  = PPN (root_phys >> 12)
+    """
+    val ppn = (root_phys >> 12) as u32
+    val satp_val = SATP_MODE_SV32 | ppn
+    csrw_satp(satp_val)
+    sfence_vma_all()
+
+# ============================================================================
+# VMM Query Interface
+# ============================================================================
+
+fn vmm_translate(virt: VirtAddr) -> PhysAddr?:
+    """Translate virtual address to physical by walking Sv32 page tables.
+
+    Returns nil if the address is not mapped.
+    """
+    val vaddr = virt.addr
+    val root_phys = g_vmm.root_phys
+
+    val vpn1 = _vpn1(vaddr)
+    val root_entry = _read_pte(root_phys, vpn1)
+    if not _pte_is_valid(root_entry):
+        return nil
+
+    # Check for 4MB megapage (leaf at root level)
+    if _pte_is_leaf(root_entry):
+        val base = _pte_phys_addr(root_entry)
+        val offset = vaddr & 0x003FFFFF  # Lower 22 bits
+        return PhysAddr(addr: base + offset)
+
+    # Walk to leaf table
+    val leaf_phys = _pte_phys_addr(root_entry)
+    val vpn0 = _vpn0(vaddr)
+    val leaf_entry = _read_pte(leaf_phys, vpn0)
+    if not _pte_is_valid(leaf_entry):
+        return nil
+
+    val base = _pte_phys_addr(leaf_entry)
+    val offset = vaddr & 0xFFF  # Lower 12 bits
+    PhysAddr(addr: base + offset)
+
+fn vmm_get_manager() -> Rv32VirtMemManager:
+    """Get reference to the global VMM."""
+    g_vmm
+
+# ============================================================================
+# Rv32Paging — HAL-Compatible Paging Interface
+# ============================================================================
+
+struct Rv32Paging:
+    """RISC-V 32-bit Sv32 paging implementation.
+
+    Wraps the Rv32VirtMemManager and page table operations behind
+    a HAL-compatible interface. 2-level page tables with 1024 entries
+    per table and 4-byte PTEs.
+    """
+    pass_dn
+
+impl Rv32Paging:
+    fn init(hhdm_offset: u64):
+        """Initialize Sv32 paging (root table, identity map)."""
+        vmm_init(hhdm_offset)
+
+    fn map_page(virt: VirtAddr, phys: PhysAddr, flags: VmFlags) -> bool:
+        """Map a 4KB virtual page to a physical frame."""
+        vmm_map_page(virt, phys, flags)
+
+    fn unmap_page(virt: VirtAddr) -> bool:
+        """Unmap a 4KB virtual page."""
+        vmm_unmap_page(virt)
+
+    fn translate(virt: VirtAddr) -> PhysAddr?:
+        """Translate virtual to physical address."""
+        vmm_translate(virt)
+
+    fn create_address_space() -> u64:
+        """Create a new root page table for a process."""
+        vmm_create_address_space()
+
+    fn switch_address_space(root_phys: u64):
+        """Switch to a different address space (write SATP)."""
+        vmm_switch_address_space(root_phys)
+
+    fn page_size() -> u64:
+        """Return page size in bytes (4KB for Sv32)."""
+        PAGE_SIZE
+
+    fn address_levels() -> u64:
+        """Return number of page table levels (2 for Sv32)."""
+        2

@@ -1,0 +1,193 @@
+# App Manifest — Application Metadata for Launcher
+#
+# Defines application entries for the desktop app launcher.
+# Manifests can be loaded from /usr/share/apps/*.sdn or
+# returned as built-in defaults.
+#
+# MDSOC: feature dimension, desktop layer
+
+# =========================================================================
+# App Manifest
+# =========================================================================
+
+struct AppManifest:
+    """Application manifest for the desktop launcher."""
+    name: text
+    description: text
+    category: text          # "System", "Utilities", "Development", "Settings"
+    binary: text            # Path to binary
+    capabilities: [text]    # Required capabilities
+    icon: text              # Icon identifier (text label for now)
+
+# =========================================================================
+# Manifest Loading
+# =========================================================================
+
+fn load_app_manifests() -> [AppManifest]:
+    """Load application manifests.
+
+    Returns built-in defaults plus any found in /usr/share/apps/.
+    """
+    # Built-in applications
+    var manifests = default_manifests()
+
+    # In a full OS, we would also scan /usr/share/apps/*.sdn
+    # and parse each file into an AppManifest.
+    # For now, return built-in defaults only.
+    manifests
+
+fn default_manifests() -> [AppManifest]:
+    """Built-in application manifest list."""
+    [
+        AppManifest(
+            name: "Terminal",
+            description: "VT100/ANSI terminal emulator",
+            category: "System",
+            binary: "/sys/apps/terminal",
+            capabilities: ["FileRead(/)", "FileWrite(/home)"],
+            icon: "term"
+        ),
+        AppManifest(
+            name: "Shell",
+            description: "Interactive command shell",
+            category: "System",
+            binary: "/sys/apps/shell",
+            capabilities: ["FileRead(/)", "FileWrite(/home)", "ProcessSpawn"],
+            icon: "shell"
+        ),
+        AppManifest(
+            name: "Editor",
+            description: "Modal text editor (vi-like)",
+            category: "Utilities",
+            binary: "/sys/apps/editor",
+            capabilities: ["FileRead(/)", "FileWrite(/home)"],
+            icon: "edit"
+        ),
+        AppManifest(
+            name: "File Manager",
+            description: "Two-panel file browser",
+            category: "Utilities",
+            binary: "/sys/apps/file_manager",
+            capabilities: ["FileRead(/)", "FileWrite(/home)"],
+            icon: "files"
+        ),
+        AppManifest(
+            name: "System Monitor",
+            description: "Process and resource monitor",
+            category: "System",
+            binary: "/sys/apps/sysmon",
+            capabilities: [],
+            icon: "monitor"
+        ),
+        AppManifest(
+            name: "Settings",
+            description: "System settings and configuration",
+            category: "Settings",
+            binary: "/sys/apps/settings",
+            capabilities: ["FileRead(/etc)", "FileWrite(/etc)"],
+            icon: "settings"
+        ),
+        AppManifest(
+            name: "Calculator",
+            description: "Standard calculator with memory functions",
+            category: "Utilities",
+            binary: "/sys/apps/calculator",
+            capabilities: [],
+            icon: "calc"
+        ),
+        AppManifest(
+            name: "Memo",
+            description: "Simple text editor (notepad-style)",
+            category: "Utilities",
+            binary: "/sys/apps/memo",
+            capabilities: ["FileRead(/)", "FileWrite(/home)"],
+            icon: "memo"
+        ),
+        AppManifest(
+            name: "File Explorer",
+            description: "Windows-style file browser with tree navigation",
+            category: "Utilities",
+            binary: "/sys/apps/file_explorer",
+            capabilities: ["FileRead(/)", "FileWrite(/home)"],
+            icon: "explore"
+        ),
+        AppManifest(
+            name: "Paint",
+            description: "Simple drawing and painting app",
+            category: "Utilities",
+            binary: "/sys/apps/paint",
+            capabilities: ["FileRead(/)", "FileWrite(/home)"],
+            icon: "paint"
+        ),
+        AppManifest(
+            name: "Clock",
+            description: "Clock with timer, stopwatch, and alarms",
+            category: "Utilities",
+            binary: "/sys/apps/clock",
+            capabilities: [],
+            icon: "clock"
+        ),
+        AppManifest(
+            name: "Calendar",
+            description: "Calendar with events and date navigation",
+            category: "Utilities",
+            binary: "/sys/apps/calendar",
+            capabilities: [],
+            icon: "calendar"
+        ),
+        AppManifest(
+            name: "Screenshot",
+            description: "Screen capture and snipping tool",
+            category: "Utilities",
+            binary: "/sys/apps/screenshot",
+            capabilities: ["FileWrite(/home)"],
+            icon: "screenshot"
+        ),
+        AppManifest(
+            name: "Image Viewer",
+            description: "View images as ASCII art with zoom and browse",
+            category: "Utilities",
+            binary: "/sys/apps/image_viewer",
+            capabilities: ["FileRead(/)"],
+            icon: "image"
+        ),
+        AppManifest(
+            name: "Disk Manager",
+            description: "Storage usage and partition management",
+            category: "System",
+            binary: "/sys/apps/disk_manager",
+            capabilities: ["FileRead(/dev)"],
+            icon: "disk"
+        ),
+        AppManifest(
+            name: "Log Viewer",
+            description: "Kernel and service log viewer",
+            category: "System",
+            binary: "/sys/apps/log_viewer",
+            capabilities: [],
+            icon: "log"
+        ),
+        AppManifest(
+            name: "Package Manager",
+            description: "Install and manage software packages",
+            category: "System",
+            binary: "/sys/apps/pkg",
+            capabilities: ["FileRead(/)", "FileWrite(/pkg)", "NetConnect(443)"],
+            icon: "pkg"
+        )
+    ]
+
+# =========================================================================
+# Search
+# =========================================================================
+
+fn search_apps(manifests: [AppManifest], query: text) -> [AppManifest]:
+    """Search manifests by name or description."""
+    if query == "":
+        return manifests
+    var results: [AppManifest] = []
+    val q_lower = query.to_lower()
+    for m in manifests:
+        if m.name.to_lower().contains(q_lower) or m.description.to_lower().contains(q_lower):
+            results = results.push(m)
+    results

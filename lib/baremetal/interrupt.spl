@@ -1,0 +1,566 @@
+@allow(unnamed_duplicate_typed_args)
+@allow(primitive_api)
+# Bare-Metal Interrupt Handlers
+#
+# Interrupt and exception handling for bare-metal targets.
+# Provides:
+# - Interrupt vector table management
+# - Exception handler registration
+# - Interrupt enable/disable
+# - Platform-specific interrupt controllers (NVIC, PLIC, APIC)
+#
+# Usage:
+#   # ARM Cortex-M (NVIC)
+#   nvic_enable_irq(15)  # Enable SysTick
+#   nvic_set_priority(15, 128)
+#   register_interrupt_handler(15, systick_handler)
+#
+#   # RISC-V (PLIC)
+#   plic_enable_irq(10)  # Enable UART interrupt
+#   plic_set_priority(10, 5)
+#
+#   # x86_64 (APIC)
+#   apic_enable_irq(32)  # Enable timer
+
+
+# ============================================================================
+# ARM Cortex-M NVIC (Nested Vectored Interrupt Controller)
+# ============================================================================
+
+# NVIC Register Base Addresses
+val NVIC_ISER_BASE: u32 = 0xE000E100  # Interrupt Set-Enable Registers
+val NVIC_ICER_BASE: u32 = 0xE000E180  # Interrupt Clear-Enable Registers
+val NVIC_ISPR_BASE: u32 = 0xE000E200  # Interrupt Set-Pending Registers
+val NVIC_ICPR_BASE: u32 = 0xE000E280  # Interrupt Clear-Pending Registers
+val NVIC_IABR_BASE: u32 = 0xE000E300  # Interrupt Active Bit Registers
+val NVIC_IPR_BASE: u32 = 0xE000E400   # Interrupt Priority Registers
+
+# System Control Block (SCB) Registers
+val SCB_ICSR: u32 = 0xE000ED04        # Interrupt Control/State Register
+val SCB_VTOR: u32 = 0xE000ED08        # Vector Table Offset Register
+val SCB_AIRCR: u32 = 0xE000ED0C       # Application Interrupt/Reset Control
+val SCB_SCR: u32 = 0xE000ED10         # System Control Register
+val SCB_SHCSR: u32 = 0xE000ED24       # System Handler Control/State
+
+# Cortex-M Exception Numbers
+val EXCEPTION_RESET: i32 = 1
+val EXCEPTION_NMI: i32 = 2
+val EXCEPTION_HARD_FAULT: i32 = 3
+val EXCEPTION_MEM_MANAGE: i32 = 4
+val EXCEPTION_BUS_FAULT: i32 = 5
+val EXCEPTION_USAGE_FAULT: i32 = 6
+val EXCEPTION_SVCALL: i32 = 11
+val EXCEPTION_DEBUG_MON: i32 = 12
+val EXCEPTION_PENDSV: i32 = 14
+val EXCEPTION_SYSTICK: i32 = 15
+
+fn nvic_enable_irq(irq: i32):
+    """Enable external interrupt.
+
+    Args:
+        irq: Interrupt number (0-239)
+
+    Example:
+        nvic_enable_irq(15)  # Enable SysTick
+    """
+    if irq < 0 or irq >= 240:
+        return
+
+    val reg_idx = irq / 32
+    val bit_idx = irq % 32
+    val reg_addr = NVIC_ISER_BASE + (reg_idx * 4)
+
+    # Set enable bit
+    val mask: u32 = 1 << bit_idx
+    mem_write_u32(reg_addr, mask)
+
+fn nvic_disable_irq(irq: i32):
+    """Disable external interrupt.
+
+    Args:
+        irq: Interrupt number (0-239)
+    """
+    if irq < 0 or irq >= 240:
+        return
+
+    val reg_idx = irq / 32
+    val bit_idx = irq % 32
+    val reg_addr = NVIC_ICER_BASE + (reg_idx * 4)
+
+    # Set disable bit
+    val mask: u32 = 1 << bit_idx
+    mem_write_u32(reg_addr, mask)
+
+fn nvic_set_priority(irq: i32, priority: u8):
+    """Set interrupt priority.
+
+    Args:
+        irq: Interrupt number (0-239)
+        priority: Priority level (0 = highest, 255 = lowest)
+
+    Note: Cortex-M typically implements 3-8 priority bits.
+          Lower 4-5 bits may be ignored.
+    """
+    if irq < 0 or irq >= 240:
+        return
+
+    val reg_addr = NVIC_IPR_BASE + irq
+    mem_write_u8(reg_addr, priority)
+
+fn nvic_get_priority(irq: i32) -> u8:
+    """Get interrupt priority.
+
+    Args:
+        irq: Interrupt number (0-239)
+
+    Returns:
+        Priority level (0-255)
+    """
+    if irq < 0 or irq >= 240:
+        return 255
+
+    val reg_addr = NVIC_IPR_BASE + irq
+    mem_read_u8(reg_addr)
+
+fn nvic_set_pending(irq: i32):
+    """Manually trigger interrupt (set pending).
+
+    Args:
+        irq: Interrupt number (0-239)
+    """
+    if irq < 0 or irq >= 240:
+        return
+
+    val reg_idx = irq / 32
+    val bit_idx = irq % 32
+    val reg_addr = NVIC_ISPR_BASE + (reg_idx * 4)
+
+    val mask: u32 = 1 << bit_idx
+    mem_write_u32(reg_addr, mask)
+
+fn nvic_clear_pending(irq: i32):
+    """Clear pending interrupt.
+
+    Args:
+        irq: Interrupt number (0-239)
+    """
+    if irq < 0 or irq >= 240:
+        return
+
+    val reg_idx = irq / 32
+    val bit_idx = irq % 32
+    val reg_addr = NVIC_ICPR_BASE + (reg_idx * 4)
+
+    val mask: u32 = 1 << bit_idx
+    mem_write_u32(reg_addr, mask)
+
+fn nvic_is_active(irq: i32) -> bool:
+    """Check if interrupt is currently being serviced.
+
+    Args:
+        irq: Interrupt number (0-239)
+
+    Returns:
+        true if interrupt is active, false otherwise
+    """
+    if irq < 0 or irq >= 240:
+        return false
+
+    val reg_idx = irq / 32
+    val bit_idx = irq % 32
+    val reg_addr = NVIC_IABR_BASE + (reg_idx * 4)
+
+    val reg_value = mem_read_u32(reg_addr)
+    val mask: u32 = 1 << bit_idx
+    (reg_value & mask) != 0
+
+fn nvic_set_vector_table(offset: u32):
+    """Set vector table offset register (VTOR).
+
+    Args:
+        offset: Vector table address (must be aligned to 128 bytes)
+    """
+    mem_write_u32(SCB_VTOR, offset)
+
+fn nvic_system_reset():
+    """Trigger system reset via AIRCR.
+
+    Resets the entire microcontroller.
+    """
+    val VECTKEY: u32 = 0x05FA0000  # Write key
+    val SYSRESETREQ: u32 = 0x04    # System reset request bit
+
+    mem_write_u32(SCB_AIRCR, VECTKEY | SYSRESETREQ)
+
+    # Loop forever (shouldn't reach here)
+    while true:
+        pass_do_nothing
+
+# ============================================================================
+# RISC-V PLIC (Platform-Level Interrupt Controller)
+# ============================================================================
+
+# PLIC Register Base (QEMU virt machine)
+val PLIC_BASE: u32 = 0x0C000000
+
+# PLIC Register Offsets
+val PLIC_PRIORITY_BASE: u32 = 0x0000  # Interrupt priorities
+val PLIC_PENDING_BASE: u32 = 0x1000   # Interrupt pending bits
+val PLIC_ENABLE_BASE: u32 = 0x2000    # Interrupt enable bits (per context)
+val PLIC_THRESHOLD: u32 = 0x200000    # Priority threshold (per context)
+val PLIC_CLAIM: u32 = 0x200004        # Claim/complete (per context)
+
+fn plic_enable_irq(irq: i32):
+    """Enable external interrupt in PLIC.
+
+    Args:
+        irq: Interrupt number (1-1023)
+
+    Note: IRQ 0 is reserved, valid range is 1-1023.
+    """
+    if irq < 1 or irq > 1023:
+        return
+
+    # Context 1 (machine mode, hart 0)
+    val context: u32 = 1
+    val enable_addr = PLIC_BASE + PLIC_ENABLE_BASE + (context * 0x80) + ((irq / 32) * 4)
+
+    val bit_idx = irq % 32
+    val mask: u32 = 1 << bit_idx
+
+    val current = mem_read_u32(enable_addr)
+    mem_write_u32(enable_addr, current | mask)
+
+fn plic_disable_irq(irq: i32):
+    """Disable external interrupt in PLIC.
+
+    Args:
+        irq: Interrupt number (1-1023)
+    """
+    if irq < 1 or irq > 1023:
+        return
+
+    val context: u32 = 1
+    val enable_addr = PLIC_BASE + PLIC_ENABLE_BASE + (context * 0x80) + ((irq / 32) * 4)
+
+    val bit_idx = irq % 32
+    val mask: u32 = 1 << bit_idx
+
+    val current = mem_read_u32(enable_addr)
+    mem_write_u32(enable_addr, current & ~mask)
+
+fn plic_set_priority(irq: i32, priority: u8):
+    """Set interrupt priority in PLIC.
+
+    Args:
+        irq: Interrupt number (1-1023)
+        priority: Priority level (0 = disabled, 1-7 = enabled, higher is more urgent)
+
+    Note: Priority 0 effectively disables the interrupt.
+    """
+    if irq < 1 or irq > 1023:
+        return
+
+    val priority_addr = PLIC_BASE + PLIC_PRIORITY_BASE + (irq * 4)
+    mem_write_u32(priority_addr, priority)
+
+fn plic_set_threshold(threshold: u8):
+    """Set priority threshold for current hart.
+
+    Interrupts with priority <= threshold are masked.
+
+    Args:
+        threshold: Priority threshold (0-7)
+    """
+    val context: u32 = 1
+    val threshold_addr = PLIC_BASE + PLIC_THRESHOLD + (context * 0x1000)
+    mem_write_u32(threshold_addr, threshold)
+
+fn plic_claim() -> i32:
+    """Claim pending interrupt.
+
+    Returns:
+        Interrupt ID of claimed interrupt, or 0 if no pending interrupts
+    """
+    val context: u32 = 1
+    val claim_addr = PLIC_BASE + PLIC_CLAIM + (context * 0x1000)
+    mem_read_u32(claim_addr)
+
+fn plic_complete(irq: i32):
+    """Complete interrupt handling.
+
+    Must be called after servicing an interrupt claimed with plic_claim().
+
+    Args:
+        irq: Interrupt ID returned by plic_claim()
+    """
+    val context: u32 = 1
+    val claim_addr = PLIC_BASE + PLIC_CLAIM + (context * 0x1000)
+    mem_write_u32(claim_addr, irq)
+
+# ============================================================================
+# x86_64 APIC (Advanced Programmable Interrupt Controller)
+# ============================================================================
+
+# Local APIC Register Base (typically 0xFEE00000)
+val APIC_BASE: u32 = 0xFEE00000
+
+# APIC Register Offsets
+val APIC_ID: u32 = 0x020          # APIC ID
+val APIC_VERSION: u32 = 0x030     # APIC version
+val APIC_TPR: u32 = 0x080         # Task Priority Register
+val APIC_EOI: u32 = 0x0B0         # End of Interrupt
+val APIC_SVR: u32 = 0x0F0         # Spurious Interrupt Vector Register
+val APIC_ESR: u32 = 0x280         # Error Status Register
+val APIC_LVT_TIMER: u32 = 0x320   # LVT Timer Register
+val APIC_LVT_LINT0: u32 = 0x350   # LVT LINT0 Register
+val APIC_LVT_LINT1: u32 = 0x360   # LVT LINT1 Register
+
+fn apic_enable():
+    """Enable Local APIC.
+
+    Sets the spurious interrupt vector and enables APIC.
+    """
+    # Set spurious interrupt vector (255) and enable bit
+    val svr = mem_read_u32(APIC_BASE + APIC_SVR)
+    mem_write_u32(APIC_BASE + APIC_SVR, svr | 0x1FF)
+
+fn apic_enable_irq(vector: u8):
+    """Enable interrupt vector in APIC.
+
+    Scans all LVT registers for the given vector and clears
+    the mask bit (bit 16) to enable delivery.
+
+    Args:
+        vector: Interrupt vector (32-255)
+    """
+    val MASK_BIT: u32 = 1 << 16
+    # Scan LVT Timer
+    val timer_val = mem_read_u32(APIC_BASE + APIC_LVT_TIMER)
+    if (timer_val & 0xFF) == vector:
+        mem_write_u32(APIC_BASE + APIC_LVT_TIMER, timer_val & ~MASK_BIT)
+        return
+    # Scan LVT LINT0
+    val lint0_val = mem_read_u32(APIC_BASE + APIC_LVT_LINT0)
+    if (lint0_val & 0xFF) == vector:
+        mem_write_u32(APIC_BASE + APIC_LVT_LINT0, lint0_val & ~MASK_BIT)
+        return
+    # Scan LVT LINT1
+    val lint1_val = mem_read_u32(APIC_BASE + APIC_LVT_LINT1)
+    if (lint1_val & 0xFF) == vector:
+        mem_write_u32(APIC_BASE + APIC_LVT_LINT1, lint1_val & ~MASK_BIT)
+        return
+
+fn apic_disable_irq(vector: u8):
+    """Disable interrupt vector in APIC.
+
+    Scans all LVT registers for the given vector and sets
+    the mask bit (bit 16) to suppress delivery.
+
+    Args:
+        vector: Interrupt vector (32-255)
+    """
+    val MASK_BIT: u32 = 1 << 16
+    # Scan LVT Timer
+    val timer_val = mem_read_u32(APIC_BASE + APIC_LVT_TIMER)
+    if (timer_val & 0xFF) == vector:
+        mem_write_u32(APIC_BASE + APIC_LVT_TIMER, timer_val | MASK_BIT)
+        return
+    # Scan LVT LINT0
+    val lint0_val = mem_read_u32(APIC_BASE + APIC_LVT_LINT0)
+    if (lint0_val & 0xFF) == vector:
+        mem_write_u32(APIC_BASE + APIC_LVT_LINT0, lint0_val | MASK_BIT)
+        return
+    # Scan LVT LINT1
+    val lint1_val = mem_read_u32(APIC_BASE + APIC_LVT_LINT1)
+    if (lint1_val & 0xFF) == vector:
+        mem_write_u32(APIC_BASE + APIC_LVT_LINT1, lint1_val | MASK_BIT)
+        return
+
+fn apic_eoi():
+    """Signal end of interrupt (EOI) to APIC.
+
+    Must be called at the end of every interrupt handler.
+    """
+    mem_write_u32(APIC_BASE + APIC_EOI, 0)
+
+fn apic_get_id() -> u8:
+    """Get local APIC ID.
+
+    Returns:
+        APIC ID of current processor
+    """
+    val id_reg = mem_read_u32(APIC_BASE + APIC_ID)
+    (id_reg >> 24) & 0xFF
+
+# ============================================================================
+# Generic Interrupt Control
+# ============================================================================
+
+fn enable_interrupts():
+    """Enable interrupts globally (clear interrupt mask).
+
+    Platform-specific implementation.
+    Stub - requires inline assembly or SFFI to implement.
+    """
+    # LIMITATION: Requires inline assembly (SFFI not available)
+    # ARM: CPSIE i (Clear PRIMASK)
+    # RISC-V: CSRS mstatus, MIE (set Machine Interrupt Enable bit)
+    # x86_64: STI (Set Interrupt Flag in EFLAGS)
+    pass_do_nothing
+
+fn disable_interrupts():
+    """Disable interrupts globally (set interrupt mask).
+
+    Platform-specific implementation.
+    Stub - requires inline assembly or SFFI to implement.
+    """
+    # LIMITATION: Requires inline assembly (SFFI not available)
+    # ARM: CPSID i (Set PRIMASK)
+    # RISC-V: CSRC mstatus, MIE (clear Machine Interrupt Enable bit)
+    # x86_64: CLI (Clear Interrupt Flag in EFLAGS)
+    pass_do_nothing
+
+fn interrupts_enabled() -> bool:
+    """Check if interrupts are enabled.
+
+    Returns:
+        true if interrupts are enabled, false otherwise
+    """
+    # LIMITATION: Requires inline assembly (SFFI not available)
+    # ARM: MRS r0, PRIMASK → check bit 0 (0=enabled, 1=disabled)
+    # RISC-V: CSRR a0, mstatus → check MIE bit (bit 3)
+    # x86_64: PUSHFQ; POP RAX → check IF bit (bit 9)
+    false
+
+fn read_processor_status() -> u32:
+    """Read processor status register (CPSR/mstatus/EFLAGS).
+
+    Returns the platform-specific processor status register value.
+    Contains interrupt enable flags, privilege level, condition flags, etc.
+
+    Returns:
+        Processor status register value, or 0 (stub - requires inline asm)
+    """
+    # LIMITATION: Requires inline assembly (SFFI not available)
+    # ARM: MRS r0, CPSR
+    # RISC-V: CSRR a0, mstatus
+    # x86_64: PUSHFQ; POP RAX
+    0
+
+fn with_interrupts_disabled(f: fn()):
+    """Execute function with interrupts disabled.
+
+    Saves interrupt state, disables interrupts, calls function,
+    then restores interrupt state.
+
+    Args:
+        f: Function to execute
+    """
+    val was_enabled = interrupts_enabled()
+    disable_interrupts()
+    f()
+    if was_enabled:
+        enable_interrupts()
+
+# ============================================================================
+# Interrupt Handler Registration
+# ============================================================================
+
+struct InterruptHandler:
+    """Interrupt handler entry."""
+    vector: i32        # Interrupt vector number
+    handler: u32       # Handler function address
+    priority: u8       # Priority level
+    enabled: bool      # Whether interrupt is enabled
+
+# Global interrupt handler table
+var interrupt_handlers: [InterruptHandler] = []
+
+fn register_interrupt_handler(vector: i32, handler_addr: u32, priority: u8):
+    """Register interrupt handler.
+
+    Args:
+        vector: Interrupt vector number
+        handler_addr: Address of handler function
+        priority: Priority level
+    """
+    val entry = InterruptHandler(
+        vector: vector,
+        handler: handler_addr,
+        priority: priority,
+        enabled: false
+    )
+    interrupt_handlers.push(entry)
+
+    # Enable interrupt in controller
+    # LIMITATION: Platform-specific register access (SFFI not available)
+    pass_do_nothing
+
+fn unregister_interrupt_handler(vector: i32):
+    """Unregister interrupt handler.
+
+    Args:
+        vector: Interrupt vector number
+    """
+    # Disable interrupt in controller
+    # LIMITATION: Platform-specific register access (SFFI not available)
+
+    # Remove from handler table
+    var new_handlers: [InterruptHandler] = []
+    for entry in interrupt_handlers:
+        if entry.vector != vector:
+            new_handlers.push(entry)
+    interrupt_handlers = new_handlers
+
+fn dispatch_interrupt(vector: i32):
+    """Dispatch interrupt to registered handler.
+
+    Called by low-level interrupt entry code.
+
+    Args:
+        vector: Interrupt vector number
+    """
+    for entry in interrupt_handlers:
+        if entry.vector == vector and entry.enabled:
+            # Call handler (address stored in entry.handler)
+            # LIMITATION: Function pointer install requires SFFI
+            return
+
+    # No handler registered - default behavior
+    default_interrupt_handler(vector)
+
+fn default_interrupt_handler(vector: i32):
+    """Default interrupt handler for unregistered interrupts.
+
+    Logs error and returns.
+
+    Args:
+        vector: Interrupt vector number
+    """
+    print "ERROR: unhandled interrupt vector {vector}"
+
+# ============================================================================
+# Memory Access Helpers
+# ============================================================================
+
+extern fn rt_mmio_read_u32(addr: u64) -> u32
+extern fn rt_mmio_write_u32(addr: u64, value: u32)
+extern fn rt_mmio_read_u8(addr: u64) -> u8
+extern fn rt_mmio_write_u8(addr: u64, value: u8)
+
+fn mem_read_u32(addr: u32) -> u32:
+    """Read 32-bit value from memory (volatile)."""
+    rt_mmio_read_u32(addr.to_u64())
+
+fn mem_write_u32(addr: u32, value: u32):
+    """Write 32-bit value to memory (volatile)."""
+    rt_mmio_write_u32(addr.to_u64(), value)
+
+fn mem_read_u8(addr: u32) -> u8:
+    """Read 8-bit value from memory (volatile)."""
+    rt_mmio_read_u8(addr.to_u64())
+
+fn mem_write_u8(addr: u32, value: u8):
+    """Write 8-bit value to memory (volatile)."""
+    rt_mmio_write_u8(addr.to_u64(), value)

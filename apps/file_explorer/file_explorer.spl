@@ -1,0 +1,872 @@
+# File Explorer — Windows Explorer-Style File Browser
+#
+# Single-panel file browser with collapsible directory tree,
+# address bar with breadcrumbs, back/forward navigation history,
+# and multi-select support. Uses the existing UI builder DSL.
+#
+# MDSOC: feature dimension, file_explorer layer
+
+use common.ui.builder.{column, row, menubar, statusbar, tree_widget, tree_node, tree_leaf, table_widget, panel, button, text_widget, label, build_tree_with_title, with_flex, with_width}
+use common.ui.widget.{WidgetNode, UITree, UIEvent}
+use common.ui.session.{UISession}
+use os.kernel.types.fs_types.{DirEntry, FsNode, FsNodeKind}
+use os.services.vfs.vfs.{VfsManager}
+
+# =========================================================================
+# Sort Configuration
+# =========================================================================
+
+enum SortField:
+    """Column to sort file listing by."""
+    Name
+    Size
+    Date
+
+enum SortDirection:
+    """Sort direction."""
+    Ascending
+    Descending
+
+# =========================================================================
+# View Mode
+# =========================================================================
+
+enum ViewMode:
+    """File listing display mode."""
+    Details
+    List
+
+# =========================================================================
+# File Entry (display model)
+# =========================================================================
+
+struct FileEntry:
+    """Flattened directory entry for display in the table."""
+    name: text
+    kind: FsNodeKind
+    size: u64
+    modified_ns: u64
+    permissions: u16
+
+fn dir_entry_to_file_entry(entry: DirEntry) -> FileEntry:
+    """Convert a DirEntry to a display FileEntry."""
+    return FileEntry(
+        name: entry.name,
+        kind: entry.node.kind,
+        size: entry.node.size,
+        modified_ns: entry.node.modified_ns,
+        permissions: entry.node.permissions
+    )
+
+fn format_size(bytes: u64) -> text:
+    """Format file size in human-readable form."""
+    if bytes < 1024:
+        return "{bytes} B"
+    val kb = bytes / 1024
+    if kb < 1024:
+        return "{kb} KB"
+    val mb = kb / 1024
+    if mb < 1024:
+        return "{mb} MB"
+    val gb = mb / 1024
+    return "{gb} GB"
+
+fn format_kind(kind: FsNodeKind) -> text:
+    """Format filesystem node kind for display."""
+    match kind:
+        FsNodeKind.File => "File"
+        FsNodeKind.Directory => "Dir"
+        FsNodeKind.Symlink => "Link"
+        FsNodeKind.Device => "Dev"
+        FsNodeKind.Pipe => "Pipe"
+
+fn kind_icon(kind: FsNodeKind) -> text:
+    """Icon prefix for filesystem node kind."""
+    match kind:
+        FsNodeKind.Directory => "[D] "
+        FsNodeKind.Symlink => "[L] "
+        FsNodeKind.Device => "[C] "
+        FsNodeKind.Pipe => "[P] "
+        _ => "    "
+
+# =========================================================================
+# Directory Tree Node (collapsible)
+# =========================================================================
+
+struct DirTreeNode:
+    """A node in the collapsible directory tree."""
+    path: text
+    name: text
+    expanded: bool
+    children: [DirTreeNode]
+    depth: i32
+
+# =========================================================================
+# Navigation History
+# =========================================================================
+
+struct NavHistory:
+    """Back/forward navigation stack."""
+    back_stack: [text]
+    forward_stack: [text]
+
+# =========================================================================
+# File Explorer
+# =========================================================================
+
+class FileExplorer:
+    """Windows Explorer-style file browser.
+
+    Features collapsible directory tree, address bar with breadcrumbs,
+    back/forward navigation history, and multi-select support.
+    """
+    current_path: text
+    entries: [FileEntry]
+    selected_indices: [i32]
+    primary_selected: i32
+    view_mode: ViewMode
+    sort_by: SortField
+    sort_dir: SortDirection
+    show_hidden: bool
+    dir_tree: [DirTreeNode]
+    nav_history: NavHistory
+    address_bar_text: text
+    status_message: text
+    clipboard_path: text
+    clipboard_op: text
+    rename_active: bool
+    rename_text: text
+    vfs: VfsManager?
+
+impl FileExplorer:
+
+    static fn new(path: text) -> FileExplorer:
+        """Create a file explorer starting at the given path."""
+        return FileExplorer(
+            current_path: path,
+            entries: [],
+            selected_indices: [],
+            primary_selected: 0,
+            view_mode: ViewMode.Details,
+            sort_by: SortField.Name,
+            sort_dir: SortDirection.Ascending,
+            show_hidden: false,
+            dir_tree: [],
+            nav_history: NavHistory(back_stack: [], forward_stack: []),
+            address_bar_text: path,
+            status_message: "",
+            clipboard_path: "",
+            clipboard_op: "",
+            rename_active: false,
+            rename_text: "",
+            vfs: nil
+        )
+
+    static fn with_vfs(path: text, vfs: VfsManager) -> FileExplorer:
+        """Create a file explorer connected to a VFS."""
+        var fe = FileExplorer.new(path)
+        fe.vfs = vfs
+        fe.refresh()
+        return fe
+
+    # -- Navigation ----------------------------------------------------------
+
+    me navigate_to(path: text):
+        """Navigate to a directory path, pushing current to back stack."""
+        if path == self.current_path:
+            return
+        # Push current path to back stack
+        self.nav_history.back_stack = self.nav_history.back_stack.push(self.current_path)
+        # Clear forward stack on new navigation
+        self.nav_history.forward_stack = []
+        self.current_path = path
+        self.address_bar_text = path
+        self.selected_indices = []
+        self.primary_selected = 0
+        self.status_message = ""
+        self.refresh()
+
+    me navigate_up():
+        """Navigate to parent directory."""
+        if self.current_path == "/":
+            return
+        val parent = _parent_dir(self.current_path)
+        self.navigate_to(parent)
+
+    me navigate_back():
+        """Navigate to previous location from back stack."""
+        if self.nav_history.back_stack.len() == 0:
+            return
+        val prev = self.nav_history.back_stack[self.nav_history.back_stack.len() - 1]
+        # Pop from back stack
+        var new_back: [text] = []
+        var i = 0
+        while i < self.nav_history.back_stack.len() - 1:
+            new_back = new_back.push(self.nav_history.back_stack[i])
+            i = i + 1
+        self.nav_history.back_stack = new_back
+        # Push current to forward stack
+        self.nav_history.forward_stack = self.nav_history.forward_stack.push(self.current_path)
+        self.current_path = prev
+        self.address_bar_text = prev
+        self.selected_indices = []
+        self.primary_selected = 0
+        self.refresh()
+
+    me navigate_forward():
+        """Navigate to next location from forward stack."""
+        if self.nav_history.forward_stack.len() == 0:
+            return
+        val next = self.nav_history.forward_stack[self.nav_history.forward_stack.len() - 1]
+        # Pop from forward stack
+        var new_fwd: [text] = []
+        var i = 0
+        while i < self.nav_history.forward_stack.len() - 1:
+            new_fwd = new_fwd.push(self.nav_history.forward_stack[i])
+            i = i + 1
+        self.nav_history.forward_stack = new_fwd
+        # Push current to back stack
+        self.nav_history.back_stack = self.nav_history.back_stack.push(self.current_path)
+        self.current_path = next
+        self.address_bar_text = next
+        self.selected_indices = []
+        self.primary_selected = 0
+        self.refresh()
+
+    me navigate_to_address():
+        """Navigate to the path typed in the address bar."""
+        if self.address_bar_text != self.current_path:
+            self.navigate_to(self.address_bar_text)
+
+    me open_selected():
+        """Open the primary selected entry (enter directory or open file)."""
+        if self.primary_selected < 0 or self.primary_selected >= self.entries.len():
+            return
+        val entry = self.entries[self.primary_selected]
+        match entry.kind:
+            FsNodeKind.Directory:
+                val new_path = _join_path(self.current_path, entry.name)
+                self.navigate_to(new_path)
+            _:
+                self.status_message = "Opened: {entry.name}"
+
+    # -- Tree ----------------------------------------------------------------
+
+    me toggle_tree_node(path: text):
+        """Toggle expanded/collapsed state of a directory tree node."""
+        self.dir_tree = _toggle_in_tree(self.dir_tree, path, self.vfs)
+
+    me _build_dir_tree_data():
+        """Build root-level DirTreeNode list from VFS."""
+        self.dir_tree = []
+        if self.vfs == nil:
+            return
+        val result = self.vfs.readdir("/")
+        if result.is_err():
+            return
+        val root_entries = result.unwrap()
+        for entry in root_entries:
+            match entry.node.kind:
+                FsNodeKind.Directory:
+                    if self.show_hidden or not entry.name.starts_with("."):
+                        val child_path = "/{entry.name}"
+                        val is_on_path = self.current_path.starts_with(child_path)
+                        var node = DirTreeNode(
+                            path: child_path,
+                            name: entry.name,
+                            expanded: is_on_path,
+                            children: [],
+                            depth: 0
+                        )
+                        if is_on_path:
+                            node.children = _expand_tree_path(child_path, self.current_path, 1, self.vfs, self.show_hidden)
+                        self.dir_tree = self.dir_tree.push(node)
+                _:
+                    pass_dn
+
+    # -- Selection -----------------------------------------------------------
+
+    me select_next():
+        """Move primary selection down."""
+        if self.primary_selected < self.entries.len() - 1:
+            self.primary_selected = self.primary_selected + 1
+            self.selected_indices = [self.primary_selected]
+
+    me select_prev():
+        """Move primary selection up."""
+        if self.primary_selected > 0:
+            self.primary_selected = self.primary_selected - 1
+            self.selected_indices = [self.primary_selected]
+
+    me toggle_select(index: i32):
+        """Toggle selection of a specific index for multi-select."""
+        if index < 0 or index >= self.entries.len():
+            return
+        self.primary_selected = index
+        if _list_contains_i32(self.selected_indices, index):
+            var new_sel: [i32] = []
+            for si in self.selected_indices:
+                if si != index:
+                    new_sel = new_sel.push(si)
+            self.selected_indices = new_sel
+        else:
+            self.selected_indices = self.selected_indices.push(index)
+
+    me select_all():
+        """Select all entries."""
+        self.selected_indices = []
+        var i = 0
+        while i < self.entries.len():
+            self.selected_indices = self.selected_indices.push(i)
+            i = i + 1
+
+    me clear_selection():
+        """Clear all selection."""
+        self.selected_indices = []
+        self.primary_selected = 0
+
+    # -- File Operations -----------------------------------------------------
+
+    me new_folder():
+        """Create a new folder in the current directory."""
+        if self.vfs == nil:
+            return
+        val new_name = "New Folder"
+        val path = _join_path(self.current_path, new_name)
+        val result = self.vfs.mkdir(path)
+        if result.is_ok():
+            self.status_message = "Created: {new_name}"
+        else:
+            self.status_message = "Failed to create folder"
+        self.refresh()
+
+    me delete_selected():
+        """Delete all selected files/directories."""
+        if self.vfs == nil:
+            return
+        if self.selected_indices.len() == 0:
+            # Fall back to primary selection
+            if self.primary_selected >= 0 and self.primary_selected < self.entries.len():
+                val entry = self.entries[self.primary_selected]
+                val path = _join_path(self.current_path, entry.name)
+                val _ = self.vfs.remove(path)
+                self.status_message = "Deleted: {entry.name}"
+        else:
+            var count = 0
+            for idx in self.selected_indices:
+                if idx >= 0 and idx < self.entries.len():
+                    val entry = self.entries[idx]
+                    val path = _join_path(self.current_path, entry.name)
+                    val _ = self.vfs.remove(path)
+                    count = count + 1
+            self.status_message = "Deleted {count} items"
+        self.selected_indices = []
+        self.primary_selected = 0
+        self.refresh()
+
+    me rename_start():
+        """Start renaming the primary selected entry."""
+        if self.primary_selected < 0 or self.primary_selected >= self.entries.len():
+            return
+        self.rename_active = true
+        self.rename_text = self.entries[self.primary_selected].name
+
+    me rename_apply():
+        """Apply the rename operation."""
+        if not self.rename_active:
+            return
+        if self.vfs == nil:
+            self.rename_active = false
+            return
+        if self.primary_selected < 0 or self.primary_selected >= self.entries.len():
+            self.rename_active = false
+            return
+        val old_name = self.entries[self.primary_selected].name
+        val old_path = _join_path(self.current_path, old_name)
+        val new_path = _join_path(self.current_path, self.rename_text)
+        val result = self.vfs.rename(old_path, new_path)
+        if result.is_ok():
+            self.status_message = "Renamed: {old_name} -> {self.rename_text}"
+        else:
+            self.status_message = "Rename failed"
+        self.rename_active = false
+        self.rename_text = ""
+        self.refresh()
+
+    me copy_selected():
+        """Copy primary selected file path to clipboard."""
+        if self.primary_selected >= 0 and self.primary_selected < self.entries.len():
+            val entry = self.entries[self.primary_selected]
+            self.clipboard_path = _join_path(self.current_path, entry.name)
+            self.clipboard_op = "copy"
+            self.status_message = "Copied: {entry.name}"
+
+    me cut_selected():
+        """Cut primary selected file (move on paste)."""
+        if self.primary_selected >= 0 and self.primary_selected < self.entries.len():
+            val entry = self.entries[self.primary_selected]
+            self.clipboard_path = _join_path(self.current_path, entry.name)
+            self.clipboard_op = "cut"
+            self.status_message = "Cut: {entry.name}"
+
+    me paste():
+        """Paste clipboard file to current directory."""
+        if self.clipboard_path == "" or self.vfs == nil:
+            return
+        val filename = _basename(self.clipboard_path)
+        val dest = _join_path(self.current_path, filename)
+        if self.clipboard_op == "copy":
+            val read_result = self.vfs.read(self.clipboard_path)
+            if read_result.is_ok():
+                val _ = self.vfs.write(dest, read_result.unwrap())
+                self.status_message = "Pasted: {filename}"
+        elif self.clipboard_op == "cut":
+            val _ = self.vfs.rename(self.clipboard_path, dest)
+            self.clipboard_path = ""
+            self.clipboard_op = ""
+            self.status_message = "Moved: {filename}"
+        self.refresh()
+
+    # -- View ----------------------------------------------------------------
+
+    me set_view_mode(mode: ViewMode):
+        """Switch between Details and List view modes."""
+        self.view_mode = mode
+
+    me set_sort(field: SortField):
+        """Set sort field, toggling direction if same field."""
+        if self._sort_field_eq(field):
+            self.sort_dir = match self.sort_dir:
+                SortDirection.Ascending => SortDirection.Descending
+                SortDirection.Descending => SortDirection.Ascending
+        else:
+            self.sort_by = field
+            self.sort_dir = SortDirection.Ascending
+        self._sort_entries()
+
+    fn _sort_field_eq(field: SortField) -> bool:
+        """Check if sort field matches current."""
+        match self.sort_by:
+            SortField.Name:
+                match field:
+                    SortField.Name => true
+                    _ => false
+            SortField.Size:
+                match field:
+                    SortField.Size => true
+                    _ => false
+            SortField.Date:
+                match field:
+                    SortField.Date => true
+                    _ => false
+
+    me toggle_hidden():
+        """Toggle showing hidden files."""
+        self.show_hidden = not self.show_hidden
+        self.refresh()
+
+    me refresh():
+        """Reload directory listing from VFS."""
+        self.entries = []
+        if self.vfs == nil:
+            return
+        val result = self.vfs.readdir(self.current_path)
+        if result.is_err():
+            self.status_message = "Failed to read directory"
+            return
+        val dir_entries = result.unwrap()
+        for entry in dir_entries:
+            val fe = dir_entry_to_file_entry(entry)
+            if self.show_hidden or not fe.name.starts_with("."):
+                self.entries = self.entries.push(fe)
+        self._sort_entries()
+        self._build_dir_tree_data()
+        # Clamp selection
+        if self.primary_selected >= self.entries.len():
+            self.primary_selected = if self.entries.len() > 0: self.entries.len() - 1 else: 0
+        # Filter selected_indices to valid range
+        var valid_sel: [i32] = []
+        for idx in self.selected_indices:
+            if idx >= 0 and idx < self.entries.len():
+                valid_sel = valid_sel.push(idx)
+        self.selected_indices = valid_sel
+
+    me _sort_entries():
+        """Sort entries by current sort field and direction."""
+        var dirs: [FileEntry] = []
+        var files: [FileEntry] = []
+        for entry in self.entries:
+            match entry.kind:
+                FsNodeKind.Directory:
+                    dirs = dirs.push(entry)
+                _:
+                    files = files.push(entry)
+        dirs = _sort_file_entries(dirs, self.sort_by, self.sort_dir)
+        files = _sort_file_entries(files, self.sort_by, self.sort_dir)
+        self.entries = dirs + files
+
+    # -- Key Handling --------------------------------------------------------
+
+    me handle_key(key: text):
+        """Handle keyboard input."""
+        match key:
+            "enter" => self.open_selected()
+            "backspace" => self.navigate_up()
+            "delete" => self.delete_selected()
+            "up" => self.select_prev()
+            "down" => self.select_next()
+            "f2" => self.rename_start()
+            "f5" => self.refresh()
+            "ctrl_c" => self.copy_selected()
+            "ctrl_x" => self.cut_selected()
+            "ctrl_v" => self.paste()
+            "ctrl_a" => self.select_all()
+            "ctrl_n" => self.new_folder()
+            "alt_left" => self.navigate_back()
+            "alt_right" => self.navigate_forward()
+            "escape":
+                if self.rename_active:
+                    self.rename_active = false
+                    self.rename_text = ""
+                else:
+                    self.clear_selection()
+            _ => pass_dn
+
+    me handle_action(action: text):
+        """Handle toolbar/menu button dispatch."""
+        match action:
+            "navigate_back" => self.navigate_back()
+            "navigate_forward" => self.navigate_forward()
+            "navigate_up" => self.navigate_up()
+            "navigate_to_address" => self.navigate_to_address()
+            "refresh" => self.refresh()
+            "new_folder" => self.new_folder()
+            "rename" => self.rename_start()
+            "rename_apply" => self.rename_apply()
+            "delete" => self.delete_selected()
+            "copy" => self.copy_selected()
+            "cut" => self.cut_selected()
+            "paste" => self.paste()
+            "select_all" => self.select_all()
+            "view_details" => self.set_view_mode(ViewMode.Details)
+            "view_list" => self.set_view_mode(ViewMode.List)
+            "toggle_hidden" => self.toggle_hidden()
+            "sort_name" => self.set_sort(SortField.Name)
+            "sort_size" => self.set_sort(SortField.Size)
+            "sort_date" => self.set_sort(SortField.Date)
+            _ => self.status_message = "Unknown action: {action}"
+
+    # -- UI Construction -----------------------------------------------------
+
+    fn build_ui() -> UISession:
+        """Build the file explorer UI.
+
+        Layout:
+          Menubar: File | Edit | View
+          Toolbar: Back | Forward | Up | Refresh | [address bar] | Go
+          Breadcrumb bar
+          Row:
+            Tree panel (30w, collapsible directory tree)
+            File panel (flex, table or list depending on view_mode)
+          Statusbar: item count + selection | path
+        """
+        val dir_tree_widget = self._build_dir_tree()
+        val file_panel_content = self._build_file_panel()
+        val breadcrumbs = self._build_breadcrumbs()
+
+        val view_mode_label = match self.view_mode:
+            ViewMode.Details => "Details"
+            ViewMode.List => "List"
+
+        val root = column("fe_root", [
+            menubar("fe_menu", [
+                "File: NewFolder|Rename|Delete|Properties|Exit",
+                "Edit: Copy|Cut|Paste|SelectAll",
+                "View: {view_mode_label}|Hidden|SortByName|SortBySize|SortByDate"
+            ]),
+            row("fe_toolbar", [
+                button("fe_btn_back", "<", "navigate_back"),
+                button("fe_btn_fwd", ">", "navigate_forward"),
+                button("fe_btn_up", "Up", "navigate_up"),
+                button("fe_btn_refresh", "Refresh", "refresh"),
+                with_flex(text_widget("fe_address", self.address_bar_text), 1),
+                button("fe_btn_go", "Go", "navigate_to_address")
+            ]),
+            breadcrumbs,
+            row("fe_content", [
+                with_width(panel("fe_tree_panel", "Folders", [dir_tree_widget]), 30),
+                with_flex(panel("fe_file_panel", "Files", [file_panel_content]), 1)
+            ]),
+            statusbar("fe_status",
+                "{self.entries.len()} items | {self.selected_indices.len()} selected",
+                self.current_path
+            )
+        ])
+
+        val title = if self.status_message != "":
+            "File Explorer - {self.current_path} - {self.status_message}"
+        else:
+            "File Explorer - {self.current_path}"
+        val tree = build_tree_with_title(root, title, "dark")
+        return UISession.new(tree)
+
+    fn _build_breadcrumbs() -> WidgetNode:
+        """Build breadcrumb navigation row from current path."""
+        var crumbs: [WidgetNode] = []
+        crumbs = crumbs.push(button("fe_crumb_root", "/", "navigate_to:/"))
+        val parts = _split_path(self.current_path)
+        var accumulated = ""
+        for part in parts:
+            accumulated = "{accumulated}/{part}"
+            val crumb_path = accumulated
+            crumbs = crumbs.push(label("fe_crumb_sep_{part}", " > "))
+            crumbs = crumbs.push(button("fe_crumb_{part}", part, "navigate_to:{crumb_path}"))
+        return row("fe_breadcrumbs", crumbs)
+
+    fn _build_dir_tree() -> WidgetNode:
+        """Build the collapsible directory tree widget."""
+        var tree_nodes: [WidgetNode] = []
+        # Root node
+        val root_marker = if self.current_path == "/": "> " else: "  "
+        tree_nodes = tree_nodes.push(tree_node("fe_tree_root", "{root_marker}/", []))
+        # Build from dir_tree data
+        for node in self.dir_tree:
+            val sub_nodes = _build_tree_nodes_recursive(node, self.current_path)
+            tree_nodes = tree_nodes.push(sub_nodes)
+        return tree_widget("fe_dir_tree", tree_nodes)
+
+    fn _build_file_panel() -> WidgetNode:
+        """Build file listing panel based on view mode."""
+        match self.view_mode:
+            ViewMode.Details => self._build_file_table()
+            ViewMode.List => self._build_file_list()
+
+    fn _build_file_table() -> WidgetNode:
+        """Build the file table widget with headers and entry rows."""
+        val headers = ["Name", "Type", "Size"]
+        var rows: [[text]] = []
+        var idx = 0
+        for entry in self.entries:
+            val is_selected = _list_contains_i32(self.selected_indices, idx)
+            val is_primary = idx == self.primary_selected
+            val prefix = if is_primary and is_selected: ">> "
+                elif is_primary: "> "
+                elif is_selected: "* "
+                else: "  "
+            val icon = kind_icon(entry.kind)
+            val display_name = if self.rename_active and idx == self.primary_selected:
+                "[{self.rename_text}]"
+            else:
+                "{prefix}{icon}{entry.name}"
+            rows = rows.push([
+                display_name,
+                format_kind(entry.kind),
+                format_size(entry.size)
+            ])
+            idx = idx + 1
+        return table_widget("fe_file_table", headers, rows)
+
+    fn _build_file_list() -> WidgetNode:
+        """Build file listing in compact list mode."""
+        var items: [WidgetNode] = []
+        var idx = 0
+        for entry in self.entries:
+            val is_selected = _list_contains_i32(self.selected_indices, idx)
+            val is_primary = idx == self.primary_selected
+            val prefix = if is_primary and is_selected: ">> "
+                elif is_primary: "> "
+                elif is_selected: "* "
+                else: "  "
+            val icon = kind_icon(entry.kind)
+            val display = "{prefix}{icon}{entry.name}"
+            items = items.push(label("fe_list_{idx}", display))
+            idx = idx + 1
+        return column("fe_file_list", items)
+
+# =========================================================================
+# Sorting Helpers
+# =========================================================================
+
+fn _sort_file_entries(entries: [FileEntry], by: SortField, dir: SortDirection) -> [FileEntry]:
+    """Sort file entries by the given field and direction (insertion sort)."""
+    var sorted: [FileEntry] = entries
+    var i = 1
+    while i < sorted.len():
+        val key = sorted[i]
+        var j = i - 1
+        while j >= 0 and _compare_entries(sorted[j], key, by, dir) > 0:
+            sorted[j + 1] = sorted[j]
+            j = j - 1
+        sorted[j + 1] = key
+        i = i + 1
+    return sorted
+
+fn _compare_entries(a: FileEntry, b: FileEntry, by: SortField, dir: SortDirection) -> i32:
+    """Compare two file entries. Returns >0 if a should come after b."""
+    val raw = match by:
+        SortField.Name:
+            if a.name < b.name: -1
+            elif a.name > b.name: 1
+            else: 0
+        SortField.Size:
+            if a.size < b.size: -1
+            elif a.size > b.size: 1
+            else: 0
+        SortField.Date:
+            if a.modified_ns < b.modified_ns: -1
+            elif a.modified_ns > b.modified_ns: 1
+            else: 0
+    match dir:
+        SortDirection.Ascending => raw
+        SortDirection.Descending => -raw
+
+# =========================================================================
+# Path Helpers
+# =========================================================================
+
+fn _parent_dir(path: text) -> text:
+    """Get parent directory path."""
+    if path == "/" or path == "":
+        return "/"
+    var last_slash = 0
+    var i = 0
+    for ch in path:
+        if ch == "/":
+            last_slash = i
+        i = i + 1
+    if last_slash == 0:
+        return "/"
+    return path.slice(0, last_slash)
+
+fn _join_path(base: text, name: text) -> text:
+    """Join a base path and filename."""
+    if base == "/":
+        return "/{name}"
+    return "{base}/{name}"
+
+fn _basename(path: text) -> text:
+    """Get the last component of a path."""
+    if path == "/" or path == "":
+        return ""
+    var last_slash = -1
+    var i = 0
+    for ch in path:
+        if ch == "/":
+            last_slash = i
+        i = i + 1
+    if last_slash < 0:
+        return path
+    return path.slice(last_slash + 1, path.len())
+
+fn _split_path(path: text) -> [text]:
+    """Split a path into components (excluding empty and root)."""
+    var parts: [text] = []
+    var current = ""
+    for ch in path:
+        if ch == "/":
+            if current != "":
+                parts = parts.push(current)
+                current = ""
+        else:
+            current = "{current}{ch}"
+    if current != "":
+        parts = parts.push(current)
+    return parts
+
+# =========================================================================
+# Tree Helpers
+# =========================================================================
+
+fn _toggle_in_tree(nodes: [DirTreeNode], path: text, vfs: VfsManager?) -> [DirTreeNode]:
+    """Toggle the expanded state of a node at the given path in the tree."""
+    var result: [DirTreeNode] = []
+    for node in nodes:
+        if node.path == path:
+            var toggled = node
+            toggled.expanded = not node.expanded
+            if toggled.expanded and toggled.children.len() == 0 and vfs != nil:
+                toggled.children = _load_children(path, node.depth + 1, vfs, false)
+            elif not toggled.expanded:
+                toggled.children = []
+            result = result.push(toggled)
+        else:
+            var updated = node
+            if node.expanded and node.children.len() > 0:
+                updated.children = _toggle_in_tree(node.children, path, vfs)
+            result = result.push(updated)
+    return result
+
+fn _load_children(path: text, depth: i32, vfs: VfsManager?, show_hidden: bool) -> [DirTreeNode]:
+    """Load child directory nodes from VFS."""
+    var children: [DirTreeNode] = []
+    if vfs == nil:
+        return children
+    val result = vfs.readdir(path)
+    if result.is_err():
+        return children
+    val entries = result.unwrap()
+    for entry in entries:
+        match entry.node.kind:
+            FsNodeKind.Directory:
+                if show_hidden or not entry.name.starts_with("."):
+                    val child_path = _join_path(path, entry.name)
+                    children = children.push(DirTreeNode(
+                        path: child_path,
+                        name: entry.name,
+                        expanded: false,
+                        children: [],
+                        depth: depth
+                    ))
+            _:
+                pass_dn
+    return children
+
+fn _expand_tree_path(from: text, target: text, depth: i32, vfs: VfsManager?, show_hidden: bool) -> [DirTreeNode]:
+    """Expand tree nodes along the path from 'from' to 'target'."""
+    var children = _load_children(from, depth, vfs, show_hidden)
+    # Find which child is on the path to target and expand it
+    var result: [DirTreeNode] = []
+    for child in children:
+        if target.starts_with(child.path):
+            var expanded_child = child
+            expanded_child.expanded = true
+            if child.path != target:
+                expanded_child.children = _expand_tree_path(child.path, target, depth + 1, vfs, show_hidden)
+            else:
+                expanded_child.children = _load_children(child.path, depth + 1, vfs, show_hidden)
+            result = result.push(expanded_child)
+        else:
+            result = result.push(child)
+    return result
+
+fn _build_tree_nodes_recursive(node: DirTreeNode, current_path: text) -> WidgetNode:
+    """Recursively build WidgetNode tree from DirTreeNode."""
+    val indent = _repeat_text("  ", node.depth)
+    val is_current = node.path == current_path
+    val marker = if is_current: "> " else: "  "
+    val expand_icon = if node.expanded: "[-] " elif node.children.len() > 0: "[+] " else: "    "
+    val display = "{indent}{marker}{expand_icon}{node.name}"
+
+    if node.expanded and node.children.len() > 0:
+        var child_widgets: [WidgetNode] = []
+        for child in node.children:
+            child_widgets = child_widgets.push(_build_tree_nodes_recursive(child, current_path))
+        return tree_node("fe_tree_{node.path}", display, child_widgets)
+    else:
+        return tree_leaf("fe_tree_{node.path}", display)
+
+fn _repeat_text(s: text, count: i32) -> text:
+    """Repeat a string count times."""
+    var result = ""
+    var i = 0
+    while i < count:
+        result = "{result}{s}"
+        i = i + 1
+    return result
+
+fn _list_contains_i32(list: [i32], value: i32) -> bool:
+    """Check if a list of i32 contains a value."""
+    for item in list:
+        if item == value:
+            return true
+    return false

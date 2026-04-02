@@ -1,0 +1,389 @@
+# UI SDN Parser
+#
+# Self-contained parser for .ui.sdn files.
+# Directly generates HTML from the parsed SDN data.
+#
+# For UITree output, see sdn_tree.spl (parse_ui_to_tree).
+
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_file_exists(path: text) -> bool
+
+struct FlatEntry:
+    key: text
+    value: text
+
+# =========================================================================
+# String helpers
+# =========================================================================
+
+fn s_strip(s: text) -> text:
+    s.strip()
+
+fn s_split(s: text, d: text) -> [text]:
+    s.split(d)
+
+fn s_starts(s: text, p: text) -> bool:
+    s.starts_with(p)
+
+fn s_ends(s: text, p: text) -> bool:
+    s.ends_with(p)
+
+fn s_len(s: text) -> i64:
+    s.len()
+
+fn tlist_len(l: [text]) -> i64:
+    l.len()
+
+fn ilist_len(l: [i64]) -> i64:
+    l.len()
+
+fn s_find(s: text, n: text) -> i64:
+    val idx = s.index_of(n)
+    match idx:
+        case Some(i):
+            return i
+        case _:
+            return -1
+
+fn unwrap_opt(v: any) -> any:
+    match v:
+        case Some(s):
+            return s
+        case _:
+            return v
+
+fn read_file(path: text) -> text:
+    val r = rt_file_read_text(path)
+    return unwrap_opt(r)
+
+fn check_exists(path: text) -> bool:
+    val r = rt_file_exists(path)
+    return unwrap_opt(r)
+
+# =========================================================================
+# Flat key-value parser
+# =========================================================================
+
+fn pop_stack(indents: [i64], keys: [text], target_indent: i64) -> ([i64], [text]):
+    var ind = indents
+    var ks = keys
+    var ilen = ilist_len(ind)
+    while ilen > 0:
+        val top = ind[ilen - 1]
+        if target_indent <= top:
+            ind = ind[0:ilen - 1]
+            ks = ks[0:ilen - 1]
+            ilen = ilist_len(ind)
+        else:
+            break
+    return (ind, ks)
+
+fn join_path(parts: [text]) -> text:
+    var result = ""
+    var first = true
+    var i = 0
+    val count = tlist_len(parts)
+    while i < count:
+        val p = parts[i]
+        i = i + 1
+        if first:
+            result = p
+            first = false
+        else:
+            result = result + "." + p
+    return result
+
+fn make_full_path(keys: [text], key: text) -> text:
+    val klen = tlist_len(keys)
+    if klen > 0:
+        return join_path(keys) + "." + key
+    return key
+
+fn count_indent(line: text) -> i64:
+    var indent = 0
+    var ci = 0
+    val ll = s_len(line)
+    while ci < ll:
+        if line[ci] == " ":
+            indent = indent + 1
+        else:
+            return indent
+        ci = ci + 1
+    return indent
+
+fn parse_to_flat(source: text) -> [FlatEntry]:
+    # Normalize Windows CRLF and old Mac CR line endings to Unix LF
+    var normalized = source.replace("\r\n", "\n")
+    normalized = normalized.replace("\r", "\n")
+    val lines = s_split(normalized, "\n")
+    var result: [FlatEntry] = []
+    var path_indents: [i64] = []
+    var path_keys: [text] = []
+    var li = 0
+    val line_count = tlist_len(lines)
+
+    while li < line_count:
+        val line = lines[li]
+        li = li + 1
+        val stripped = s_strip(line)
+        if stripped == "":
+            continue
+        if s_starts(stripped, "#"):
+            continue
+
+        val indent = count_indent(line)
+        val cp = s_find(stripped, ":")
+        if cp < 0:
+            continue
+
+        val key = s_strip(stripped[0:cp])
+        val sl = s_len(stripped)
+        var after = ""
+        if cp + 1 < sl:
+            after = s_strip(stripped[cp + 1:])
+
+        val popped = pop_stack(path_indents, path_keys, indent)
+        path_indents = popped.0
+        path_keys = popped.1
+
+        val full_path = make_full_path(path_keys, key)
+
+        if after == "" or after == "|":
+            path_indents = path_indents + [indent]
+            path_keys = path_keys + [key]
+        else:
+            var val_text = after
+            val vl = s_len(val_text)
+            if vl >= 2:
+                if s_starts(val_text, "\""):
+                    if s_ends(val_text, "\""):
+                        val_text = val_text[1:vl - 1]
+            result = result.push(FlatEntry(key: full_path, value: val_text))
+
+    return result
+
+fn flat_get(entries: [FlatEntry], key: text) -> text:
+    for entry in entries:
+        if entry.key == key:
+            return entry.value
+    return ""
+
+fn flat_child_keys(entries: [FlatEntry], prefix: text) -> [text]:
+    var keys: [text] = []
+    val plen = s_len(prefix)
+    val dot_prefix = prefix + "."
+    for entry in entries:
+        val key = entry.key
+        if s_starts(key, dot_prefix):
+            val rest = key[plen + 1:]
+            val dot_pos = s_find(rest, ".")
+            var child_key = rest
+            if dot_pos >= 0:
+                child_key = rest[0:dot_pos]
+            if not list_contains(keys, child_key):
+                keys = keys + [child_key]
+    return keys
+
+fn list_contains(lst: [text], item: text) -> bool:
+    var i = 0
+    val count = tlist_len(lst)
+    while i < count:
+        if lst[i] == item:
+            return true
+        i = i + 1
+    return false
+
+# =========================================================================
+# Parse + Render to HTML (combined, no widget system)
+# =========================================================================
+
+fn parse_ui_file(path: text) -> Result<text, text>:
+    """Parse a .ui.sdn file and return rendered HTML.
+    NOTE: Caller must pass the file path. This function reads the file,
+    parses it, and renders HTML in separate steps to avoid interpreter
+    method dispatch state corruption."""
+    val exists = check_exists(path)
+    if exists == false:
+        return Err("File not found: {path}")
+    val source = read_file(path)
+    return render_source(source)
+
+fn render_source(source: text) -> Result<text, text>:
+    val entries = parse_to_flat(source)
+    return render_entries(entries)
+
+fn render_entries(entries: [FlatEntry]) -> Result<text, text>:
+    val title = flat_get(entries, "app.title")
+    val theme = flat_get(entries, "app.theme")
+    val html = render_node_html(entries, "layout", 0)
+    val page = build_html_page(title, theme, html)
+    return Ok(page)
+
+fn replace_template_value(text_val: text, placeholder: text, replacement: text) -> text:
+    if placeholder == "":
+        return text_val
+    val parts = text_val.split(placeholder)
+    return parts.join(replacement)
+
+fn expand_template_value(entries: [FlatEntry], tpl: text) -> text:
+    if tpl == "":
+        return ""
+    var result = tpl
+    val ph_mode = "{" + "app.mode" + "}"
+    val ph_title = "{" + "app.title" + "}"
+    result = replace_template_value(result, ph_mode, "app")
+    result = replace_template_value(result, ph_title, flat_get(entries, "app.title"))
+    return result
+
+fn render_node_html(entries: [FlatEntry], path: text, depth: i64) -> text:
+    val wtype = flat_get(entries, "{path}.type")
+    val wid = flat_get(entries, "{path}.id")
+    val content = flat_get(entries, "{path}.content")
+    val title = flat_get(entries, "{path}.title")
+    val label = flat_get(entries, "{path}.label")
+    val value = flat_get(entries, "{path}.value")
+    val flex = flat_get(entries, "{path}.flex")
+    val left_text = expand_template_value(entries, flat_get(entries, "{path}.left"))
+    val right_text = expand_template_value(entries, flat_get(entries, "{path}.right"))
+    val width = flat_get(entries, "{path}.width")
+
+    val placeholder = flat_get(entries, "{path}.placeholder")
+    val checked = flat_get(entries, "{path}.checked")
+    val disabled = flat_get(entries, "{path}.disabled")
+    val readonly_val = flat_get(entries, "{path}.readonly")
+    val required_val = flat_get(entries, "{path}.required")
+    val error_val = flat_get(entries, "{path}.error")
+    val error_msg = flat_get(entries, "{path}.error_message")
+    val max_height = flat_get(entries, "{path}.max_height")
+    val rows = flat_get(entries, "{path}.rows")
+    val src = flat_get(entries, "{path}.src")
+    val alt = flat_get(entries, "{path}.alt")
+    val target = flat_get(entries, "{path}.target")
+    val action = flat_get(entries, "{path}.action")
+    val expanded = flat_get(entries, "{path}.expanded")
+    val headers = flat_get(entries, "{path}.headers")
+    val selected_idx = flat_get(entries, "{path}.selected_index")
+
+    var inner = ""
+    var extra_attrs = ""
+
+    # Render based on type
+    if wtype == "text":
+        if content != "":
+            inner = "<p>{content}</p>"
+        elif label != "":
+            inner = "<span>{label}</span>"
+    elif wtype == "button":
+        val btn_label = if label != "": label else: "Button"
+        val dis_attr = if disabled == "true": " disabled" else: ""
+        inner = "<button class=\"button\" data-action=\"{action}\"{dis_attr}>{btn_label}</button>"
+    elif wtype == "checkbox":
+        val chk = if checked == "true": "checked" else: ""
+        val dis_attr = if disabled == "true": " disabled" else: ""
+        inner = "<label class=\"checkbox\"><input type=\"checkbox\" {chk}{dis_attr}/> {label}</label>"
+    elif wtype == "input":
+        val dis_attr = if disabled == "true": " disabled" else: ""
+        val ro_attr = if readonly_val == "true": " readonly" else: ""
+        val req_mark = if required_val == "true": "<span class=\"required\">*</span>" else: ""
+        val err_div = if error_msg != "": "<div class=\"error-message\">{error_msg}</div>" else: ""
+        inner = "{req_mark}<input class=\"input\" type=\"text\" placeholder=\"{placeholder}\"{dis_attr}{ro_attr}/>{err_div}"
+    elif wtype == "textfield":
+        val dis_attr = if disabled == "true": " disabled" else: ""
+        val ro_attr = if readonly_val == "true": " readonly" else: ""
+        inner = "<input class=\"textfield\" type=\"text\" value=\"{value}\" placeholder=\"{placeholder}\"{dis_attr}{ro_attr}/>"
+    elif wtype == "textarea":
+        val r = if rows != "": rows else: "4"
+        inner = "<textarea class=\"textarea\" rows=\"{r}\" placeholder=\"{placeholder}\">{value}</textarea>"
+    elif wtype == "dropdown":
+        inner = "<select class=\"dropdown\"></select>"
+    elif wtype == "progress":
+        val pct = if value != "": value else: "0"
+        inner = "<div class=\"progress\"><div class=\"progress-bar\" style=\"width:{pct}%\">{pct}%</div></div>"
+    elif wtype == "list":
+        inner = "<ul class=\"list\"></ul>"
+        if selected_idx != "":
+            extra_attrs = " data-selected=\"{selected_idx}\""
+    elif wtype == "table":
+        val hdr = if headers != "": "<thead><tr><th>{headers}</th></tr></thead>" else: ""
+        inner = "<table class=\"table\">{hdr}<tbody></tbody></table>"
+    elif wtype == "tree":
+        inner = "<div class=\"tree\"></div>"
+    elif wtype == "treenode":
+        val exp_cls = if expanded == "true": "expanded" else: "collapsed"
+        val node_label = if label != "": label else: wid
+        inner = "<div class=\"treenode {exp_cls}\"><span class=\"tree-marker\"></span>{node_label}</div>"
+    elif wtype == "tabs":
+        inner = "<div class=\"tabs\"></div>"
+    elif wtype == "statusbar":
+        inner = "<div class=\"statusbar\"><span>{left_text}</span><span>{right_text}</span></div>"
+    elif wtype == "menubar":
+        inner = "<nav class=\"menubar\"></nav>"
+    elif wtype == "image":
+        inner = "<div class=\"image\" title=\"{alt}\">[IMG: {alt}]</div>"
+    elif wtype == "divider":
+        inner = "<hr class=\"divider\"/>"
+    elif wtype == "tooltip":
+        inner = "<div class=\"tooltip\" data-target=\"{target}\">{content}</div>"
+    elif wtype == "dialog":
+        inner = "<div class=\"dialog-overlay\"><div class=\"dialog\">"
+        if title != "":
+            inner = inner + "<div class=\"dialog-title\">{title}</div>"
+    elif wtype == "scroll":
+        val mh = if max_height != "": max_height else: "10"
+        extra_attrs = " data-max-height=\"{mh}\""
+
+    # Add title for panels
+    if title != "" and wtype != "dialog":
+        inner = "<h3>{title}</h3>" + inner
+
+    # Render children
+    val child_keys = flat_child_keys(entries, "{path}.children")
+    var ci = 0
+    val ccount = tlist_len(child_keys)
+    var children_parts: [text] = []
+    while ci < ccount:
+        val ck = child_keys[ci]
+        ci = ci + 1
+        val child_path = "{path}.children.{ck}"
+        val child_html = render_node_html(entries, child_path, depth + 1)
+        children_parts = children_parts.push(child_html)
+    val children_html = children_parts.join("")
+
+    inner = inner + children_html
+
+    # Close dialog if needed
+    if wtype == "dialog":
+        inner = inner + "</div></div>"
+
+    # CSS class: always include widget type
+    var css_class = "widget"
+    if wtype != "":
+        css_class = "widget {wtype}"
+    if wtype == "vbox" or wtype == "":
+        css_class = "widget vbox"
+    elif wtype == "hbox":
+        css_class = "widget hbox"
+    elif wtype == "panel":
+        css_class = "widget panel"
+
+    # Style
+    var style = ""
+    if flex != "":
+        style = "flex:{flex};"
+    if width != "":
+        style = style + "width:{width}ch;"
+    if wtype == "scroll" and max_height != "":
+        style = style + "max-height:{max_height}em;overflow:auto;"
+
+    val id_attr = if wid != "": " id=\"{wid}\"" else: ""
+    val style_attr = if style != "": " style=\"{style}\"" else: ""
+
+    return "<div class=\"{css_class}\"{id_attr}{style_attr}{extra_attrs}>{inner}</div>\n"
+
+fn build_html_page(title: text, theme: text, body_html: text) -> text:
+    val display_title = if title != "": title else: "Simple UI"
+    val theme_class = if theme != "": theme else: "dark"
+    return "<html><head><title>{display_title}</title><style>" + get_css(theme_class) + "</style></head><body class=\"{theme_class}\"><div id=\"app\">" + body_html + "</div></body></html>"
+
+fn get_css(theme: text) -> text:
+    return "* { margin: 0; padding: 0; box-sizing: border-box; } body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; background: #1a1a2e; color: #e0e0e0; min-height: 100vh; } body.dark { background: #1a1a2e; color: #e0e0e0; } body.light { background: #f5f5f5; color: #333; } .widget { padding: 4px; } .vbox { display: flex; flex-direction: column; } .hbox { display: flex; flex-direction: row; } .panel { border: 1px solid #333; border-radius: 4px; padding: 8px; margin: 4px; } h3 { color: #7ec8e3; margin-bottom: 8px; font-size: 14px; border-bottom: 1px solid #333; padding-bottom: 4px; } p { margin: 4px 0; } .progress { background: #2d2d44; border-radius: 4px; height: 20px; margin: 8px 0; overflow: hidden; } .progress-bar { background: linear-gradient(90deg, #4a9eff, #7ec8e3); height: 100%; text-align: center; color: #fff; font-size: 12px; line-height: 20px; } .statusbar { display: flex; justify-content: space-between; background: #16213e; padding: 4px 12px; font-size: 12px; color: #7ec8e3; } .statusbar-widget { position: fixed; bottom: 0; left: 0; right: 0; } .menubar-widget { background: #16213e; padding: 4px 12px; border-bottom: 1px solid #333; } .list { list-style: none; padding: 4px; }"

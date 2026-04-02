@@ -1,0 +1,121 @@
+# Reactive State System
+#
+# Provides State<T>-like reactive containers that trigger UI rebuilds
+# when their values change. Observers are notified of changes and
+# can trigger tree diffing + patch application.
+
+use common.ui.widget.{UITree, UIState, WidgetNode}
+use common.ui.diff.{diff_trees}
+use common.ui.patch.{UIPatch}
+
+# =========================================================================
+# Reactive Value
+# =========================================================================
+
+class ReactiveValue:
+    name: text
+    value: text
+    observers: [text]
+    version: i32
+
+    static fn new(name: text, initial: text) -> ReactiveValue:
+        return ReactiveValue(
+            name: name,
+            value: initial,
+            observers: [],
+            version: 0
+        )
+
+    fn get() -> text:
+        return self.value
+
+    fn set(new_value: text) -> bool:
+        """Set the value. Returns true if it changed."""
+        if self.value == new_value:
+            return false
+        self.value = new_value
+        self.version = self.version + 1
+        return true
+
+    fn add_observer(observer_id: text):
+        self.observers.push(observer_id)
+
+# =========================================================================
+# Reactive Store
+# =========================================================================
+
+class ReactiveStore:
+    values: Dict<text, ReactiveValue>
+    dirty: bool
+    change_count: i32
+
+    static fn new() -> ReactiveStore:
+        return ReactiveStore(
+            values: {},
+            dirty: false,
+            change_count: 0
+        )
+
+    fn define(name: text, initial: text):
+        """Define a new reactive value."""
+        self.values[name] = ReactiveValue.new(name, initial)
+
+    fn get(name: text) -> text:
+        """Get a reactive value."""
+        if self.values.contains_key(name):
+            return self.values[name].get()
+        return ""
+
+    fn set(name: text, value: text) -> bool:
+        """Set a reactive value. Returns true if it changed."""
+        if self.values.contains_key(name):
+            val changed = self.values[name].set(value)
+            if changed:
+                self.dirty = true
+                self.change_count = self.change_count + 1
+            return changed
+        return false
+
+    fn is_dirty() -> bool:
+        return self.dirty
+
+    fn clear_dirty():
+        self.dirty = false
+
+    fn observe(value_name: text, observer_id: text):
+        """Register an observer for a reactive value."""
+        if self.values.contains_key(value_name):
+            self.values[value_name].add_observer(observer_id)
+
+# =========================================================================
+# Reactive UI Controller
+# =========================================================================
+
+class ReactiveUI:
+    store: ReactiveStore
+    current_tree: WidgetNode?
+    build_fn_id: text
+
+    static fn new() -> ReactiveUI:
+        return ReactiveUI(
+            store: ReactiveStore.new(),
+            current_tree: nil,
+            build_fn_id: ""
+        )
+
+    fn update(new_tree: WidgetNode) -> [UIPatch]:
+        """Update the tree and return patches."""
+        if self.current_tree == nil:
+            self.current_tree = new_tree
+            return []
+
+        val patches = diff_trees(self.current_tree, new_tree)
+        self.current_tree = new_tree
+        self.store.clear_dirty()
+        return patches
+
+    fn get_store() -> ReactiveStore:
+        return self.store
+
+    fn current() -> WidgetNode?:
+        return self.current_tree

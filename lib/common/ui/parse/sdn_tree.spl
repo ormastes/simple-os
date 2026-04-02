@@ -1,0 +1,331 @@
+# UI SDN Tree Builder
+#
+# Parses .ui.sdn files into UITree widget trees for app backends.
+# Self-contained: includes its own SDN parser and file I/O helpers
+# so it works independently of sdn.spl.
+
+use common.ui.widget.{WidgetNode, UITree}
+
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_file_exists(path: text) -> bool
+
+struct STFlatEntry:
+    key: text
+    value: text
+
+# =========================================================================
+# String / List Helpers
+# =========================================================================
+
+fn st_strip(s: text) -> text:
+    s.strip()
+
+fn st_split(s: text, d: text) -> [text]:
+    s.split(d)
+
+fn st_starts(s: text, p: text) -> bool:
+    s.starts_with(p)
+
+fn st_ends(s: text, p: text) -> bool:
+    s.ends_with(p)
+
+fn st_len(s: text) -> i64:
+    s.len()
+
+fn st_tlist_len(l: [text]) -> i64:
+    l.len()
+
+fn st_ilist_len(l: [i64]) -> i64:
+    l.len()
+
+fn st_find(s: text, n: text) -> i64:
+    val idx = s.index_of(n)
+    match idx:
+        case Some(i):
+            return i
+        case _:
+            return -1
+
+fn st_unwrap_opt(v: any) -> any:
+    match v:
+        case Some(s):
+            return s
+        case _:
+            return v
+
+fn st_read_file(path: text) -> text:
+    val r = rt_file_read_text(path)
+    return st_unwrap_opt(r)
+
+fn st_check_exists(path: text) -> bool:
+    val r = rt_file_exists(path)
+    return st_unwrap_opt(r)
+
+# =========================================================================
+# Flat key-value SDN parser (same algorithm as sdn.spl)
+# =========================================================================
+
+fn st_pop_stack(indents: [i64], keys: [text], target_indent: i64) -> ([i64], [text]):
+    var ind = indents
+    var ks = keys
+    var ilen = st_ilist_len(ind)
+    while ilen > 0:
+        val top = ind[ilen - 1]
+        if target_indent <= top:
+            ind = ind[0:ilen - 1]
+            ks = ks[0:ilen - 1]
+            ilen = st_ilist_len(ind)
+        else:
+            break
+    return (ind, ks)
+
+fn st_join_path(parts: [text]) -> text:
+    var result = ""
+    var first = true
+    var i = 0
+    val count = st_tlist_len(parts)
+    while i < count:
+        val p = parts[i]
+        i = i + 1
+        if first:
+            result = p
+            first = false
+        else:
+            result = result + "." + p
+    return result
+
+fn st_make_full_path(keys: [text], key: text) -> text:
+    val klen = st_tlist_len(keys)
+    if klen > 0:
+        return st_join_path(keys) + "." + key
+    return key
+
+fn st_count_indent(line: text) -> i64:
+    var indent = 0
+    var ci = 0
+    val ll = st_len(line)
+    while ci < ll:
+        if line[ci] == " ":
+            indent = indent + 1
+        else:
+            return indent
+        ci = ci + 1
+    return indent
+
+fn st_parse_to_flat(source: text) -> [STFlatEntry]:
+    # Normalize Windows CRLF and old Mac CR line endings to Unix LF
+    var normalized = source.replace("\r\n", "\n")
+    normalized = normalized.replace("\r", "\n")
+    val lines = st_split(normalized, "\n")
+    var result: [STFlatEntry] = []
+    var path_indents: [i64] = []
+    var path_keys: [text] = []
+    var li = 0
+    val line_count = st_tlist_len(lines)
+
+    while li < line_count:
+        val line = lines[li]
+        li = li + 1
+        val stripped = st_strip(line)
+        if stripped == "":
+            continue
+        if st_starts(stripped, "#"):
+            continue
+
+        val indent = st_count_indent(line)
+        val cp = st_find(stripped, ":")
+        if cp < 0:
+            continue
+
+        val key = st_strip(stripped[0:cp])
+        val sl = st_len(stripped)
+        var after = ""
+        if cp + 1 < sl:
+            after = st_strip(stripped[cp + 1:])
+
+        val popped = st_pop_stack(path_indents, path_keys, indent)
+        path_indents = popped.0
+        path_keys = popped.1
+
+        val full_path = st_make_full_path(path_keys, key)
+
+        if after == "" or after == "|":
+            path_indents = path_indents + [indent]
+            path_keys = path_keys + [key]
+        else:
+            var val_text = after
+            val vl = st_len(val_text)
+            if vl >= 2:
+                if st_starts(val_text, "\""):
+                    if st_ends(val_text, "\""):
+                        val_text = val_text[1:vl - 1]
+            result = result.push(STFlatEntry(key: full_path, value: val_text))
+
+    return result
+
+fn st_flat_get(entries: [STFlatEntry], key: text) -> text:
+    for entry in entries:
+        if entry.key == key:
+            return entry.value
+    return ""
+
+fn st_flat_child_keys(entries: [STFlatEntry], prefix: text) -> [text]:
+    var keys: [text] = []
+    val plen = st_len(prefix)
+    val dot_prefix = prefix + "."
+    for entry in entries:
+        val key = entry.key
+        if st_starts(key, dot_prefix):
+            val rest = key[plen + 1:]
+            val dot_pos = st_find(rest, ".")
+            var child_key = rest
+            if dot_pos >= 0:
+                child_key = rest[0:dot_pos]
+            if not st_list_contains(keys, child_key):
+                keys = keys + [child_key]
+    return keys
+
+fn st_list_contains(lst: [text], item: text) -> bool:
+    var i = 0
+    val count = st_tlist_len(lst)
+    while i < count:
+        if lst[i] == item:
+            return true
+        i = i + 1
+    return false
+
+# =========================================================================
+# Public API
+# =========================================================================
+
+fn parse_ui_to_tree(path: text) -> Result<UITree, text>:
+    """Parse a .ui.sdn file and return a UITree.
+    This builds WidgetNode objects from the SDN data so that
+    app backends can use the full state/event/render pipeline."""
+    val exists = st_check_exists(path)
+    if exists == false:
+        return Err("File not found: {path}")
+    val source = st_read_file(path)
+    return build_tree_from_source(source)
+
+fn build_tree_from_source(source: text) -> Result<UITree, text>:
+    """Parse SDN source text and build a UITree."""
+    val entries = st_parse_to_flat(source)
+    val title = st_flat_get(entries, "app.title")
+    val theme = st_flat_get(entries, "app.theme")
+    val root = build_widget_node(entries, "layout", 0)
+    var tree = UITree.new(root)
+    if title != "":
+        tree = tree.with_title(title)
+    if theme != "":
+        tree = tree.with_theme(theme)
+    return Ok(tree)
+
+# =========================================================================
+# Internal: Recursive Widget Builder
+# =========================================================================
+
+fn build_widget_node(entries: [STFlatEntry], path: text, depth: i64) -> WidgetNode:
+    """Recursively build a WidgetNode from flat SDN entries."""
+    val wtype = st_flat_get(entries, "{path}.type")
+    val wid = st_flat_get(entries, "{path}.id")
+    val kind = if wtype != "": wtype else: "panel"
+    val node_id = if wid != "": wid else: "node_{depth}"
+    var node = WidgetNode.new(node_id, kind)
+
+    # Set layout for container types
+    if kind == "vbox" or kind == "":
+        node = node.set_layout("vbox")
+    elif kind == "hbox":
+        node = node.set_layout("hbox")
+    elif kind == "grid":
+        node = node.set_layout("grid")
+    elif kind == "panel":
+        node = node.set_layout("vbox")
+
+    # Copy all known properties from SDN entries to widget props
+    val content = st_flat_get(entries, "{path}.content")
+    if content != "":
+        node = node.set_prop("content", content)
+    val title = st_flat_get(entries, "{path}.title")
+    if title != "":
+        node = node.set_prop("title", title)
+    val label = st_flat_get(entries, "{path}.label")
+    if label != "":
+        node = node.set_prop("label", label)
+    val value = st_flat_get(entries, "{path}.value")
+    if value != "":
+        node = node.set_prop("value", value)
+    val flex = st_flat_get(entries, "{path}.flex")
+    if flex != "":
+        node = node.set_prop("flex", flex)
+    val left_text = st_flat_get(entries, "{path}.left")
+    if left_text != "":
+        node = node.set_prop("left", left_text)
+    val right_text = st_flat_get(entries, "{path}.right")
+    if right_text != "":
+        node = node.set_prop("right", right_text)
+    val width = st_flat_get(entries, "{path}.width")
+    if width != "":
+        node = node.set_prop("width", width)
+    val placeholder = st_flat_get(entries, "{path}.placeholder")
+    if placeholder != "":
+        node = node.set_prop("placeholder", placeholder)
+    val checked = st_flat_get(entries, "{path}.checked")
+    if checked != "":
+        node = node.set_prop("checked", checked)
+    val disabled = st_flat_get(entries, "{path}.disabled")
+    if disabled != "":
+        node = node.set_prop("disabled", disabled)
+    val readonly_val = st_flat_get(entries, "{path}.readonly")
+    if readonly_val != "":
+        node = node.set_prop("readonly", readonly_val)
+    val required_val = st_flat_get(entries, "{path}.required")
+    if required_val != "":
+        node = node.set_prop("required", required_val)
+    val error_val = st_flat_get(entries, "{path}.error")
+    if error_val != "":
+        node = node.set_prop("error", error_val)
+    val error_msg = st_flat_get(entries, "{path}.error_message")
+    if error_msg != "":
+        node = node.set_prop("error_message", error_msg)
+    val max_height = st_flat_get(entries, "{path}.max_height")
+    if max_height != "":
+        node = node.set_prop("max_height", max_height)
+    val rows = st_flat_get(entries, "{path}.rows")
+    if rows != "":
+        node = node.set_prop("rows", rows)
+    val src = st_flat_get(entries, "{path}.src")
+    if src != "":
+        node = node.set_prop("src", src)
+    val alt = st_flat_get(entries, "{path}.alt")
+    if alt != "":
+        node = node.set_prop("alt", alt)
+    val target = st_flat_get(entries, "{path}.target")
+    if target != "":
+        node = node.set_prop("target", target)
+    val action = st_flat_get(entries, "{path}.action")
+    if action != "":
+        node = node.set_prop("action", action)
+    val expanded = st_flat_get(entries, "{path}.expanded")
+    if expanded != "":
+        node = node.set_prop("expanded", expanded)
+    val headers = st_flat_get(entries, "{path}.headers")
+    if headers != "":
+        node = node.set_prop("headers", headers)
+    val selected_idx = st_flat_get(entries, "{path}.selected_index")
+    if selected_idx != "":
+        node = node.set_prop("selected_index", selected_idx)
+
+    # Build children recursively
+    val child_keys = st_flat_child_keys(entries, "{path}.children")
+    var ci = 0
+    val ccount = st_tlist_len(child_keys)
+    while ci < ccount:
+        val ck = child_keys[ci]
+        ci = ci + 1
+        val child_path = "{path}.children.{ck}"
+        val child_node = build_widget_node(entries, child_path, depth + 1)
+        node = node.add_child(child_node)
+
+    return node

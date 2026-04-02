@@ -1,0 +1,268 @@
+# Capability Enforcement — Computation Dimension
+#
+# Per-task capability management with pledge/unveil restrictions.
+# Capabilities follow the generation-counter pattern from SurfaceHandle:
+# revoking a capability bumps its generation, invalidating all copies.
+#
+# Monotonic security model (inspired by OpenBSD):
+#   - pledge() permanently restricts a task's capability set
+#   - unveil() permanently restricts file path access
+#   - Neither can ever be expanded once applied
+
+use os.kernel.types.task_types.{TaskId}
+use os.kernel.types.capability_types.{CapabilityToken, CapabilityKind, CapabilitySet}
+
+# ============================================================================
+# Per-Task Capability Record
+# ============================================================================
+
+struct TaskCapRecord:
+    """Capability state for a single task.
+
+    Tracks the capability set, pledge/unveil status, and path restrictions.
+    """
+    task_id: TaskId
+    caps: CapabilitySet
+    unveil_paths: [UnveilEntry]     # Allowed paths after unveil()
+    is_unveiled: bool               # Once unveiled, no new paths can be added
+
+struct UnveilEntry:
+    """A single unveil path restriction."""
+    path: text
+    permissions: text               # "r", "w", "rw", "rwx", "rwxc", etc.
+
+# ============================================================================
+# Capability Manager
+# ============================================================================
+
+class CapabilityManager:
+    """Manages per-task capability sets and enforces security policy.
+
+    Each task starts with a full capability set (or inherits from parent).
+    Tasks can permanently restrict their capabilities via pledge() and
+    restrict file access via unveil(). These restrictions are monotonic:
+    once applied, they can only shrink, never expand.
+
+    Capability transfer between tasks uses generation counters:
+    revoking a token bumps the generation, immediately invalidating
+    all copies held by other tasks.
+    """
+    records: [TaskCapRecord]
+    next_generation: u64            # Global generation counter for tokens
+
+impl CapabilityManager:
+    static fn new() -> CapabilityManager:
+        """Create an empty capability manager."""
+        CapabilityManager(
+            records: [],
+            next_generation: 1
+        )
+
+    # -- Checking ------------------------------------------------------------
+
+    fn check(task: TaskId, required: CapabilityKind) -> bool:
+        """Check if a task holds a capability matching the required kind.
+
+        Returns true if the task has the capability, false otherwise.
+        """
+        val record = self._find_record(task)
+        if record == nil:
+            return false
+        val rec = record
+        rec.caps.has(required)
+
+    fn check_file_access(task: TaskId, path: text, perm: text) -> bool:
+        """Check if a task can access a file path with given permissions.
+
+        If the task has not called unveil(), all paths are allowed
+        (subject to normal capability checks). Once unveiled, only
+        explicitly allowed paths are permitted.
+        """
+        val record = self._find_record(task)
+        if record == nil:
+            return false
+        val rec = record
+        if not rec.is_unveiled:
+            # Not unveiled — all paths allowed (capability-only check)
+            return true
+        # Check unveil entries
+        for entry in rec.unveil_paths:
+            val path_matches = _path_starts_with(path, entry.path)
+            val perm_matches = _perms_contain(entry.permissions, perm)
+            if path_matches:
+                if perm_matches:
+                    return true
+        false
+
+    # -- Granting / Revoking -------------------------------------------------
+
+    me grant(from: TaskId, to: TaskId, cap: CapabilityToken) -> bool:
+        """Grant a capability from one task to another.
+
+        The granting task must hold a capability of the same kind.
+        A new token is created with a fresh generation for the target.
+        """
+        # Verify the source task holds this capability
+        val has_cap = self.check(from, cap.kind)
+        if not has_cap:
+            return false
+
+        # Create a new token for the target
+        val new_token = CapabilityToken(
+            kind: cap.kind,
+            generation: self.next_generation,
+            owner: to.id
+        )
+        self.next_generation = self.next_generation + 1
+
+        # Add to target's capability set
+        self._ensure_record(to)
+        var idx = 0
+        while idx < self.records.len():
+            var rec = self.records[idx]
+            if rec.task_id.id == to.id:
+                rec.caps.caps.push(new_token)
+                self.records[idx] = rec
+                return true
+            idx = idx + 1
+        false
+
+    me revoke(cap: CapabilityToken) -> bool:
+        """Revoke a capability token.
+
+        Removes the token from the owning task's capability set.
+        Because tokens carry generation counters, any stale copies
+        held elsewhere are automatically invalid.
+        """
+        val owner_id = TaskId(id: cap.owner)
+        var idx = 0
+        while idx < self.records.len():
+            var rec = self.records[idx]
+            if rec.task_id.id == owner_id.id:
+                var new_caps: [CapabilityToken] = []
+                for existing in rec.caps.caps:
+                    # Keep all caps except the revoked one
+                    val same_kind = existing.kind == cap.kind
+                    val same_gen = existing.generation == cap.generation
+                    if same_kind:
+                        if same_gen:
+                            pass  # Skip — this is the revoked token
+                        else:
+                            new_caps.push(existing)
+                    else:
+                        new_caps.push(existing)
+                rec.caps.caps = new_caps
+                self.records[idx] = rec
+                return true
+            idx = idx + 1
+        false
+
+    # -- Pledge / Unveil (Monotonic Restriction) -----------------------------
+
+    me pledge(task: TaskId, allowed: [CapabilityKind]):
+        """Permanently restrict a task's capabilities to the allowed list.
+
+        After pledge(), the task can only use capabilities in the allowed
+        list. This is irreversible — once pledged, the set can only shrink.
+
+        Delegates to CapabilitySet.pledge() which handles the filtering.
+        """
+        self._ensure_record(task)
+        var idx = 0
+        while idx < self.records.len():
+            var rec = self.records[idx]
+            if rec.task_id.id == task.id:
+                rec.caps.pledge(allowed)
+                self.records[idx] = rec
+                return
+            idx = idx + 1
+
+    me unveil(task: TaskId, path: text, permissions: text):
+        """Restrict file access to a specific path with given permissions.
+
+        First call to unveil() locks the task into unveiled mode.
+        Subsequent calls can only add more restrictive entries.
+        Once unveiled, access to non-unveiled paths is denied.
+        """
+        self._ensure_record(task)
+        var idx = 0
+        while idx < self.records.len():
+            var rec = self.records[idx]
+            if rec.task_id.id == task.id:
+                rec.is_unveiled = true
+                rec.unveil_paths.push(UnveilEntry(
+                    path: path,
+                    permissions: permissions
+                ))
+                self.records[idx] = rec
+                return
+            idx = idx + 1
+
+    # -- Task Lifecycle ------------------------------------------------------
+
+    me init_task(task: TaskId, caps: CapabilitySet):
+        """Initialize capability record for a new task."""
+        val record = TaskCapRecord(
+            task_id: task,
+            caps: caps,
+            unveil_paths: [],
+            is_unveiled: false
+        )
+        self.records.push(record)
+
+    me destroy_task(task: TaskId):
+        """Remove all capability records for a destroyed task."""
+        var new_records: [TaskCapRecord] = []
+        for rec in self.records:
+            if rec.task_id.id != task.id:
+                new_records.push(rec)
+        self.records = new_records
+
+    # -- Internal Helpers ----------------------------------------------------
+
+    fn _find_record(task: TaskId) -> TaskCapRecord?:
+        """Find the capability record for a task."""
+        for rec in self.records:
+            if rec.task_id.id == task.id:
+                return rec
+        nil
+
+    me _ensure_record(task: TaskId):
+        """Ensure a capability record exists for the task, creating if needed."""
+        val existing = self._find_record(task)
+        if existing != nil:
+            return
+        val record = TaskCapRecord(
+            task_id: task,
+            caps: CapabilitySet.full(),
+            unveil_paths: [],
+            is_unveiled: false
+        )
+        self.records.push(record)
+
+# ============================================================================
+# Path Matching Helpers
+# ============================================================================
+
+fn _path_starts_with(path: text, prefix: text) -> bool:
+    """Check if a path starts with a given prefix.
+
+    Handles the root prefix "/" as matching everything.
+    """
+    if prefix == "/":
+        return true
+    path.starts_with(prefix)
+
+fn _perms_contain(allowed: text, requested: text) -> bool:
+    """Check if allowed permissions contain the requested permission.
+
+    Permissions are single characters: r, w, x, c (create).
+    """
+    var i = 0
+    while i < requested.len():
+        val ch = requested[i]
+        val found = allowed.contains(ch)
+        if not found:
+            return false
+        i = i + 1
+    true

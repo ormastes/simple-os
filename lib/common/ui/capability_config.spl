@@ -1,0 +1,90 @@
+# SDN-based capability configuration parser for per-window policies.
+#
+# Parses capability config in SDN format:
+#
+#   window:
+#       id: main
+#       default: deny
+#       granted:
+#           - Notification
+#           - FileSystemRead
+#       denied:
+#           - ShellAccess
+#           - ProcessSpawn
+
+use common.ui.capability.{Capability}
+use common.ui.capability_policy.{CapabilityPolicy, grant, deny, parse_capability}
+
+## Parse capability policy from SDN text content.
+fn parse_capability_config(content: text, window_id: text) -> Result<CapabilityPolicy, text>:
+    val lines = content.split("\n")
+    var policy = CapabilityPolicy.new(window_id)
+    var section = ""
+    var found_window = false
+
+    for line in lines:
+        val trimmed = line.trim()
+
+        # Skip empty lines and comments
+        if trimmed == "" or trimmed.starts_with("#"):
+            continue
+
+        # Detect section headers
+        if trimmed == "window:":
+            found_window = true
+            section = "window"
+            continue
+
+        if trimmed == "granted:":
+            section = "granted"
+            continue
+
+        if trimmed == "denied:":
+            section = "denied"
+            continue
+
+        # Parse key-value pairs
+        if section == "window" and trimmed.starts_with("id:"):
+            val parsed_id = trimmed.slice(3, trimmed.len()).trim()
+            if parsed_id != window_id:
+                # Skip this window block — not the one we want
+                found_window = false
+            continue
+
+        if section == "window" and trimmed.starts_with("default:"):
+            val default_val = trimmed.slice(8, trimmed.len()).trim()
+            if default_val == "allow":
+                policy = CapabilityPolicy(
+                    window_id: policy.window_id,
+                    granted: policy.granted,
+                    denied: policy.denied,
+                    default_deny: false,
+                    audit_config: policy.audit_config
+                )
+            continue
+
+        # Parse list items
+        if trimmed.starts_with("- ") and found_window:
+            val cap_name = trimmed.slice(2, trimmed.len()).trim()
+            val cap_result = parse_capability(cap_name)
+            match cap_result:
+                Ok(cap):
+                    if section == "granted":
+                        policy = grant(policy, cap)
+                    else if section == "denied":
+                        policy = deny(policy, cap)
+                Err(msg):
+                    return Err("parse error for window {window_id}: {msg}")
+
+    if not found_window:
+        return Err("window '{window_id}' not found in config")
+
+    Ok(policy)
+
+## Load capability policy from an SDN file path.
+fn load_capability_config(path: text, window_id: text) -> Result<CapabilityPolicy, text>:
+    use std.io.file
+    val content_result = file.read_text(path)
+    match content_result:
+        Ok(content): parse_capability_config(content, window_id)
+        Err(e): Err("failed to read capability config: {e}")

@@ -1,0 +1,50 @@
+# Filesystem Types — Entity Dimension
+#
+# VFS types shared by kernel, services, and applications.
+
+struct FileDescriptor:
+    """File descriptor (per-process)."""
+    fd: i32
+    node: u64           # FsNode reference
+    offset: u64          # Current read/write position
+    flags: FileFlags
+
+struct FileFlags:
+    """File open flags."""
+    read: bool
+    write: bool
+    append: bool
+    create: bool
+    truncate: bool
+    directory: bool
+
+struct MountPoint:
+    """Filesystem mount point."""
+    path: text
+    fs_type: text       # "fat32", "ext2", "zfs", etc.
+    device: text        # Block device path
+    read_only: bool
+
+enum FsNodeKind:
+    """Filesystem node type."""
+    File
+    Directory
+    Symlink
+    Device
+    Pipe
+
+struct FsNode:
+    """Filesystem node (inode equivalent)."""
+    id: u64
+    kind: FsNodeKind
+    size: u64
+    permissions: u16     # POSIX-style rwxrwxrwx
+    owner: u32
+    group: u32
+    created_ns: u64
+    modified_ns: u64
+
+struct DirEntry:
+    """Directory entry."""
+    name: text
+    node: FsNode

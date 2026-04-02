@@ -1,0 +1,225 @@
+# Architecture Context — Per-CPU Register State
+#
+# ArchContext is an enum dispatching to architecture-specific saved register sets.
+# Only one variant is active per compilation target — the compiler optimizes away the tag.
+
+enum Architecture:
+    """Target architecture identifier."""
+    X86_64
+    X86
+    Riscv64
+    Riscv32
+    Arm64
+    Arm32
+
+enum ArchContext:
+    """Architecture-specific saved CPU state for context switching."""
+    X86_64(ctx: X86_64Context)
+    X86(ctx: X86Context)
+    Riscv64(ctx: Riscv64Context)
+    Riscv32(ctx: Riscv32Context)
+    Arm64(ctx: Arm64Context)
+    Arm32(ctx: Arm32Context)
+
+    fn arch() -> Architecture:
+        """Returns the active architecture for this context."""
+        match self:
+            ArchContext.X86_64(_): Architecture.X86_64
+            ArchContext.X86(_): Architecture.X86
+            ArchContext.Riscv64(_): Architecture.Riscv64
+            ArchContext.Riscv32(_): Architecture.Riscv32
+            ArchContext.Arm64(_): Architecture.Arm64
+            ArchContext.Arm32(_): Architecture.Arm32
+
+# --- x86_64 Register State ---
+
+@repr("C")
+struct X86_64Context:
+    """Saved register state for x86_64 (System V ABI + segment regs)."""
+    rax: u64
+    rbx: u64
+    rcx: u64
+    rdx: u64
+    rsi: u64
+    rdi: u64
+    rbp: u64
+    rsp: u64
+    r8: u64
+    r9: u64
+    r10: u64
+    r11: u64
+    r12: u64
+    r13: u64
+    r14: u64
+    r15: u64
+    rip: u64
+    rflags: u64
+    cs: u64
+    ss: u64
+    fpu_state: u64
+
+# --- RISC-V 64 Register State ---
+
+@repr("C")
+struct Riscv64Context:
+    """Saved register state for RISC-V 64-bit (RV64GC)."""
+    ra: u64             # x1 — return address
+    sp: u64             # x2 — stack pointer
+    gp: u64             # x3 — global pointer
+    tp: u64             # x4 — thread pointer
+    t0: u64             # x5 — temporary
+    t1: u64             # x6 — temporary
+    t2: u64             # x7 — temporary
+    s0: u64             # x8 — saved / frame pointer
+    s1: u64             # x9 — saved
+    a0: u64             # x10 — argument / return value
+    a1: u64             # x11 — argument / return value
+    a2: u64             # x12 — argument
+    a3: u64             # x13 — argument
+    a4: u64             # x14 — argument
+    a5: u64             # x15 — argument
+    a6: u64             # x16 — argument
+    a7: u64             # x17 — argument
+    s2: u64             # x18 — saved
+    s3: u64             # x19 — saved
+    s4: u64             # x20 — saved
+    s5: u64             # x21 — saved
+    s6: u64             # x22 — saved
+    s7: u64             # x23 — saved
+    s8: u64             # x24 — saved
+    s9: u64             # x25 — saved
+    s10: u64            # x26 — saved
+    s11: u64            # x27 — saved
+    t3: u64             # x28 — temporary
+    t4: u64             # x29 — temporary
+    t5: u64             # x30 — temporary
+    t6: u64             # x31 — temporary
+    sepc: u64           # supervisor exception program counter
+    sstatus: u64        # supervisor status register
+    scause: u64         # supervisor cause register
+
+# --- RISC-V 32 Register State ---
+
+@repr("C")
+struct Riscv32Context:
+    """Saved register state for RISC-V 32-bit (RV32GC)."""
+    ra: u32             # x1 — return address
+    sp: u32             # x2 — stack pointer
+    gp: u32             # x3 — global pointer
+    tp: u32             # x4 — thread pointer
+    t0: u32             # x5 — temporary
+    t1: u32             # x6 — temporary
+    t2: u32             # x7 — temporary
+    s0: u32             # x8 — saved / frame pointer
+    s1: u32             # x9 — saved
+    a0: u32             # x10 — argument / return value
+    a1: u32             # x11 — argument / return value
+    a2: u32             # x12 — argument
+    a3: u32             # x13 — argument
+    a4: u32             # x14 — argument
+    a5: u32             # x15 — argument
+    a6: u32             # x16 — argument
+    a7: u32             # x17 — argument
+    s2: u32             # x18 — saved
+    s3: u32             # x19 — saved
+    s4: u32             # x20 — saved
+    s5: u32             # x21 — saved
+    s6: u32             # x22 — saved
+    s7: u32             # x23 — saved
+    s8: u32             # x24 — saved
+    s9: u32             # x25 — saved
+    s10: u32            # x26 — saved
+    s11: u32            # x27 — saved
+    t3: u32             # x28 — temporary
+    t4: u32             # x29 — temporary
+    t5: u32             # x30 — temporary
+    t6: u32             # x31 — temporary
+    sepc: u32           # supervisor exception program counter
+    sstatus: u32        # supervisor status register
+    scause: u32         # supervisor cause register
+
+# --- ARM64 (AArch64) Register State ---
+
+@repr("C")
+struct Arm64Context:
+    """Saved register state for ARM64 / AArch64."""
+    x0: u64
+    x1: u64
+    x2: u64
+    x3: u64
+    x4: u64
+    x5: u64
+    x6: u64
+    x7: u64
+    x8: u64
+    x9: u64
+    x10: u64
+    x11: u64
+    x12: u64
+    x13: u64
+    x14: u64
+    x15: u64
+    x16: u64
+    x17: u64
+    x18: u64
+    x19: u64
+    x20: u64
+    x21: u64
+    x22: u64
+    x23: u64
+    x24: u64
+    x25: u64
+    x26: u64
+    x27: u64
+    x28: u64
+    x29: u64
+    x30: u64
+    sp: u64
+    elr_el1: u64       # exception link register (saved PC)
+    spsr_el1: u64       # saved program status register
+    fpu_state: u64
+
+# --- x86 (32-bit) Register State ---
+
+@repr("C")
+struct X86Context:
+    """Saved register state for x86 32-bit (cdecl ABI + segment regs)."""
+    eax: u32
+    ebx: u32
+    ecx: u32
+    edx: u32
+    esi: u32
+    edi: u32
+    ebp: u32
+    esp: u32
+    eip: u32
+    eflags: u32
+    cs: u32
+    ss: u32
+    ds: u32
+    es: u32
+    fpu_state: u32
+
+# --- ARM32 (ARMv7-A) Register State ---
+
+@repr("C")
+struct Arm32Context:
+    """Saved register state for ARM32 / ARMv7-A (AAPCS)."""
+    r0: u32
+    r1: u32
+    r2: u32
+    r3: u32
+    r4: u32
+    r5: u32
+    r6: u32
+    r7: u32
+    r8: u32
+    r9: u32
+    r10: u32
+    r11: u32             # frame pointer
+    r12: u32             # intra-procedure scratch
+    sp: u32              # r13 — stack pointer
+    lr: u32              # r14 — link register
+    pc: u32              # r15 — program counter
+    cpsr: u32            # current program status register
+    fpu_state: u32

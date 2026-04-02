@@ -1,0 +1,323 @@
+@allow(unnamed_duplicate_typed_args)
+@allow(primitive_api)
+# RISC-V Platform-Level Interrupt Controller (PLIC)
+#
+# The PLIC manages external interrupts for RISC-V systems.
+# Features:
+# - Up to 1023 interrupt sources
+# - Configurable priority levels (1-7, 0 = disabled)
+# - Context-based interrupt routing
+# - Claim/complete mechanism for interrupt handling
+#
+# Memory-mapped registers (example base: 0x0C000000):
+# - Source Priority: 0x0C000000 + (source * 4)
+# - Pending Bits: 0x0C001000
+# - Enable Bits: 0x0C002000 + (context * 0x80)
+# - Priority Threshold: 0x0C200000 + (context * 0x1000)
+# - Claim/Complete: 0x0C200004 + (context * 0x1000)
+
+
+# PLIC Register Base (SiFive U54 / QEMU virt)
+val PLIC_BASE: u64 = 0x0C000000
+
+# PLIC Register Offsets
+val PLIC_PRIORITY_BASE: u64 = 0x0C000000      # Source priority registers
+val PLIC_PENDING_BASE: u64 = 0x0C001000       # Pending bits
+val PLIC_ENABLE_BASE: u64 = 0x0C002000        # Enable bits per context
+val PLIC_THRESHOLD_BASE: u64 = 0x0C200000     # Priority threshold per context
+val PLIC_CLAIM_BASE: u64 = 0x0C200004         # Claim/complete per context
+
+# Context stride
+val PLIC_CONTEXT_STRIDE: u64 = 0x1000
+
+# PLIC Context (hart + privilege level)
+struct PlicContext:
+    """PLIC context identifier."""
+    hart_id: i64         # Hardware thread ID
+    privilege: text      # "M" (machine) or "S" (supervisor)
+
+impl PlicContext:
+    fn to_id() -> i64:
+        """Convert to PLIC context ID.
+
+        Context ID = (hart_id * 2) + (0 for M-mode, 1 for S-mode)
+        """
+        val priv_offset = if self.privilege == "S": 1 else: 0
+        (self.hart_id * 2) + priv_offset
+
+    fn machine(hart: i64) -> PlicContext:
+        PlicContext(hart_id: hart, privilege: "M")
+
+    fn supervisor(hart: i64) -> PlicContext:
+        PlicContext(hart_id: hart, privilege: "S")
+
+# PLIC Register Access
+struct PlicRegisters:
+    """PLIC memory-mapped register interface."""
+    base: u64
+
+impl PlicRegisters:
+    fn default_() -> PlicRegisters:
+        PlicRegisters(base: PLIC_BASE)
+
+    fn priority_addr(source: i64) -> u64:
+        """Get address of priority register for interrupt source."""
+        PLIC_PRIORITY_BASE + (source * 4)
+
+    fn pending_addr() -> u64:
+        """Get address of pending bits register."""
+        PLIC_PENDING_BASE
+
+    fn enable_addr(context: PlicContext) -> u64:
+        """Get address of enable bits for a context."""
+        PLIC_ENABLE_BASE + (context.to_id() * 0x80)
+
+    fn threshold_addr(context: PlicContext) -> u64:
+        """Get address of priority threshold for a context."""
+        PLIC_THRESHOLD_BASE + (context.to_id() * PLIC_CONTEXT_STRIDE)
+
+    fn claim_addr(context: PlicContext) -> u64:
+        """Get address of claim/complete register for a context."""
+        PLIC_CLAIM_BASE + (context.to_id() * PLIC_CONTEXT_STRIDE)
+
+# RISC-V Trap Frame
+#
+# Saved register state during interrupt/exception handling.
+# Must be 16-byte aligned for efficiency.
+struct TrapFrame:
+    """Registers saved during trap handling."""
+    # General-purpose registers (x1-x31)
+    ra: u64   # x1: Return address
+    sp: u64   # x2: Stack pointer
+    gp: u64   # x3: Global pointer
+    tp: u64   # x4: Thread pointer
+    t0: u64   # x5: Temporary
+    t1: u64   # x6: Temporary
+    t2: u64   # x7: Temporary
+    s0: u64   # x8: Saved / frame pointer
+    s1: u64   # x9: Saved
+    a0: u64   # x10: Argument / return value
+    a1: u64   # x11: Argument / return value
+    a2: u64   # x12: Argument
+    a3: u64   # x13: Argument
+    a4: u64   # x14: Argument
+    a5: u64   # x15: Argument
+    a6: u64   # x16: Argument
+    a7: u64   # x17: Argument
+    s2: u64   # x18: Saved
+    s3: u64   # x19: Saved
+    s4: u64   # x20: Saved
+    s5: u64   # x21: Saved
+    s6: u64   # x22: Saved
+    s7: u64   # x23: Saved
+    s8: u64   # x24: Saved
+    s9: u64   # x25: Saved
+    s10: u64  # x26: Saved
+    s11: u64  # x27: Saved
+    t3: u64   # x28: Temporary
+    t4: u64   # x29: Temporary
+    t5: u64   # x30: Temporary
+    t6: u64   # x31: Temporary
+
+    # Control registers
+    sepc: u64    # Supervisor exception PC
+    sstatus: u64 # Supervisor status
+
+# CSR (Control/Status Register) Addresses
+val CSR_MSTATUS: u64 = 0x300
+val CSR_MIE: u64 = 0x304
+val CSR_MTVEC: u64 = 0x305
+val CSR_MSCRATCH: u64 = 0x340
+val CSR_MEPC: u64 = 0x341
+val CSR_MCAUSE: u64 = 0x342
+val CSR_MTVAL: u64 = 0x343
+val CSR_MIP: u64 = 0x344
+
+# Exception/Interrupt Causes
+val CAUSE_INTERRUPT_BIT: u64 = 0x8000000000000000
+val CAUSE_M_SOFTWARE_INTERRUPT: u64 = CAUSE_INTERRUPT_BIT | 3
+val CAUSE_M_TIMER_INTERRUPT: u64 = CAUSE_INTERRUPT_BIT | 7
+val CAUSE_M_EXTERNAL_INTERRUPT: u64 = CAUSE_INTERRUPT_BIT | 11
+val CAUSE_S_SOFTWARE_INTERRUPT: u64 = CAUSE_INTERRUPT_BIT | 1
+val CAUSE_S_TIMER_INTERRUPT: u64 = CAUSE_INTERRUPT_BIT | 5
+val CAUSE_S_EXTERNAL_INTERRUPT: u64 = CAUSE_INTERRUPT_BIT | 9
+
+# Initialize PLIC
+fn plic_init(context: PlicContext):
+    """Initialize PLIC for a given context."""
+    # Set all priorities to 0 (disabled)
+    var source: i64 = 1
+    while source <= 127:
+        plic_set_priority(source, 0)
+        source = source + 1
+
+    # Disable all interrupts for this context
+    source = 1
+    while source <= 127:
+        plic_disable_irq(context, source)
+        source = source + 1
+
+    # Set priority threshold to 0 (accept all priorities)
+    plic_set_threshold(context, 0)
+
+# Set interrupt source priority
+fn plic_set_priority(source: i64, priority: i64):
+    """Set priority for an interrupt source (0 = disabled, 1-7 = priority)."""
+    if source < 1 or source > 1023:
+        return
+
+    if priority < 0 or priority > 7:
+        return
+
+    val regs = PlicRegisters.default_()
+    val addr = regs.priority_addr(source)
+
+    # unsafe:
+    #     val reg = @address(addr) @volatile var: u32
+    #     reg = priority as u32
+    pass
+
+# Enable interrupt for a context
+fn plic_enable_irq(context: PlicContext, source: i64):
+    """Enable an interrupt source for a specific context."""
+    if source < 1 or source > 1023:
+        return
+
+    val regs = PlicRegisters.default_()
+    val enable_base = regs.enable_addr(context)
+
+    val word_idx = source / 32
+    val bit_idx = source % 32
+    val addr = enable_base + (word_idx * 4)
+
+    # unsafe:
+    #     val reg = @address(addr) @volatile var: u32
+    #     reg = reg | (1 << bit_idx)
+    pass
+
+# Disable interrupt for a context
+fn plic_disable_irq(context: PlicContext, source: i64):
+    """Disable an interrupt source for a specific context."""
+    if source < 1 or source > 1023:
+        return
+
+    val regs = PlicRegisters.default_()
+    val enable_base = regs.enable_addr(context)
+
+    val word_idx = source / 32
+    val bit_idx = source % 32
+    val addr = enable_base + (word_idx * 4)
+
+    # unsafe:
+    #     val reg = @address(addr) @volatile var: u32
+    #     reg = reg & ~(1 << bit_idx)
+    pass
+
+# Set priority threshold
+fn plic_set_threshold(context: PlicContext, threshold: i64):
+    """Set priority threshold (interrupts with priority <= threshold are masked)."""
+    if threshold < 0 or threshold > 7:
+        return
+
+    val regs = PlicRegisters.default_()
+    val addr = regs.threshold_addr(context)
+
+    # unsafe:
+    #     val reg = @address(addr) @volatile var: u32
+    #     reg = threshold as u32
+    pass
+
+# Claim an interrupt
+fn plic_claim(context: PlicContext) -> i64:
+    """Claim the highest-priority pending interrupt.
+
+    Returns the interrupt source ID, or 0 if none pending.
+    """
+    val regs = PlicRegisters.default_()
+    val addr = regs.claim_addr(context)
+
+    # unsafe:
+    #     val reg = @address(addr) @volatile val: u32
+    #     return reg as i64
+    0
+
+# Complete an interrupt
+fn plic_complete(context: PlicContext, source: i64):
+    """Signal completion of interrupt handling."""
+    val regs = PlicRegisters.default_()
+    val addr = regs.claim_addr(context)
+
+    # unsafe:
+    #     val reg = @address(addr) @volatile var: u32
+    #     reg = source as u32
+    pass
+
+# Set up trap vector
+fn setup_trap_vector(handler_addr: u64):
+    """Configure the trap vector to point to the interrupt handler.
+
+    Mode: Vectored (bit 0 = 1) - each cause has its own entry
+    """
+    val mtvec_value = handler_addr | 0x01  # Vectored mode
+
+    # unsafe:
+    #     asm volatile:
+    #         "csrw mtvec, {0}"
+    #         in(reg) mtvec_value
+    pass
+
+# Enable machine-mode interrupts
+fn enable_machine_interrupts():
+    """Enable machine external interrupts (MEI)."""
+    # unsafe:
+    #     asm volatile:
+    #         "csrsi mstatus, 0x8"  # Set MIE bit
+    #         "csrsi mie, 0x800"    # Enable MEI
+    pass
+
+# Handle external interrupt
+fn handle_interrupt(context: PlicContext):
+    """Handle a PLIC external interrupt.
+
+    This should be called from the trap handler when mcause indicates
+    an external interrupt.
+    """
+    # Claim the interrupt
+    val source = plic_claim(context)
+
+    if source == 0:
+        return  # Spurious interrupt
+
+    # Dispatch to handler based on source
+    # match source:
+    #     case 1:
+    #         uart_interrupt_handler()
+    #     case 2:
+    #         timer_interrupt_handler()
+    #     ...
+
+    # Complete the interrupt
+    plic_complete(context, source)
+
+# Example trap handler entry (would be in assembly)
+#
+# @naked
+# fn trap_vector():
+#     asm:
+#         # Save context
+#         "addi sp, sp, -256"
+#         "sd ra, 0(sp)"
+#         # ... save all registers ...
+#
+#         # Check cause
+#         "csrr t0, mcause"
+#         "bge t0, zero, exception_handler"  # MSB clear = exception
+#
+#         # Handle interrupt
+#         "call handle_interrupt"
+#
+#         # Restore context
+#         "ld ra, 0(sp)"
+#         # ... restore all registers ...
+#         "addi sp, sp, 256"
+#         "mret"

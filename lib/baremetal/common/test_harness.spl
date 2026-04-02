@@ -1,0 +1,108 @@
+@allow(unnamed_duplicate_typed_args)
+# Bare-Metal Test Harness
+#
+# SSpec-compatible test framework for bare-metal environments.
+# Outputs results via serial port for host parsing.
+#
+# Usage in bare-metal tests:
+#   test_harness_init()
+#   test_start("my test")
+#   if condition:
+#       test_pass("my test")
+#   else:
+#       test_fail("my test", "error message")
+#   test_end()
+
+use std.baremetal.x86.io.{outb}
+use std.baremetal.x86.serial.{serial_print, serial_println, serial_init}
+
+# Test result tracking
+var g_stats_total: i32 = 0
+var g_stats_passed: i32 = 0
+var g_stats_failed: i32 = 0
+var g_current_test: text = ""
+var g_initialized: bool = false
+
+# Output a line via serial port
+fn output(s: text):
+    serial_println(s)
+
+# Initialize test harness
+fn test_harness_init():
+    if g_initialized:
+        return
+    serial_init()
+    g_initialized = true
+    output("[TEST START]")
+
+# Start a test
+fn test_start(name: text):
+    g_current_test = name
+    g_stats_total = g_stats_total + 1
+
+# Mark current test as passed
+fn test_pass(name: text):
+    g_stats_passed = g_stats_passed + 1
+    output("[PASS] {name}")
+
+# Mark current test as failed
+fn test_fail(name: text, message: text):
+    g_stats_failed = g_stats_failed + 1
+    output("[FAIL] {name}: {message}")
+
+# End test run and output summary
+fn test_end():
+    output("[TEST END] passed={g_stats_passed} failed={g_stats_failed}")
+
+    # Exit QEMU with appropriate exit code
+    # isa-debug-exit: writing to port 0xF4 exits QEMU
+    # Exit code = (value << 1) | 1
+    # So writing 0 gives exit code 1 (success), 1 gives exit code 3 (failure)
+    val exit_value = if g_stats_failed > 0: 1 else: 0
+    outb(0xF4, exit_value)
+
+# Assert that a condition is true
+fn assert_true(condition: bool, message: text) -> bool:
+    if not condition:
+        test_fail(g_current_test, "assertion failed: {message}")
+        false
+    else:
+        true
+
+# Assert that a condition is false
+fn assert_false(condition: bool, message: text) -> bool:
+    assert_true(not condition, "expected false: {message}")
+
+# Assert equality for i32
+fn assert_eq_i32(actual: i32, expected: i32, message: text) -> bool:
+    if actual != expected:
+        test_fail(g_current_test, "{message}: expected {expected}, got {actual}")
+        false
+    else:
+        true
+
+# Assert inequality for i32
+fn assert_ne_i32(actual: i32, expected: i32, message: text) -> bool:
+    if actual == expected:
+        test_fail(g_current_test, "{message}: expected not equal to {expected}")
+        false
+    else:
+        true
+
+# Run a simple test
+fn run_test(name: text, test_passed: bool):
+    test_start(name)
+    if test_passed:
+        test_pass(name)
+    else:
+        test_fail(name, "test returned false")
+
+# Example test runner
+fn run_all_tests():
+    test_harness_init()
+
+    # Example tests would go here
+    run_test("example_pass", true)
+    run_test("example_fail", false)
+
+    test_end()

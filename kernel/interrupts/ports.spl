@@ -1,0 +1,27 @@
+# Interrupts Layer — Input/Output Ports
+#
+# Input: MemoryOutputPort (for IDT/GDT allocation)
+# Output: interrupt registration for scheduler and drivers.
+
+use os.kernel.types.memory_types.{VirtAddr}
+use os.kernel.types.task_types.{TaskContext}
+use os.kernel.memory.ports.{MemoryOutputPort}
+
+struct InterruptInputPort:
+    """What interrupts layer needs from memory."""
+    memory: MemoryOutputPort
+
+struct InterruptOutputPort:
+    """What interrupts layer provides to upper layers."""
+    # Handler registration
+    register_irq_fn: fn(u32, fn(TaskContext))
+    unregister_irq_fn: fn(u32)
+
+    # Interrupt control
+    enable_fn: fn()
+    disable_fn: fn()
+    eoi_fn: fn()            # End-of-interrupt signal
+
+    # Timer (APIC)
+    set_timer_fn: fn(u32)
+    register_timer_fn: fn(fn(TaskContext))

@@ -1,0 +1,86 @@
+# Semihost Transport Configuration
+#
+# Provides a configuration struct for initializing the semihost transport
+# layer with desired settings. Supports auto-detection of HW capabilities.
+#
+# Compile-time selection convention:
+#   Use @cfg("semihost_transport", "buffered") in startup code to select
+#   transport at build time. The compiler supports arbitrary @cfg string keys.
+#
+# Usage:
+#   val config = semihost_config_default()   # safe defaults
+#   semihost_init(config)                    # apply config
+#
+#   semihost_init_default()                  # one-liner with auto-detect
+
+
+use std.nogc_async_mut_noalloc.baremetal.semihost_transport.{
+    TRANSPORT_WRITEC, TRANSPORT_WRITE,
+    semihost_set_transport, semihost_set_batch_size,
+    semihost_set_uart_base, semihost_buffer_init,
+    semihost_open_stdout, semihost_probe_capabilities,
+    semihost_auto_select
+}
+
+# ============================================================================
+# Configuration Struct
+# ============================================================================
+
+class SemihostTransportConfig:
+    preferred_transport: i32
+    batch_size: i32
+    buffer_capacity: i32
+    uart_base_addr: i32
+    auto_detect: bool
+
+# ============================================================================
+# Configuration Functions
+# ============================================================================
+
+fn semihost_config_default() -> SemihostTransportConfig:
+    """Create a default configuration.
+
+    Defaults:
+    - preferred_transport: TRANSPORT_WRITEC (safest)
+    - batch_size: 3
+    - buffer_capacity: 0 (no buffer allocation)
+    - uart_base_addr: 0x10000000 (QEMU virt UART0)
+    - auto_detect: true (probe HW capabilities)
+    """
+    SemihostTransportConfig(
+        preferred_transport: 1,
+        batch_size: 3,
+        buffer_capacity: 0,
+        uart_base_addr: 0x10000000,
+        auto_detect: true
+    )
+
+fn semihost_init(config: SemihostTransportConfig):
+    """Initialize the semihost transport layer with the given configuration.
+
+    1. Sets batch_size and uart_base from config
+    2. If buffer_capacity > 0, allocates ring buffer
+    3. If auto_detect: probes HW capabilities and selects best transport
+    4. Otherwise: sets preferred_transport directly, opens stdout if WRITE mode
+    """
+    semihost_set_batch_size(config.batch_size)
+    semihost_set_uart_base(config.uart_base_addr)
+
+    if config.buffer_capacity > 0:
+        semihost_buffer_init(config.buffer_capacity)
+
+    if config.auto_detect:
+        semihost_probe_capabilities()
+        semihost_auto_select()
+    else:
+        semihost_set_transport(config.preferred_transport)
+        if config.preferred_transport == TRANSPORT_WRITE:
+            semihost_open_stdout()
+
+fn semihost_init_default():
+    """Initialize with default config (auto-detect enabled).
+
+    Convenience one-liner for the common case.
+    """
+    val config = semihost_config_default()
+    semihost_init(config)

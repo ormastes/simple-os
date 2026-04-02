@@ -1,0 +1,169 @@
+# UI Surface Manager
+#
+# Manages named surfaces (windows/panels) with handle semantics.
+# Surfaces can be opened, updated, and closed via handles that
+# prevent use-after-close via generation counters.
+#
+# Uses list-based storage (not Dict) to avoid runtime generics limitation.
+
+use common.ui.widget.{WidgetNode, UITree}
+
+# =========================================================================
+# Surface Entry (key-value pair stored in list)
+# =========================================================================
+
+struct SurfaceEntry:
+    id: text
+    tree: UITree
+    generation: i32
+
+# =========================================================================
+# Surface Handle
+# =========================================================================
+
+struct SurfaceHandle:
+    id: text
+    generation: i32
+
+# =========================================================================
+# Surface Manager
+# =========================================================================
+
+class SurfaceManager:
+    entries: [SurfaceEntry]
+    active_surface: text
+
+    static fn new() -> SurfaceManager:
+        return SurfaceManager(
+            entries: [],
+            active_surface: "main"
+        )
+
+# =========================================================================
+# Constructor Shorthand
+# =========================================================================
+
+fn new_surface_manager() -> SurfaceManager:
+    """Create a new empty surface manager."""
+    return SurfaceManager.new()
+
+# =========================================================================
+# SurfaceManager Methods
+# =========================================================================
+
+impl SurfaceManager:
+
+    # -- Open / Close --------------------------------------------------------
+
+    me open(id: text, tree: UITree) -> SurfaceHandle:
+        """Open a new named surface with a widget tree."""
+        val gen = self._next_generation(id)
+        # Remove any existing entry with same id, then add new
+        var updated: [SurfaceEntry] = []
+        for entry in self.entries:
+            if entry.id != id:
+                updated = updated.push(entry)
+        updated = updated.push(SurfaceEntry(id: id, tree: tree, generation: gen))
+        self.entries = updated
+        return SurfaceHandle(id: id, generation: gen)
+
+    me close(handle: SurfaceHandle) -> bool:
+        """Close a surface. Returns false if handle is stale."""
+        val valid = self.validate_handle(handle)
+        if not valid:
+            return false
+        var updated: [SurfaceEntry] = []
+        for entry in self.entries:
+            if entry.id == handle.id:
+                # Keep the entry but bump generation to invalidate handles
+                updated = updated.push(SurfaceEntry(
+                    id: entry.id,
+                    tree: entry.tree,
+                    generation: entry.generation + 1
+                ))
+            else:
+                updated = updated.push(entry)
+        # Actually remove the entry
+        var removed: [SurfaceEntry] = []
+        for entry in updated:
+            if entry.id != handle.id:
+                removed = removed.push(entry)
+        self.entries = removed
+        if self.active_surface == handle.id:
+            self.active_surface = "main"
+        return true
+
+    # -- Getters -------------------------------------------------------------
+
+    fn get(id: text) -> UITree?:
+        """Get the tree for a surface."""
+        for entry in self.entries:
+            if entry.id == id:
+                return entry.tree
+        return nil
+
+    fn has(id: text) -> bool:
+        """Check if a surface exists."""
+        for entry in self.entries:
+            if entry.id == id:
+                return true
+        return false
+
+    fn surface_ids() -> [text]:
+        """Get all surface IDs."""
+        var ids: [text] = []
+        for entry in self.entries:
+            ids = ids.push(entry.id)
+        return ids
+
+    fn surface_count() -> i32:
+        """Get the number of open surfaces."""
+        var count: i32 = 0
+        for entry in self.entries:
+            count = count + 1
+        return count
+
+    fn active() -> text:
+        """Get the active surface ID."""
+        return self.active_surface
+
+    # -- Active surface ------------------------------------------------------
+
+    me set_active(id: text):
+        """Set the active surface (only if it exists)."""
+        if self.has(id):
+            self.active_surface = id
+
+    # -- Handle validation ---------------------------------------------------
+
+    fn validate_handle(handle: SurfaceHandle) -> bool:
+        """Check that a handle's generation matches the current generation."""
+        for entry in self.entries:
+            if entry.id == handle.id:
+                return entry.generation == handle.generation
+        return false
+
+    # -- Internal helpers ----------------------------------------------------
+
+    fn _next_generation(id: text) -> i32:
+        """Compute the next generation number for a surface id."""
+        for entry in self.entries:
+            if entry.id == id:
+                return entry.generation + 1
+        return 1
+
+    # -- Tree update ---------------------------------------------------------
+
+    me update_tree(id: text, new_tree: UITree):
+        """Replace the tree for a surface."""
+        var updated: [SurfaceEntry] = []
+        for entry in self.entries:
+            if entry.id == id:
+                updated = updated.push(SurfaceEntry(
+                    id: entry.id,
+                    tree: new_tree,
+                    generation: entry.generation
+                ))
+            else:
+                updated = updated.push(entry)
+        self.entries = updated

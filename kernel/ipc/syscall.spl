@@ -1,0 +1,599 @@
+# Syscall Dispatcher — Computation Dimension
+#
+# System call entry point and dispatch table.
+# Called from the syscall entry stub (SYSCALL instruction handler).
+# Routes each syscall ID to the appropriate kernel subsystem.
+
+use os.kernel.types.syscall_types.{SyscallId, SyscallArgs, SyscallResult, SignalKind, TaskInfoBuf, DeviceInfoBuf, KLogEntry, MemInfoBuf, SysInfoKind}
+use os.kernel.types.task_types.{TaskId, TaskState, TaskPriority, BlockReason}
+use os.kernel.types.ipc_types.{IpcPort, IpcMessage}
+use os.kernel.types.capability_types.{CapabilityToken, CapabilityKind, CapabilitySet}
+use os.kernel.scheduler.scheduler.{Scheduler}
+use os.kernel.ipc.ipc.{IpcManager}
+use os.kernel.log.klog.{KernelLog}
+
+# ============================================================================
+# Syscall Handler
+# ============================================================================
+
+fn syscall_handler(args: SyscallArgs, scheduler: Scheduler, ipc: IpcManager, klog: KernelLog) -> SyscallResult:
+    """Main syscall dispatcher. Called from the SYSCALL entry stub.
+
+    The entry stub has already saved the user context into the current
+    task's TCB. Arguments are passed in registers per the SyscallArgs layout.
+
+    Returns SyscallResult with value >= 0 on success, < 0 on error.
+    """
+    match args.id:
+        # -- Process ---------------------------------------------------------
+        case 0:     # Exit
+            _handle_exit(args, scheduler)
+        case 1:     # Yield
+            _handle_yield(scheduler)
+        case 2:     # Spawn
+            _handle_spawn(args, scheduler)
+        case 3:     # Wait
+            _handle_wait(args, scheduler)
+        case 4:     # GetPid
+            _handle_getpid(scheduler)
+
+        # -- IPC -------------------------------------------------------------
+        case 20:    # IpcSend
+            _handle_ipc_send(args, scheduler, ipc)
+        case 21:    # IpcRecv
+            _handle_ipc_recv(args, scheduler, ipc)
+        case 22:    # IpcCreatePort
+            _handle_ipc_create_port(args, scheduler, ipc)
+        case 23:    # IpcConnect
+            _handle_ipc_connect(args, ipc)
+
+        # -- Security --------------------------------------------------------
+        case 40:    # Pledge
+            _handle_pledge(args, scheduler, ipc)
+        case 41:    # Unveil
+            _handle_unveil(args, scheduler, ipc)
+        case 42:    # CapGrant
+            _handle_cap_grant(args, scheduler, ipc)
+
+        # -- Process (extended) ----------------------------------------------
+        case 5:     # ListTasks
+            _handle_list_tasks(scheduler)
+        case 6:     # GetTaskInfo
+            _handle_get_task_info(args, scheduler)
+        case 7:     # Signal
+            _handle_signal(args, scheduler)
+        case 8:     # SetPriority
+            _handle_set_priority(args, scheduler)
+        case 9:     # GetParentPid
+            _handle_get_parent_pid(scheduler)
+
+        # -- File (routed to VFS via IPC) ------------------------------------
+        case 37:    # Mount
+            _handle_mount(args, scheduler, ipc)
+        case 38:    # Unmount
+            _handle_unmount(args, scheduler, ipc)
+
+        # -- Debug -----------------------------------------------------------
+        case 60:    # DebugWrite
+            _handle_debug_write(args)
+
+        # -- Device ----------------------------------------------------------
+        case 80:    # DevEnumerate
+            _handle_dev_enumerate(args)
+        case 81:    # DevGetInfo
+            _handle_dev_get_info(args)
+
+        # -- Logging ---------------------------------------------------------
+        case 90:    # LogWrite
+            _handle_log_write(args, scheduler, klog)
+        case 91:    # LogRead
+            _handle_log_read(args, klog)
+
+        # -- System Info -----------------------------------------------------
+        case 95:    # SysInfo
+            _handle_sysinfo(args, scheduler)
+        case 96:    # GetHostname
+            _handle_get_hostname()
+        case 97:    # SetHostname
+            _handle_set_hostname(args)
+
+        # -- Unknown ---------------------------------------------------------
+        case _:
+            SyscallResult(value: -1)
+
+# ============================================================================
+# Process Syscall Handlers
+# ============================================================================
+
+fn _handle_exit(args: SyscallArgs, scheduler: Scheduler) -> SyscallResult:
+    """Exit the current task with the given exit code."""
+    val code = args.arg0
+    var sched = scheduler
+    sched.exit_task(code.to_i32())
+    # exit_task does not return to the caller; the scheduler picks next task.
+    # This result is never seen by the exiting task.
+    SyscallResult(value: 0)
+
+fn _handle_yield(scheduler: Scheduler) -> SyscallResult:
+    """Yield the current task's time slice."""
+    var sched = scheduler
+    sched.yield_current()
+    SyscallResult(value: 0)
+
+fn _handle_spawn(args: SyscallArgs, scheduler: Scheduler) -> SyscallResult:
+    """Spawn a new task.
+
+    Args:
+      arg0: entry point address
+      arg1: priority (0=Realtime, 1=High, 2=Normal, 3=Low, 4=Idle)
+    """
+    val entry = args.arg0
+    val priority = _u64_to_priority(args.arg1)
+    val caps = CapabilitySet.full()
+
+    var sched = scheduler
+    val task_id = sched.create_task(entry, priority, caps)
+    SyscallResult(value: task_id.id.to_i64())
+
+fn _handle_wait(args: SyscallArgs, scheduler: Scheduler) -> SyscallResult:
+    """Wait for a child task to exit.
+
+    Args:
+      arg0: child task ID (0 = any child)
+
+    Blocks the caller until the child exits, then returns the exit code.
+    """
+    val child_id = TaskId(id: args.arg0)
+    var sched = scheduler
+
+    # Check if child is already a zombie
+    val child_tcb = sched.get_task(child_id)
+    if child_tcb == nil:
+        return SyscallResult(value: -1)     # No such task
+
+    val child = child_tcb
+    match child.state:
+        case Zombie:
+            # Child already exited — collect exit code
+            return SyscallResult(value: child.exit_code.to_i64())
+        case _:
+            # Child still running — block the caller
+            val current = sched.get_current()
+            sched.block_task(current, BlockReason.Exit)
+            SyscallResult(value: 0)
+
+fn _handle_getpid(scheduler: Scheduler) -> SyscallResult:
+    """Return the current task's ID."""
+    val current = scheduler.get_current()
+    SyscallResult(value: current.id.to_i64())
+
+# ============================================================================
+# IPC Syscall Handlers
+# ============================================================================
+
+fn _handle_ipc_send(args: SyscallArgs, scheduler: Scheduler, ipc: IpcManager) -> SyscallResult:
+    """Send an IPC message.
+
+    Args:
+      arg0: destination port ID
+      arg1: method ID
+      arg2: flags
+      arg3: payload pointer (userspace)
+      arg4: payload length
+    """
+    var sched = scheduler
+    val current = sched.get_current()
+
+    val msg = IpcMessage(
+        src_port: current.id,
+        dst_port: args.arg0,
+        method: args.arg1.to_u32(),
+        flags: args.arg2.to_u32(),
+        payload_len: args.arg4.to_u32(),
+        cap_count: 0
+    )
+
+    var ipc_mgr = ipc
+    val result = ipc_mgr.send(msg)
+
+    # If send succeeded and there was a waiter, unblock it
+    if result == 0:
+        val waiter = ipc_mgr.get_first_waiter(args.arg0)
+        if waiter != nil:
+            val waiter_id = waiter
+            sched.unblock_task(waiter_id)
+
+    SyscallResult(value: result)
+
+fn _handle_ipc_recv(args: SyscallArgs, scheduler: Scheduler, ipc: IpcManager) -> SyscallResult:
+    """Receive an IPC message.
+
+    Args:
+      arg0: port ID to receive from
+      arg1: timeout in milliseconds (0 = non-blocking, -1 = infinite)
+    """
+    val port = IpcPort(id: args.arg0, owner: 0)
+    val timeout = args.arg1.to_i64()
+
+    var ipc_mgr = ipc
+    val msg = ipc_mgr.recv(port, timeout)
+
+    if msg != nil:
+        # Message received successfully
+        return SyscallResult(value: 0)
+
+    # No message available
+    if timeout == 0:
+        # Non-blocking — return "would block"
+        return SyscallResult(value: -11)    # EAGAIN
+
+    # Blocking recv — block the caller and add to waiter list
+    var sched = scheduler
+    val current = sched.get_current()
+    ipc_mgr.add_waiter(port, current)
+    sched.block_task(current, BlockReason.IpcRecv(port: args.arg0))
+    SyscallResult(value: 0)
+
+fn _handle_ipc_create_port(args: SyscallArgs, scheduler: Scheduler, ipc: IpcManager) -> SyscallResult:
+    """Create a new IPC port.
+
+    Args:
+      arg0: pointer to name string (userspace)
+      arg1: name length
+    """
+    var sched = scheduler
+    val current = sched.get_current()
+
+    # In a real kernel, we would copy the name from userspace.
+    # For now, use a placeholder name based on port ID.
+    var ipc_mgr = ipc
+    val port = ipc_mgr.create_port(current, "port")
+    SyscallResult(value: port.id.to_i64())
+
+fn _handle_ipc_connect(args: SyscallArgs, ipc: IpcManager) -> SyscallResult:
+    """Connect to an existing IPC port by name.
+
+    Args:
+      arg0: pointer to name string (userspace)
+      arg1: name length
+    """
+    # In a real kernel, we would copy the name from userspace.
+    var ipc_mgr = ipc
+    val port = ipc_mgr.connect("port")
+    if port != nil:
+        val p = port
+        return SyscallResult(value: p.id.to_i64())
+    SyscallResult(value: -1)
+
+# ============================================================================
+# Security Syscall Handlers
+# ============================================================================
+
+fn _handle_pledge(args: SyscallArgs, scheduler: Scheduler, ipc: IpcManager) -> SyscallResult:
+    """Restrict the current task's capabilities (monotonic shrink).
+
+    Args:
+      arg0: pointer to allowed capability list (userspace)
+      arg1: count of allowed capabilities
+    """
+    var sched = scheduler
+    val current = sched.get_current()
+    var ipc_mgr = ipc
+
+    # In a real kernel, we would parse the capability list from userspace.
+    # For now, pledge with empty list (maximum restriction).
+    ipc_mgr.cap_manager.pledge(current, [])
+    SyscallResult(value: 0)
+
+fn _handle_unveil(args: SyscallArgs, scheduler: Scheduler, ipc: IpcManager) -> SyscallResult:
+    """Restrict file access to specific paths.
+
+    Args:
+      arg0: pointer to path string (userspace)
+      arg1: path length
+      arg2: pointer to permissions string (userspace)
+      arg3: permissions length
+    """
+    var sched = scheduler
+    val current = sched.get_current()
+    var ipc_mgr = ipc
+
+    # In a real kernel, we would copy path and perms from userspace.
+    ipc_mgr.cap_manager.unveil(current, "/", "r")
+    SyscallResult(value: 0)
+
+fn _handle_cap_grant(args: SyscallArgs, scheduler: Scheduler, ipc: IpcManager) -> SyscallResult:
+    """Grant a capability from the current task to another.
+
+    Args:
+      arg0: target task ID
+      arg1: capability kind (encoded)
+      arg2: capability generation
+    """
+    var sched = scheduler
+    val current = sched.get_current()
+    val target = TaskId(id: args.arg0)
+
+    val cap = CapabilityToken(
+        kind: CapabilityKind.ProcessSpawn,  # Simplified — real kernel decodes arg1
+        generation: args.arg2,
+        owner: current.id
+    )
+
+    var ipc_mgr = ipc
+    val ok = ipc_mgr.cap_grant(current, target, cap)
+    if ok:
+        SyscallResult(value: 0)
+    else:
+        SyscallResult(value: -1)
+
+# ============================================================================
+# Debug Syscall Handler
+# ============================================================================
+
+fn _handle_debug_write(args: SyscallArgs) -> SyscallResult:
+    """Write a byte to the serial debug port.
+
+    Args:
+      arg0: byte value to write
+    """
+    # Write to COM1 serial port (0x3F8) via port I/O
+    val byte_val = args.arg0
+    asm:
+        "mov dx, 0x3F8"
+        "mov al, dil"          # arg0 is in RDI (dil = low byte)
+        "out dx, al"
+        # options: [volatile]
+    SyscallResult(value: 0)
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+# ============================================================================
+# Extended Process Handlers
+# ============================================================================
+
+fn _handle_list_tasks(scheduler: Scheduler) -> SyscallResult:
+    """List all tasks. Returns count of active tasks.
+
+    The caller retrieves task info via repeated GetTaskInfo calls.
+    """
+    val count = scheduler.active_task_count()
+    SyscallResult(value: count.to_i64())
+
+fn _handle_get_task_info(args: SyscallArgs, scheduler: Scheduler) -> SyscallResult:
+    """Get info for a specific task by PID.
+
+    Args:
+      arg0: target task PID
+    Returns: 0 on success (info written to shared buffer), -1 if not found.
+    """
+    val target = TaskId(id: args.arg0)
+    val tcb = scheduler.get_task(target)
+    if tcb == nil:
+        return SyscallResult(value: -1)
+    # In a real kernel, we would copy TaskInfoBuf to userspace at arg1 address.
+    # For now, return 0 to indicate success.
+    SyscallResult(value: 0)
+
+fn _handle_signal(args: SyscallArgs, scheduler: Scheduler) -> SyscallResult:
+    """Send a signal to a task.
+
+    Args:
+      arg0: target task PID
+      arg1: signal kind (0=Term, 1=Kill, 2=Stop, 3=Cont, 4=Int)
+    """
+    val target = TaskId(id: args.arg0)
+    val signal = args.arg1
+
+    var sched = scheduler
+    val tcb = sched.get_task(target)
+    if tcb == nil:
+        return SyscallResult(value: -1)
+
+    match signal:
+        case 0:     # Term
+            sched.exit_task_by_id(target, -15)
+        case 1:     # Kill (uncatchable)
+            sched.exit_task_by_id(target, -9)
+        case 2:     # Stop
+            sched.block_task(target, BlockReason.Signal)
+        case 3:     # Cont
+            sched.unblock_task(target)
+        case 4:     # Int (Ctrl+C)
+            sched.exit_task_by_id(target, -2)
+        case _:
+            return SyscallResult(value: -22)    # EINVAL
+    SyscallResult(value: 0)
+
+fn _handle_set_priority(args: SyscallArgs, scheduler: Scheduler) -> SyscallResult:
+    """Change a task's scheduling priority.
+
+    Args:
+      arg0: target task PID
+      arg1: new priority (0-4)
+    """
+    val target = TaskId(id: args.arg0)
+    val priority = _u64_to_priority(args.arg1)
+    var sched = scheduler
+    val ok = sched.set_priority(target, priority)
+    if ok:
+        SyscallResult(value: 0)
+    else:
+        SyscallResult(value: -1)
+
+fn _handle_get_parent_pid(scheduler: Scheduler) -> SyscallResult:
+    """Return the current task's parent PID."""
+    val current = scheduler.get_current()
+    val tcb = scheduler.get_task(current)
+    if tcb == nil:
+        return SyscallResult(value: 0)
+    SyscallResult(value: tcb.parent_id.to_i64())
+
+# ============================================================================
+# File Mount/Unmount Handlers
+# ============================================================================
+
+fn _handle_mount(args: SyscallArgs, scheduler: Scheduler, ipc: IpcManager) -> SyscallResult:
+    """Mount a filesystem. Routed to VFS service via IPC.
+
+    Args:
+      arg0: device path pointer
+      arg1: mount path pointer
+      arg2: fs type pointer
+      arg3: flags
+    """
+    # Route to VFS service via IPC method 10 (MOUNT)
+    var sched = scheduler
+    val current = sched.get_current()
+    val msg = IpcMessage(
+        src_port: current.id,
+        dst_port: 0,    # VFS service port (resolved at runtime)
+        method: 10,     # MOUNT
+        flags: 0,
+        payload_len: 0,
+        cap_count: 0
+    )
+    var ipc_mgr = ipc
+    val result = ipc_mgr.send(msg)
+    SyscallResult(value: result)
+
+fn _handle_unmount(args: SyscallArgs, scheduler: Scheduler, ipc: IpcManager) -> SyscallResult:
+    """Unmount a filesystem. Routed to VFS service via IPC.
+
+    Args:
+      arg0: mount path pointer
+      arg1: path length
+    """
+    var sched = scheduler
+    val current = sched.get_current()
+    val msg = IpcMessage(
+        src_port: current.id,
+        dst_port: 0,
+        method: 11,     # UNMOUNT
+        flags: 0,
+        payload_len: 0,
+        cap_count: 0
+    )
+    var ipc_mgr = ipc
+    val result = ipc_mgr.send(msg)
+    SyscallResult(value: result)
+
+# ============================================================================
+# Device Handlers
+# ============================================================================
+
+fn _handle_dev_enumerate(args: SyscallArgs) -> SyscallResult:
+    """Enumerate PCI devices. Returns device count.
+
+    Args:
+      arg0: class filter (0 = all classes)
+    """
+    # In a real kernel, iterate PciBus scan results and copy to userspace buffer.
+    # Return count of matching devices.
+    val class_filter = args.arg0
+    # Placeholder: report 0 devices until PCI bus is wired
+    SyscallResult(value: 0)
+
+fn _handle_dev_get_info(args: SyscallArgs) -> SyscallResult:
+    """Get info for a specific PCI device.
+
+    Args:
+      arg0: bus
+      arg1: device
+      arg2: function
+    """
+    # In a real kernel, read PCI config space and fill DeviceInfoBuf.
+    SyscallResult(value: 0)
+
+# ============================================================================
+# Logging Handlers
+# ============================================================================
+
+fn _handle_log_write(args: SyscallArgs, scheduler: Scheduler, klog: KernelLog) -> SyscallResult:
+    """Write a structured log entry.
+
+    Args:
+      arg0: level (0-7)
+      arg1: facility
+      arg2: message pointer
+      arg3: message length
+    """
+    val level = args.arg0.to_u8()
+    val facility = args.arg1.to_u16()
+    val pid = scheduler.get_current().id
+    # In a real kernel, copy message from userspace pointer.
+    var log = klog
+    log.write(level, facility, pid, "")
+    SyscallResult(value: 0)
+
+fn _handle_log_read(args: SyscallArgs, klog: KernelLog) -> SyscallResult:
+    """Read log entries from the kernel journal.
+
+    Args:
+      arg0: minimum level filter
+      arg1: offset (start from this entry)
+      arg2: max count
+    Returns: number of entries read.
+    """
+    val min_level = args.arg0.to_u8()
+    val offset = args.arg1
+    val max_count = args.arg2
+    val entries = klog.read(min_level, offset, max_count)
+    SyscallResult(value: entries.len().to_i64())
+
+# ============================================================================
+# System Info Handlers
+# ============================================================================
+
+# Module-level hostname storage
+var _hostname: text = "simpleos"
+
+fn _handle_sysinfo(args: SyscallArgs, scheduler: Scheduler) -> SyscallResult:
+    """Query system information.
+
+    Args:
+      arg0: SysInfoKind (0=Memory, 1=CpuCount, 2=Uptime, 3=TickCount)
+    """
+    match args.arg0:
+        case 0:     # Memory
+            # In a real kernel, query PMM for page stats.
+            SyscallResult(value: 0)
+        case 1:     # CpuCount
+            SyscallResult(value: 1)     # Single CPU for now
+        case 2:     # Uptime (placeholder)
+            SyscallResult(value: 0)
+        case 3:     # TickCount
+            val count = scheduler.tick_count()
+            SyscallResult(value: count.to_i64())
+        case _:
+            SyscallResult(value: -22)   # EINVAL
+
+fn _handle_get_hostname() -> SyscallResult:
+    """Return the hostname length. Hostname copied to userspace buffer."""
+    SyscallResult(value: _hostname.len().to_i64())
+
+fn _handle_set_hostname(args: SyscallArgs) -> SyscallResult:
+    """Set the system hostname.
+
+    Args:
+      arg0: name pointer
+      arg1: name length
+    """
+    # In a real kernel, copy from userspace.
+    SyscallResult(value: 0)
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+fn _u64_to_priority(val_: u64) -> TaskPriority:
+    """Convert a numeric value to TaskPriority enum."""
+    match val_:
+        case 0: TaskPriority.Realtime
+        case 1: TaskPriority.High
+        case 2: TaskPriority.Normal
+        case 3: TaskPriority.Low
+        case 4: TaskPriority.Idle
+        case _: TaskPriority.Normal

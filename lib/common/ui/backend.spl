@@ -1,0 +1,45 @@
+# UI Render Backend Trait
+#
+# Platform-independent rendering interface.
+# Each target (TUI, Web, VSCode, Electron) implements this trait.
+#
+# Usage:
+#   use common.ui.backend.{RenderBackend}
+#   use app.ui.tui.backend  # provides TuiBackend impl
+#
+#   bind RenderBackend = TuiBackend
+#   # or dynamic dispatch:
+#   fn run(backend: RenderBackend): ...
+#
+# Follows the same handle-level trait pattern as TorchBackend.
+
+use common.ui.widget.{UITree, UIState, UIEvent}
+
+# =========================================================================
+# Core Render Backend Trait
+# =========================================================================
+
+trait RenderBackend:
+    # --- Lifecycle ---
+    fn init() -> Result<bool, text>
+    fn shutdown()
+
+    # --- Rendering ---
+    fn render(state: UIState) -> Result<bool, text>
+    fn render_html(state: UIState) -> text
+
+    # --- Events ---
+    fn poll_event(timeout_ms: i32) -> UIEvent?
+
+    # --- Capabilities ---
+    fn supports_mouse() -> bool
+    fn supports_color() -> bool
+    fn supports_images() -> bool
+    fn supports_touch() -> bool
+
+    # --- Viewport ---
+    fn viewport_width() -> i32
+    fn viewport_height() -> i32
+
+    # --- Backend Info ---
+    fn backend_name() -> text

@@ -1,0 +1,200 @@
+# RISC-V 32 CPU Primitives — CSR Access and CPU Control
+#
+# Wraps RISC-V 32-bit CSR (Control and Status Register) operations
+# and CPU control instructions for S-mode execution.
+#
+# Same CSR addresses as rv64 but all values are 32-bit.
+# Key CSRs:
+#   sstatus  (0x100) — supervisor status
+#   sie      (0x104) — supervisor interrupt enable
+#   stvec    (0x105) — supervisor trap vector
+#   sscratch (0x140) — supervisor scratch register
+#   sepc     (0x141) — supervisor exception program counter
+#   scause   (0x142) — supervisor cause register
+#   stval    (0x143) — supervisor trap value
+#   sip      (0x144) — supervisor interrupt pending
+#   satp     (0x180) — supervisor address translation and protection
+
+# ============================================================================
+# CSR Extern Declarations (runtime-provided)
+# ============================================================================
+
+extern fn rt_rv32_csrr_sstatus() -> u32
+extern fn rt_rv32_csrw_sstatus(val_: u32)
+extern fn rt_rv32_csrr_sie() -> u32
+extern fn rt_rv32_csrw_sie(val_: u32)
+extern fn rt_rv32_csrr_stvec() -> u32
+extern fn rt_rv32_csrw_stvec(val_: u32)
+extern fn rt_rv32_csrr_sscratch() -> u32
+extern fn rt_rv32_csrw_sscratch(val_: u32)
+extern fn rt_rv32_csrr_sepc() -> u32
+extern fn rt_rv32_csrw_sepc(val_: u32)
+extern fn rt_rv32_csrr_scause() -> u32
+extern fn rt_rv32_csrr_stval() -> u32
+extern fn rt_rv32_csrr_sip() -> u32
+extern fn rt_rv32_csrr_satp() -> u32
+extern fn rt_rv32_csrw_satp(val_: u32)
+
+# CPU control
+extern fn rt_rv32_wfi()
+extern fn rt_rv32_sfence_vma(vaddr: u32, asid: u32)
+extern fn rt_rv32_sfence_vma_all()
+
+# ============================================================================
+# CSR Address Constants
+# ============================================================================
+
+val CSR_SSTATUS: u32 = 0x100
+val CSR_SIE: u32 = 0x104
+val CSR_STVEC: u32 = 0x105
+val CSR_SSCRATCH: u32 = 0x140
+val CSR_SEPC: u32 = 0x141
+val CSR_SCAUSE: u32 = 0x142
+val CSR_STVAL: u32 = 0x143
+val CSR_SIP: u32 = 0x144
+val CSR_SATP: u32 = 0x180
+
+# sstatus bits (32-bit)
+val SSTATUS_SIE: u32 = 1 << 1       # Supervisor Interrupt Enable
+val SSTATUS_SPIE: u32 = 1 << 5      # Supervisor Previous Interrupt Enable
+val SSTATUS_SPP: u32 = 1 << 8       # Supervisor Previous Privilege
+
+# sie bits
+val SIE_SSIE: u32 = 1 << 1          # Supervisor Software Interrupt Enable
+val SIE_STIE: u32 = 1 << 5          # Supervisor Timer Interrupt Enable
+val SIE_SEIE: u32 = 1 << 9          # Supervisor External Interrupt Enable
+
+# scause: interrupt bit is bit 31 on rv32 (not bit 63 like rv64)
+val CAUSE_INTERRUPT_BIT: u32 = 0x80000000
+
+# ============================================================================
+# CSR Wrapper Functions
+# ============================================================================
+
+fn csrr_sstatus() -> u32:
+    """Read sstatus CSR."""
+    rt_rv32_csrr_sstatus()
+
+fn csrw_sstatus(val_: u32):
+    """Write sstatus CSR."""
+    rt_rv32_csrw_sstatus(val_)
+
+fn csrr_sie() -> u32:
+    """Read sie CSR."""
+    rt_rv32_csrr_sie()
+
+fn csrw_sie(val_: u32):
+    """Write sie CSR."""
+    rt_rv32_csrw_sie(val_)
+
+fn csrr_stvec() -> u32:
+    """Read stvec CSR."""
+    rt_rv32_csrr_stvec()
+
+fn csrw_stvec(val_: u32):
+    """Write stvec CSR."""
+    rt_rv32_csrw_stvec(val_)
+
+fn csrr_sepc() -> u32:
+    """Read sepc CSR."""
+    rt_rv32_csrr_sepc()
+
+fn csrw_sepc(val_: u32):
+    """Write sepc CSR."""
+    rt_rv32_csrw_sepc(val_)
+
+fn csrr_scause() -> u32:
+    """Read scause CSR."""
+    rt_rv32_csrr_scause()
+
+fn csrr_stval() -> u32:
+    """Read stval CSR."""
+    rt_rv32_csrr_stval()
+
+fn csrr_sip() -> u32:
+    """Read sip CSR."""
+    rt_rv32_csrr_sip()
+
+fn csrr_satp() -> u32:
+    """Read satp CSR."""
+    rt_rv32_csrr_satp()
+
+fn csrw_satp(val_: u32):
+    """Write satp CSR."""
+    rt_rv32_csrw_satp(val_)
+
+# ============================================================================
+# CPU Control Functions
+# ============================================================================
+
+fn wfi():
+    """Wait For Interrupt — halt until next interrupt."""
+    rt_rv32_wfi()
+
+fn sfence_vma(vaddr: u32, asid: u32):
+    """Flush TLB entry for a specific virtual address and ASID."""
+    rt_rv32_sfence_vma(vaddr, asid)
+
+fn sfence_vma_all():
+    """Flush entire TLB."""
+    rt_rv32_sfence_vma_all()
+
+# ============================================================================
+# Rv32Cpu — HAL-Compatible CPU Interface
+# ============================================================================
+
+struct Rv32Cpu:
+    """RISC-V 32-bit CPU primitives.
+
+    Provides architecture-specific CPU operations: CSR access,
+    interrupt control, TLB management, and halt instructions.
+    All register values are 32-bit (unlike rv64).
+    """
+    pass_dn
+
+impl Rv32Cpu:
+    fn cpu_id() -> u64:
+        """Return current hart ID. Reads from saved boot param."""
+        # Hart ID is saved at boot time; for now return 0 (single-hart)
+        0
+
+    fn cpu_address_width() -> u64:
+        """Return virtual address width in bits (32 for rv32)."""
+        32
+
+    fn cpu_enable_interrupts():
+        """Enable supervisor interrupts (set sstatus.SIE)."""
+        val status = csrr_sstatus()
+        csrw_sstatus(status | SSTATUS_SIE)
+
+    fn cpu_disable_interrupts():
+        """Disable supervisor interrupts (clear sstatus.SIE)."""
+        val status = csrr_sstatus()
+        csrw_sstatus(status & (~SSTATUS_SIE))
+
+    fn cpu_halt():
+        """Halt until next interrupt (WFI)."""
+        wfi()
+
+    fn cpu_halt_loop():
+        """Disable interrupts and halt forever."""
+        self.cpu_disable_interrupts()
+        while true:
+            wfi()
+
+    fn cpu_flush_tlb(addr: u64):
+        """Invalidate TLB entry for a single virtual address."""
+        sfence_vma(addr as u32, 0)
+
+    fn cpu_flush_tlb_all():
+        """Flush entire TLB."""
+        sfence_vma_all()
+
+    fn cpu_read_satp() -> u32:
+        """Read current SATP register (page table base + mode)."""
+        csrr_satp()
+
+    fn cpu_write_satp(val_: u32):
+        """Write SATP register (switch page tables)."""
+        csrw_satp(val_)
+        sfence_vma_all()

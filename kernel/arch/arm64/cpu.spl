@@ -1,0 +1,224 @@
+# ARM64 CPU Primitives — AArch64 System Register Access
+#
+# Wraps AArch64 system register operations via extern functions
+# (implemented in assembly or C runtime). ARM64 uses system registers
+# (accessed via MSR/MRS) instead of x86 MSRs or RISC-V CSRs.
+#
+# Key system registers:
+#   CurrentEL     — Current exception level (EL0-EL3)
+#   VBAR_EL1      — Vector Base Address Register (exception vectors)
+#   TTBR0_EL1     — Translation Table Base Register 0 (user space)
+#   TTBR1_EL1     — Translation Table Base Register 1 (kernel space)
+#   TCR_EL1       — Translation Control Register
+#   MAIR_EL1      — Memory Attribute Indirection Register
+#   SCTLR_EL1     — System Control Register (MMU enable, caches)
+#   DAIF          — Interrupt mask bits (Debug, SError, IRQ, FIQ)
+#   MPIDR_EL1     — Multiprocessor Affinity Register (CPU ID)
+
+# ============================================================================
+# AArch64 System Register Access (extern — implemented in asm/C runtime)
+# ============================================================================
+
+extern fn rt_arm64_mrs_currentel() -> u64
+extern fn rt_arm64_msr_vbar_el1(val: u64)
+extern fn rt_arm64_msr_ttbr0_el1(val: u64)
+extern fn rt_arm64_msr_ttbr1_el1(val: u64)
+extern fn rt_arm64_mrs_ttbr0_el1() -> u64
+extern fn rt_arm64_mrs_ttbr1_el1() -> u64
+extern fn rt_arm64_msr_tcr_el1(val: u64)
+extern fn rt_arm64_msr_mair_el1(val: u64)
+extern fn rt_arm64_msr_sctlr_el1(val: u64)
+extern fn rt_arm64_mrs_sctlr_el1() -> u64
+extern fn rt_arm64_isb()
+extern fn rt_arm64_dsb()
+extern fn rt_arm64_dmb()
+extern fn rt_arm64_wfi()
+extern fn rt_arm64_wfe()
+extern fn rt_arm64_tlbi_alle1()
+extern fn rt_arm64_tlbi_vae1(vaddr: u64)
+extern fn rt_arm64_daif_set(mask: u64)
+extern fn rt_arm64_daif_clr(mask: u64)
+extern fn rt_arm64_mrs_mpidr_el1() -> u64
+
+# ============================================================================
+# System Register Wrapper Functions
+# ============================================================================
+
+fn mrs_currentel() -> u64:
+    """Read CurrentEL register. Returns EL in bits [3:2].
+
+    Values: 0x00=EL0, 0x04=EL1, 0x08=EL2, 0x0C=EL3.
+    """
+    rt_arm64_mrs_currentel()
+
+fn current_el() -> u64:
+    """Return the current exception level as a number (0-3)."""
+    (mrs_currentel() >> 2) & 0x3
+
+fn msr_vbar_el1(val: u64):
+    """Set VBAR_EL1 — Exception Vector Base Address for EL1."""
+    rt_arm64_msr_vbar_el1(val)
+
+fn msr_ttbr0_el1(val: u64):
+    """Set TTBR0_EL1 — Translation Table Base Register 0 (user space)."""
+    rt_arm64_msr_ttbr0_el1(val)
+
+fn msr_ttbr1_el1(val: u64):
+    """Set TTBR1_EL1 — Translation Table Base Register 1 (kernel space)."""
+    rt_arm64_msr_ttbr1_el1(val)
+
+fn mrs_ttbr0_el1() -> u64:
+    """Read TTBR0_EL1 — current user-space page table base."""
+    rt_arm64_mrs_ttbr0_el1()
+
+fn mrs_ttbr1_el1() -> u64:
+    """Read TTBR1_EL1 — current kernel-space page table base."""
+    rt_arm64_mrs_ttbr1_el1()
+
+fn msr_tcr_el1(val: u64):
+    """Set TCR_EL1 — Translation Control Register."""
+    rt_arm64_msr_tcr_el1(val)
+
+fn msr_mair_el1(val: u64):
+    """Set MAIR_EL1 — Memory Attribute Indirection Register."""
+    rt_arm64_msr_mair_el1(val)
+
+fn msr_sctlr_el1(val: u64):
+    """Set SCTLR_EL1 — System Control Register (MMU, caches, alignment)."""
+    rt_arm64_msr_sctlr_el1(val)
+
+fn mrs_sctlr_el1() -> u64:
+    """Read SCTLR_EL1 — current system control register value."""
+    rt_arm64_mrs_sctlr_el1()
+
+fn isb():
+    """Instruction Synchronization Barrier.
+
+    Ensures all previous instructions complete and pipeline is flushed
+    before subsequent instructions execute. Required after writing
+    system registers that affect instruction execution.
+    """
+    rt_arm64_isb()
+
+fn dsb():
+    """Data Synchronization Barrier (full system).
+
+    Ensures all previous memory accesses complete before any
+    subsequent memory accesses. Required before TLB invalidation
+    and after page table modifications.
+    """
+    rt_arm64_dsb()
+
+fn dmb():
+    """Data Memory Barrier (full system).
+
+    Ensures ordering of memory accesses but doesn't wait for
+    completion. Lighter weight than DSB.
+    """
+    rt_arm64_dmb()
+
+fn wfi():
+    """Wait For Interrupt — halt CPU until interrupt fires."""
+    rt_arm64_wfi()
+
+fn wfe():
+    """Wait For Event — halt CPU until event fires."""
+    rt_arm64_wfe()
+
+fn tlbi_alle1():
+    """Invalidate all TLB entries at EL1.
+
+    Must be followed by DSB + ISB to ensure completion.
+    """
+    rt_arm64_tlbi_alle1()
+
+fn tlbi_vae1(vaddr: u64):
+    """Invalidate TLB entry for a single virtual address at EL1.
+
+    The address should be the page-aligned VA shifted right by 12.
+    Must be followed by DSB + ISB to ensure completion.
+    """
+    rt_arm64_tlbi_vae1(vaddr >> 12)
+
+# DAIF mask bits
+val DAIF_D: u64 = 1 << 3   # Debug exceptions
+val DAIF_A: u64 = 1 << 2   # SError (asynchronous abort)
+val DAIF_I: u64 = 1 << 1   # IRQ
+val DAIF_F: u64 = 1 << 0   # FIQ
+val DAIF_ALL: u64 = 0xF    # All interrupt types
+
+fn daif_set(mask: u64):
+    """Set (mask/disable) DAIF interrupt bits. MSR DAIFSet, #mask."""
+    rt_arm64_daif_set(mask)
+
+fn daif_clr(mask: u64):
+    """Clear (unmask/enable) DAIF interrupt bits. MSR DAIFClr, #mask."""
+    rt_arm64_daif_clr(mask)
+
+fn mrs_mpidr_el1() -> u64:
+    """Read MPIDR_EL1 — Multiprocessor Affinity Register.
+
+    Bits [7:0] = Aff0 (core ID within cluster).
+    """
+    rt_arm64_mrs_mpidr_el1()
+
+# ============================================================================
+# Arm64Cpu — HAL-Compatible CPU Interface
+# ============================================================================
+
+struct Arm64Cpu:
+    """ARM64 CPU primitives.
+
+    Provides architecture-specific CPU operations: system register
+    access, interrupt control, barriers, TLB management, CPU
+    identification.
+    """
+    pass_dn
+
+impl Arm64Cpu:
+    fn cpu_id() -> u64:
+        """Return current CPU core ID from MPIDR_EL1 Aff0 field."""
+        mrs_mpidr_el1() & 0xFF
+
+    fn cpu_address_width() -> u64:
+        """Return virtual address width in bits (64 for AArch64)."""
+        64
+
+    fn cpu_enable_interrupts():
+        """Enable IRQ and FIQ interrupts (clear DAIF I and F bits)."""
+        daif_clr(DAIF_I | DAIF_F)
+
+    fn cpu_disable_interrupts():
+        """Disable all maskable interrupts (set all DAIF bits)."""
+        daif_set(DAIF_ALL)
+
+    fn cpu_halt():
+        """Halt CPU until next interrupt (WFI)."""
+        wfi()
+
+    fn cpu_halt_loop():
+        """Disable interrupts and halt forever."""
+        daif_set(DAIF_ALL)
+        while true:
+            wfi()
+
+    fn cpu_flush_tlb(vaddr: u64):
+        """Invalidate TLB entry for a single virtual address."""
+        tlbi_vae1(vaddr)
+        dsb()
+        isb()
+
+    fn cpu_flush_tlb_all():
+        """Flush the entire TLB on the current CPU."""
+        tlbi_alle1()
+        dsb()
+        isb()
+
+    fn cpu_read_page_table_base() -> u64:
+        """Read current user-space page table base (TTBR0_EL1)."""
+        mrs_ttbr0_el1()
+
+    fn cpu_write_page_table_base(addr: u64):
+        """Write user-space page table base (TTBR0_EL1)."""
+        msr_ttbr0_el1(addr)
+        isb()

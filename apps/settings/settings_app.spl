@@ -1,0 +1,274 @@
+# Settings App — System Configuration
+#
+# Provides a tabbed settings interface for configuring display,
+# network, boot, system, and package settings. Reads and writes
+# configuration from /etc/settings.sdn via VFS.
+#
+# MDSOC: feature dimension, apps layer
+
+use common.ui.builder.{
+    column, row, panel, tabs, text_widget, label, button,
+    checkbox, statusbar, build_tree, build_tree_with_title,
+    with_flex, with_width
+}
+use common.ui.widget.{WidgetNode, UITree, UIEvent}
+use common.ui.session.{UISession}
+use os.userlib.fs.{read_text, write_text}
+use os.userlib.system.{hostname, set_hostname, sysinfo}
+use os.userlib.net.{ifconfig}
+
+# =========================================================================
+# Setting Types
+# =========================================================================
+
+enum SettingKind:
+    """Type of setting control."""
+    Toggle
+    Text
+    Dropdown
+    Slider
+
+struct SettingEntry:
+    """A single configurable setting."""
+    key: text
+    label_text: text
+    kind: SettingKind
+    value: text
+    options: [text]         # For Dropdown kind
+
+struct SettingsCategory:
+    """A category of settings."""
+    name: text
+    entries: [SettingEntry]
+
+# =========================================================================
+# Settings App
+# =========================================================================
+
+class SettingsApp:
+    """System settings application.
+
+    Manages system configuration through a tabbed UI.
+    Persists settings to /etc/settings.sdn.
+    """
+    categories: [SettingsCategory]
+    current_category: i32
+    status_message: text
+    modified: bool
+
+impl SettingsApp:
+
+    static fn new() -> SettingsApp:
+        """Create a settings app with default categories."""
+        val cats = _default_categories()
+        SettingsApp(
+            categories: cats,
+            current_category: 0,
+            status_message: "Settings loaded",
+            modified: false
+        )
+
+    me load() -> Result<bool, text>:
+        """Load settings from /etc/settings.sdn."""
+        val result = read_text("/etc/settings.sdn")
+        if result.is_err():
+            # Use defaults if file doesn't exist
+            return Result.Ok(true)
+        val content = result.unwrap()
+        # Parse SDN content and update category entries
+        self._parse_settings(content)
+        self.status_message = "Settings loaded from /etc/settings.sdn"
+        Result.Ok(true)
+
+    me save() -> Result<bool, text>:
+        """Save settings to /etc/settings.sdn."""
+        val content = self._serialize_settings()
+        val result = write_text("/etc/settings.sdn", content)
+        if result.is_err():
+            self.status_message = "Failed to save: {result.unwrap_err()}"
+            return Result.Err(result.unwrap_err())
+        self.modified = false
+        self.status_message = "Settings saved"
+        Result.Ok(true)
+
+    me select_category(index: i32):
+        """Switch to a settings category tab."""
+        if index >= 0 and index < self.categories.len():
+            self.current_category = index
+
+    me update_setting(key: text, value: text):
+        """Update a setting value."""
+        var cat_idx = 0
+        while cat_idx < self.categories.len():
+            var entry_idx = 0
+            while entry_idx < self.categories[cat_idx].entries.len():
+                if self.categories[cat_idx].entries[entry_idx].key == key:
+                    self.categories[cat_idx].entries[entry_idx].value = value
+                    self.modified = true
+                    self.status_message = "Modified: {key}"
+                    return
+                entry_idx = entry_idx + 1
+            cat_idx = cat_idx + 1
+
+    me toggle_setting(key: text):
+        """Toggle a boolean setting."""
+        var cat_idx = 0
+        while cat_idx < self.categories.len():
+            var entry_idx = 0
+            while entry_idx < self.categories[cat_idx].entries.len():
+                val entry = self.categories[cat_idx].entries[entry_idx]
+                if entry.key == key:
+                    val new_val = if entry.value == "true": "false" else: "true"
+                    self.categories[cat_idx].entries[entry_idx].value = new_val
+                    self.modified = true
+                    return
+                entry_idx = entry_idx + 1
+            cat_idx = cat_idx + 1
+
+    # -- Serialization -------------------------------------------------------
+
+    me _parse_settings(content: text):
+        """Parse SDN settings content into category entries."""
+        # Simple key=value parsing
+        for line in content.split("\n"):
+            val trimmed = line.trim()
+            if trimmed == "" or trimmed.starts_with("#") or trimmed.starts_with("["):
+                pass_dn
+            else:
+                val eq_pos = _find_eq(trimmed)
+                if eq_pos > 0:
+                    val key = trimmed.slice(0, eq_pos).trim()
+                    val value = trimmed.slice(eq_pos + 1, trimmed.len()).trim()
+                    self.update_setting(key, value)
+
+    fn _serialize_settings() -> text:
+        """Serialize all settings to SDN format."""
+        var result = "# SimpleOS Settings\n# Auto-generated by Settings app\n\n"
+        for cat in self.categories:
+            result = "{result}[{cat.name}]\n"
+            for entry in cat.entries:
+                result = "{result}{entry.key} = {entry.value}\n"
+            result = "{result}\n"
+        result
+
+    # -- UI Construction -----------------------------------------------------
+
+    fn build_ui() -> UISession:
+        """Build the settings UI.
+
+        Layout:
+          Tab bar with category names
+          Settings panel for current category
+          Save/Cancel buttons
+          Status bar
+        """
+        # Tab names
+        var tab_names: [text] = []
+        for cat in self.categories:
+            tab_names = tab_names.push(cat.name)
+
+        # Current category entries
+        var entry_widgets: [WidgetNode] = []
+        if self.current_category >= 0 and self.current_category < self.categories.len():
+            val cat = self.categories[self.current_category]
+            for entry in cat.entries:
+                val widget = match entry.kind:
+                    SettingKind.Toggle:
+                        val checked = entry.value == "true"
+                        val indicator = if checked: "[x]" else: "[ ]"
+                        button("setting_{entry.key}", "{indicator} {entry.label_text}", "toggle_{entry.key}")
+                    SettingKind.Text:
+                        row("setting_{entry.key}_row", [
+                            label("setting_{entry.key}_label", "{entry.label_text}:"),
+                            text_widget("setting_{entry.key}_value", entry.value)
+                        ])
+                    SettingKind.Dropdown:
+                        row("setting_{entry.key}_row", [
+                            label("setting_{entry.key}_label", "{entry.label_text}:"),
+                            text_widget("setting_{entry.key}_value", entry.value)
+                        ])
+                    SettingKind.Slider:
+                        row("setting_{entry.key}_row", [
+                            label("setting_{entry.key}_label", "{entry.label_text}:"),
+                            text_widget("setting_{entry.key}_value", entry.value)
+                        ])
+                entry_widgets = entry_widgets.push(widget)
+
+        val mod_indicator = if self.modified: " [modified]" else: ""
+
+        val root = column("settings_root", [
+            tabs("settings_tabs", tab_names, self.current_category),
+            with_flex(panel("settings_panel", "Settings", entry_widgets), 1),
+            row("settings_actions", [
+                button("settings_save", "Save", "save"),
+                button("settings_reload", "Reload", "reload")
+            ]),
+            statusbar("settings_status",
+                self.status_message,
+                "Settings{mod_indicator}"
+            )
+        ])
+
+        val tree = build_tree_with_title(root, "Settings", "dark")
+        UISession.new(tree)
+
+# =========================================================================
+# Default Categories
+# =========================================================================
+
+fn _default_categories() -> [SettingsCategory]:
+    """Built-in settings categories with default values."""
+    [
+        SettingsCategory(
+            name: "Display",
+            entries: [
+                SettingEntry(key: "display.resolution", label_text: "Resolution", kind: SettingKind.Dropdown, value: "1024x768", options: ["800x600", "1024x768", "1280x720", "1920x1080"]),
+                SettingEntry(key: "display.theme", label_text: "Theme", kind: SettingKind.Dropdown, value: "dark", options: ["dark", "light"]),
+                SettingEntry(key: "display.font_size", label_text: "Font Size", kind: SettingKind.Slider, value: "14", options: []),
+                SettingEntry(key: "display.vsync", label_text: "VSync", kind: SettingKind.Toggle, value: "true", options: [])
+            ]
+        ),
+        SettingsCategory(
+            name: "Network",
+            entries: [
+                SettingEntry(key: "net.hostname", label_text: "Hostname", kind: SettingKind.Text, value: "simpleos", options: []),
+                SettingEntry(key: "net.dhcp", label_text: "DHCP Enabled", kind: SettingKind.Toggle, value: "true", options: []),
+                SettingEntry(key: "net.dns", label_text: "DNS Server", kind: SettingKind.Text, value: "8.8.8.8", options: [])
+            ]
+        ),
+        SettingsCategory(
+            name: "Boot",
+            entries: [
+                SettingEntry(key: "boot.timeout", label_text: "Boot Timeout (sec)", kind: SettingKind.Slider, value: "5", options: []),
+                SettingEntry(key: "boot.verbose", label_text: "Verbose Boot", kind: SettingKind.Toggle, value: "false", options: [])
+            ]
+        ),
+        SettingsCategory(
+            name: "System",
+            entries: [
+                SettingEntry(key: "sys.timezone", label_text: "Timezone", kind: SettingKind.Dropdown, value: "UTC", options: ["UTC", "US/Eastern", "US/Pacific", "Europe/London", "Asia/Tokyo", "Asia/Seoul"]),
+                SettingEntry(key: "sys.language", label_text: "Language", kind: SettingKind.Dropdown, value: "en", options: ["en", "ko", "ja", "de", "fr"]),
+                SettingEntry(key: "sys.auto_update", label_text: "Auto Update", kind: SettingKind.Toggle, value: "true", options: [])
+            ]
+        ),
+        SettingsCategory(
+            name: "Packages",
+            entries: [
+                SettingEntry(key: "pkg.repo_url", label_text: "Repository URL", kind: SettingKind.Text, value: "https://pkg.simpleos.org", options: []),
+                SettingEntry(key: "pkg.auto_clean", label_text: "Auto Clean Cache", kind: SettingKind.Toggle, value: "true", options: [])
+            ]
+        )
+    ]
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn _find_eq(s: text) -> i32:
+    """Find first '=' in a string. Returns -1 if not found."""
+    var i = 0
+    for ch in s:
+        if ch == "=":
+            return i
+        i = i + 1
+    -1

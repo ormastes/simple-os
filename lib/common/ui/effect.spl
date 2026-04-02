@@ -1,0 +1,121 @@
+# Side Effect System
+#
+# Handles async side effects triggered by lifecycle events. Effects
+# are dispatched into a queue and processed by the EffectRunner,
+# which feeds results back for the next UI update cycle.
+
+# =========================================================================
+# Effect Types
+# =========================================================================
+
+enum Effect:
+    FetchData(url: text, callback_id: text)
+    Timer(delay_ms: i32, callback_id: text)
+    Log(message: text)
+    UpdateProp(widget_id: text, key: text, value: text)
+
+# =========================================================================
+# Effect Result
+# =========================================================================
+
+struct EffectResult:
+    effect_kind: text
+    callback_id: text
+    success: bool
+    data: text
+
+fn new_effect_result(kind: text, callback_id: text, success: bool, data: text) -> EffectResult:
+    return EffectResult(
+        effect_kind: kind,
+        callback_id: callback_id,
+        success: success,
+        data: data
+    )
+
+# =========================================================================
+# Effect Runner
+# =========================================================================
+
+class EffectRunner:
+    pending_effects: [Effect]
+    results: [EffectResult]
+    log_messages: [text]
+
+    static fn new() -> EffectRunner:
+        return EffectRunner(
+            pending_effects: [],
+            results: [],
+            log_messages: []
+        )
+
+    me dispatch_effect(effect: Effect):
+        """Add an effect to the pending queue."""
+        self.pending_effects = self.pending_effects.push(effect)
+
+    fn pending_count() -> i32:
+        return self.pending_effects.len()
+
+    fn result_count() -> i32:
+        return self.results.len()
+
+    fn log_count() -> i32:
+        return self.log_messages.len()
+
+    me process_effects():
+        """Process all pending effects. Log effects are handled
+        inline; FetchData and Timer produce result entries;
+        UpdateProp produces a result with the widget/prop info."""
+        var remaining: [Effect] = []
+        for effect in self.pending_effects:
+            match effect:
+                Effect.Log(message):
+                    self.log_messages = self.log_messages.push(message)
+                    val result = new_effect_result("log", "", true, message)
+                    self.results = self.results.push(result)
+                Effect.FetchData(url, callback_id):
+                    # Queue a result placeholder (actual fetch is async)
+                    val result = new_effect_result("fetch", callback_id, true, url)
+                    self.results = self.results.push(result)
+                Effect.Timer(delay_ms, callback_id):
+                    # Queue a result placeholder (actual timer is async)
+                    val result = new_effect_result("timer", callback_id, true, "{delay_ms}")
+                    self.results = self.results.push(result)
+                Effect.UpdateProp(widget_id, key, value):
+                    val result = new_effect_result("update_prop", widget_id, true, "{key}={value}")
+                    self.results = self.results.push(result)
+        self.pending_effects = []
+
+    fn last_result() -> EffectResult?:
+        if self.results.len() == 0:
+            return nil
+        return self.results[self.results.len() - 1]
+
+    me clear_results():
+        self.results = []
+
+    me clear_log():
+        self.log_messages = []
+
+# =========================================================================
+# Convenience Constructors
+# =========================================================================
+
+fn new_effect_runner() -> EffectRunner:
+    """Create a new EffectRunner."""
+    return EffectRunner.new()
+
+# =========================================================================
+# Effect Description
+# =========================================================================
+
+fn describe_effect(effect: Effect) -> text:
+    """Human-readable description of an effect."""
+    match effect:
+        Effect.FetchData(url, callback_id):
+            return "fetch:{url}:{callback_id}"
+        Effect.Timer(delay_ms, callback_id):
+            return "timer:{delay_ms}ms:{callback_id}"
+        Effect.Log(message):
+            return "log:{message}"
+        Effect.UpdateProp(widget_id, key, value):
+            return "update_prop:{widget_id}.{key}={value}"

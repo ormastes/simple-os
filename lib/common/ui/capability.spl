@@ -1,0 +1,35 @@
+# UI backend capability flags, security-gated resource access, and unsupported-operation marker.
+
+enum Capability:
+    # Input capabilities
+    Mouse
+    Touch
+    # Display capabilities
+    Color
+    Images
+    FullScreen
+    # UI chrome capabilities
+    NativeDialogs
+    Notification
+    SystemTray
+    # Security-gated resource capabilities
+    FileSystemRead
+    FileSystemWrite
+    NetworkAccess
+    ClipboardRead
+    ClipboardWrite
+    Camera
+    Microphone
+    Geolocation
+    # Developer capabilities
+    DevTools
+    # External access capabilities
+    ExternalUrls
+    ShellAccess
+    ProcessSpawn
+
+class NotSupported:
+    operation: text
+
+    static fn new(operation: text) -> NotSupported:
+        return NotSupported(operation: operation)

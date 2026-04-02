@@ -1,0 +1,312 @@
+@allow(primitive_api)
+# PS/2 Mouse Driver
+#
+# Reads 3-byte packets from the PS/2 auxiliary device.
+# Tracks absolute cursor position with screen bounds clamping.
+#
+# MDSOC: feature dimension, drivers layer
+# Requires: CapabilityKind.PortIO(base: 0x60, count: 4) capability
+
+use os.kernel.boot.cpu.{port_inb, port_outb}
+
+# ============================================================================
+# PS/2 Controller Constants
+# ============================================================================
+
+val MOUSE_DATA_PORT: u16 = 0x60
+val MOUSE_STATUS_PORT: u16 = 0x64
+val MOUSE_COMMAND_PORT: u16 = 0x64
+
+# Status register bits
+val MOUSE_STATUS_OUTPUT_FULL: u8 = 0x01
+val MOUSE_STATUS_INPUT_FULL: u8 = 0x02
+val MOUSE_STATUS_AUX_DATA: u8 = 0x20   # Bit 5: data is from aux (mouse)
+
+# Controller commands
+val CMD_ENABLE_AUX: u8 = 0xA8
+val CMD_READ_CONFIG: u8 = 0x20
+val CMD_WRITE_CONFIG: u8 = 0x60
+val CMD_WRITE_AUX: u8 = 0xD4
+
+# Mouse commands
+val MOUSE_CMD_SET_DEFAULTS: u8 = 0xF6
+val MOUSE_CMD_ENABLE_REPORTING: u8 = 0xF4
+val MOUSE_CMD_SET_SAMPLE_RATE: u8 = 0xF3
+val MOUSE_CMD_RESET: u8 = 0xFF
+
+# ============================================================================
+# Data Structures
+# ============================================================================
+
+struct MouseState:
+    """Current absolute mouse position and button state."""
+    x: i64
+    y: i64
+    left_button: bool
+    right_button: bool
+    middle_button: bool
+    dx: i64
+    dy: i64
+    screen_width: i64
+    screen_height: i64
+
+struct MouseEvent:
+    """A single mouse event with position, deltas, and edge-triggered buttons."""
+    x: i64
+    y: i64
+    dx: i64
+    dy: i64
+    left_pressed: bool
+    right_pressed: bool
+    middle_pressed: bool
+    left_just_pressed: bool
+    right_just_pressed: bool
+    left_just_released: bool
+
+# ============================================================================
+# PS/2 Mouse Driver
+# ============================================================================
+
+class Ps2Mouse:
+    """PS/2 mouse driver.
+
+    Reads 3-byte packets from the PS/2 auxiliary device, tracks absolute
+    cursor position with screen bounds clamping, and generates MouseEvents
+    with edge-triggered button state.
+    """
+    state: MouseState
+    prev_left: bool
+    prev_right: bool
+    packet_byte0: i64
+    packet_byte1: i64
+    packet_byte2: i64
+    packet_index: i64
+    initialized: bool
+
+impl Ps2Mouse:
+    static fn create(screen_width: i64, screen_height: i64) -> Ps2Mouse:
+        """Create a new PS/2 mouse driver for the given screen dimensions."""
+        val initial_state = MouseState(
+            x: screen_width / 2,
+            y: screen_height / 2,
+            left_button: false,
+            right_button: false,
+            middle_button: false,
+            dx: 0,
+            dy: 0,
+            screen_width: screen_width,
+            screen_height: screen_height
+        )
+        Ps2Mouse(
+            state: initial_state,
+            prev_left: false,
+            prev_right: false,
+            packet_byte0: 0,
+            packet_byte1: 0,
+            packet_byte2: 0,
+            packet_index: 0,
+            initialized: false
+        )
+
+    me init():
+        """Initialize PS/2 auxiliary device for mouse input.
+
+        Sequence:
+        1. Enable auxiliary device (cmd 0xA8)
+        2. Enable auxiliary interrupts in config byte
+        3. Set defaults (0xF6)
+        4. Enable data reporting (0xF4)
+        """
+        # Step 1: Enable the auxiliary device
+        port_outb(MOUSE_COMMAND_PORT, CMD_ENABLE_AUX)
+        me _wait_input()
+
+        # Step 2: Read config byte, set bit 1 (enable aux interrupt),
+        #         clear bit 5 (enable aux clock)
+        port_outb(MOUSE_COMMAND_PORT, CMD_READ_CONFIG)
+        me _wait_output()
+        val config = port_inb(MOUSE_DATA_PORT)
+        val new_config = (config | 0x02) & 0xDF   # Set bit 1, clear bit 5
+        port_outb(MOUSE_COMMAND_PORT, CMD_WRITE_CONFIG)
+        me _wait_input()
+        port_outb(MOUSE_DATA_PORT, new_config)
+        me _wait_input()
+
+        # Step 3: Set defaults
+        me _mouse_write(MOUSE_CMD_SET_DEFAULTS)
+        me _mouse_read()   # ACK
+
+        # Step 4: Enable data reporting
+        me _mouse_write(MOUSE_CMD_ENABLE_REPORTING)
+        me _mouse_read()   # ACK
+
+        self.initialized = true
+
+    me poll() -> MouseEvent?:
+        """Poll for available mouse data and return an event if a full packet is ready.
+
+        Reads bytes from the data port when aux data is available,
+        accumulates into a 3-byte packet, and processes when complete.
+        Returns nil if no complete packet is available yet.
+        """
+        if not self.initialized:
+            return nil
+
+        # Read all available bytes
+        var max_reads: i64 = 32  # Prevent infinite loop
+        while max_reads > 0:
+            max_reads = max_reads - 1
+            val status = port_inb(MOUSE_STATUS_PORT)
+
+            # Check if output buffer has data AND it's from the aux device
+            val has_data = (status & MOUSE_STATUS_OUTPUT_FULL) != 0
+            val is_aux = (status & MOUSE_STATUS_AUX_DATA) != 0
+            if not has_data or not is_aux:
+                return nil
+
+            val byte_val = port_inb(MOUSE_DATA_PORT).to_i64()
+
+            # Accumulate packet bytes
+            if self.packet_index == 0:
+                # Byte 0: validate — bit 3 must be set (always 1)
+                if (byte_val & 0x08) == 0:
+                    # Out of sync, discard and re-sync
+                    self.packet_index = 0
+                    continue
+                self.packet_byte0 = byte_val
+                self.packet_index = 1
+            elif self.packet_index == 1:
+                self.packet_byte1 = byte_val
+                self.packet_index = 2
+            elif self.packet_index == 2:
+                self.packet_byte2 = byte_val
+                self.packet_index = 0
+
+                # Full packet received — process it
+                me _process_packet()
+
+                # Build event with edge-triggered button state
+                val left_just = self.state.left_button and not self.prev_left
+                val right_just = self.state.right_button and not self.prev_right
+                val left_released = not self.state.left_button and self.prev_left
+
+                val event = MouseEvent(
+                    x: self.state.x,
+                    y: self.state.y,
+                    dx: self.state.dx,
+                    dy: self.state.dy,
+                    left_pressed: self.state.left_button,
+                    right_pressed: self.state.right_button,
+                    middle_pressed: self.state.middle_button,
+                    left_just_pressed: left_just,
+                    right_just_pressed: right_just,
+                    left_just_released: left_released
+                )
+
+                # Update previous button state
+                self.prev_left = self.state.left_button
+                self.prev_right = self.state.right_button
+
+                return event
+
+        return nil
+
+    me _mouse_write(byte_val: u8):
+        """Write a command byte to the mouse via the PS/2 controller."""
+        me _wait_input()
+        port_outb(MOUSE_COMMAND_PORT, CMD_WRITE_AUX)
+        me _wait_input()
+        port_outb(MOUSE_DATA_PORT, byte_val)
+
+    me _mouse_read() -> i64:
+        """Read a response byte from the mouse."""
+        me _wait_output()
+        port_inb(MOUSE_DATA_PORT).to_i64()
+
+    me _wait_input():
+        """Wait until the PS/2 controller input buffer is empty."""
+        var timeout: i64 = 100000
+        while timeout > 0:
+            val status = port_inb(MOUSE_STATUS_PORT)
+            if (status & MOUSE_STATUS_INPUT_FULL) == 0:
+                return
+            timeout = timeout - 1
+
+    me _wait_output():
+        """Wait until the PS/2 controller output buffer has data."""
+        var timeout: i64 = 100000
+        while timeout > 0:
+            val status = port_inb(MOUSE_STATUS_PORT)
+            if (status & MOUSE_STATUS_OUTPUT_FULL) != 0:
+                return
+            timeout = timeout - 1
+
+    me _process_packet():
+        """Parse a 3-byte PS/2 mouse packet and update state.
+
+        Packet format:
+          Byte 0: Y_overflow | X_overflow | Y_sign | X_sign | 1 | Middle | Right | Left
+          Byte 1: X movement (unsigned, sign from byte 0 bit 4)
+          Byte 2: Y movement (unsigned, sign from byte 0 bit 5)
+        """
+        val flags = self.packet_byte0
+        val raw_x = self.packet_byte1
+        val raw_y = self.packet_byte2
+
+        # Extract button state
+        self.state.left_button = (flags & 0x01) != 0
+        self.state.right_button = (flags & 0x02) != 0
+        self.state.middle_button = (flags & 0x04) != 0
+
+        # Check overflow bits — discard movement if overflow
+        val x_overflow = (flags & 0x40) != 0
+        val y_overflow = (flags & 0x80) != 0
+
+        if x_overflow or y_overflow:
+            self.state.dx = 0
+            self.state.dy = 0
+            return
+
+        # Sign-extend X movement using bit 4 of flags
+        var dx: i64 = raw_x
+        val x_sign = (flags & 0x10) != 0
+        if x_sign:
+            # Negative: sign-extend from 8-bit to 64-bit
+            dx = dx - 256
+
+        # Sign-extend Y movement using bit 5 of flags
+        var dy: i64 = raw_y
+        val y_sign = (flags & 0x20) != 0
+        if y_sign:
+            dy = dy - 256
+
+        # PS/2 Y axis is inverted (positive = up), screen Y is down
+        dy = 0 - dy
+
+        self.state.dx = dx
+        self.state.dy = dy
+
+        # Update absolute position with clamping
+        var new_x = self.state.x + dx
+        var new_y = self.state.y + dy
+
+        # Clamp to screen bounds
+        if new_x < 0:
+            new_x = 0
+        if new_x >= self.state.screen_width:
+            new_x = self.state.screen_width - 1
+        if new_y < 0:
+            new_y = 0
+        if new_y >= self.state.screen_height:
+            new_y = self.state.screen_height - 1
+
+        self.state.x = new_x
+        self.state.y = new_y
+
+    fn get_state() -> MouseState:
+        """Get current mouse state (position + buttons)."""
+        self.state
+
+    fn is_initialized() -> bool:
+        """Check if the mouse driver has been initialized."""
+        self.initialized

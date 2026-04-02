@@ -1,0 +1,127 @@
+@allow(primitive_api)
+# Notification Center — Pull-down notification panel
+#
+# Displays system and app notifications in a slide-down panel.
+# Supports push, dismiss, clear-all, and unread count.
+#
+# MDSOC: feature dimension, desktop layer
+
+# ============================================================================
+# Notification
+# ============================================================================
+
+struct Notification:
+    """A single notification entry."""
+    id: i64
+    title: text
+    body: text
+    timestamp: i64    # nanos since boot
+    read: bool
+    app_name: text
+
+# ============================================================================
+# Notification Center
+# ============================================================================
+
+class NotificationCenter:
+    """Pull-down notification panel.
+
+    Notifications are ordered newest-first. The panel can hold up to
+    max_notifications entries; older ones are evicted when full.
+    """
+    notifications: [Notification]
+    visible: bool
+    next_id: i64
+    max_notifications: i64
+    screen_width: i64
+
+impl NotificationCenter:
+
+    static fn create(screen_width: i64) -> NotificationCenter:
+        """Create an empty, hidden notification center."""
+        NotificationCenter(
+            notifications: [],
+            visible: false,
+            next_id: 1,
+            max_notifications: 50,
+            screen_width: screen_width
+        )
+
+    me push(title: text, body: text, app_name: text):
+        """Push a new notification.
+
+        If at capacity, the oldest notification is evicted.
+        """
+        val notif = Notification(
+            id: self.next_id,
+            title: title,
+            body: body,
+            timestamp: 0,
+            read: false,
+            app_name: app_name
+        )
+        self.next_id = self.next_id + 1
+
+        # Prepend (newest first)
+        var new_list: [Notification] = [notif]
+        var i: i64 = 0
+        while i < self.notifications.len():
+            new_list = new_list.push(self.notifications[i])
+            i = i + 1
+        self.notifications = new_list
+
+        # Evict if over capacity
+        if self.notifications.len() > self.max_notifications:
+            var trimmed: [Notification] = []
+            var j: i64 = 0
+            while j < self.max_notifications:
+                trimmed = trimmed.push(self.notifications[j])
+                j = j + 1
+            self.notifications = trimmed
+
+    me dismiss(notification_id: i64):
+        """Remove a notification by ID."""
+        var new_list: [Notification] = []
+        var i: i64 = 0
+        while i < self.notifications.len():
+            if self.notifications[i].id != notification_id:
+                new_list = new_list.push(self.notifications[i])
+            i = i + 1
+        self.notifications = new_list
+
+    me clear_all():
+        """Remove all notifications."""
+        self.notifications = []
+
+    me show():
+        """Show the notification panel."""
+        self.visible = true
+
+    me hide():
+        """Hide the notification panel."""
+        self.visible = false
+
+    me toggle():
+        """Toggle notification panel visibility."""
+        if self.visible:
+            self.visible = false
+        else:
+            self.visible = true
+
+    fn unread_count() -> i64:
+        """Return the number of unread notifications."""
+        var count: i64 = 0
+        var i: i64 = 0
+        while i < self.notifications.len():
+            if not self.notifications[i].read:
+                count = count + 1
+            i = i + 1
+        count
+
+    fn get_visible_notifications() -> [Notification]:
+        """Return notifications to display (all of them, newest first)."""
+        self.notifications
+
+    fn is_visible() -> bool:
+        """Return whether the notification panel is currently visible."""
+        self.visible

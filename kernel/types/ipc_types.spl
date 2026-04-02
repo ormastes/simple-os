@@ -1,0 +1,35 @@
+# IPC Types — Entity Dimension
+#
+# Inter-process communication types used by kernel IPC and all services.
+# Extends the existing actor/mailbox model from nogc_async_mut.
+
+struct IpcPort:
+    """IPC endpoint identifier."""
+    id: u64
+    owner: u64              # TaskId
+
+struct IpcEndpoint:
+    """Named IPC endpoint for service discovery."""
+    name: text
+    port: IpcPort
+
+@repr("C")
+struct IpcMessage:
+    """Kernel IPC message.
+
+    Binary format for kernel-level performance.
+    Userspace services use NDJSON (existing ui.ipc protocol) on top.
+    """
+    src_port: u64           # Sender's port ID
+    dst_port: u64           # Destination port ID
+    method: u32             # Method ID
+    flags: u32              # Message flags (sync, async, capability_transfer)
+    payload_len: u32        # Length of payload in bytes
+    cap_count: u32          # Number of capability tokens attached
+
+enum IpcFlags:
+    """Message delivery flags."""
+    Sync            # Block until receiver processes
+    Async           # Non-blocking, queue in mailbox
+    CapTransfer     # Message carries capability tokens
+    Reply           # This is a reply to a previous message

@@ -1,0 +1,597 @@
+# OS MCP Server — LLM Control of SimpleOS
+#
+# MCP server exposing OS operations as tools for LLM control.
+# Uses existing MCP SDK (std.nogc_async_mut.mcp) for protocol handling
+# and existing VFS service for file operations.
+#
+# Tools exposed:
+#   File:    file_read, file_write, file_list, file_search
+#   Process: process_list, process_spawn, process_kill
+#   Window:  window_create, window_close, window_list, window_focus
+#   Widget:  widget_set, widget_read, widget_action
+#   Screen:  screenshot, screen_read_text
+#   System:  system_info, system_exec
+
+use os.services.vfs.vfs.{VfsManager, MountEntry}
+use os.kernel.types.fs_types.{DirEntry, FsNode, FsNodeKind, FileFlags, FileDescriptor}
+use os.kernel.types.task_types.{TaskId, TaskState}
+use os.kernel.types.syscall_types.{SyscallId}
+use os.services.llm.widget_eval.{WidgetDslEvaluator}
+use os.services.llm.cli_gui_bridge.{CliGuiBridge}
+use os.services.llm.tool_registry.{register_os_tools}
+use common.ui.session.{UISession}
+use common.ui.widget.{UITree, WidgetNode, UIEvent}
+use common.ui.builder.{build_tree}
+
+# =========================================================================
+# Window Tracking
+# =========================================================================
+
+struct WindowInfo:
+    """Tracked window state."""
+    id: u64
+    title: text
+    width: i32
+    height: i32
+    focused: bool
+    surface_id: text
+
+# =========================================================================
+# Process Tracking
+# =========================================================================
+
+struct ProcessInfo:
+    """Tracked process info for MCP reporting."""
+    pid: u64
+    name: text
+    state: text
+    cpu_pct: text
+
+# =========================================================================
+# OsMcpServer
+# =========================================================================
+
+class OsMcpServer:
+    """MCP server for LLM control of SimpleOS.
+
+    Exposes tools for:
+    - File operations (read, write, list, search)
+    - Process management (spawn, kill, list)
+    - Window management (create, close, resize, focus)
+    - Widget manipulation (set widget tree, read widget state)
+    - Screen capture (screenshot as text description)
+    - System info (memory, CPU, disk)
+    """
+    vfs: VfsManager
+    bridge: CliGuiBridge
+    evaluator: WidgetDslEvaluator
+    windows: [WindowInfo]
+    processes: [ProcessInfo]
+    next_window_id: u64
+    hostname: text
+    uptime_sec: u64
+
+impl OsMcpServer:
+
+    static fn new(vfs: VfsManager, bridge: CliGuiBridge) -> OsMcpServer:
+        """Create a new OS MCP server with VFS and rendering bridge."""
+        return OsMcpServer(
+            vfs: vfs,
+            bridge: bridge,
+            evaluator: WidgetDslEvaluator.new(),
+            windows: [],
+            processes: [],
+            next_window_id: 1,
+            hostname: "simpleos",
+            uptime_sec: 0
+        )
+
+    # =================================================================
+    # Tool Dispatch
+    # =================================================================
+
+    me dispatch(tool_name: text, args: text) -> text:
+        """Dispatch an MCP tool call by name. Returns result text."""
+        if tool_name == "file_read":
+            val path = _extract_arg(args, "path")
+            return self.tool_file_read(path)
+        elif tool_name == "file_write":
+            val path = _extract_arg(args, "path")
+            val content = _extract_arg(args, "content")
+            return self.tool_file_write(path, content)
+        elif tool_name == "file_list":
+            val path = _extract_arg(args, "path")
+            return self.tool_file_list(path)
+        elif tool_name == "file_search":
+            val path = _extract_arg(args, "path")
+            val pattern = _extract_arg(args, "pattern")
+            return self.tool_file_search(path, pattern)
+        elif tool_name == "process_list":
+            return self.tool_process_list()
+        elif tool_name == "process_spawn":
+            val binary = _extract_arg(args, "binary")
+            return self.tool_process_spawn(binary)
+        elif tool_name == "process_kill":
+            val pid_str = _extract_arg(args, "pid")
+            return self.tool_process_kill(pid_str)
+        elif tool_name == "window_create":
+            val title = _extract_arg(args, "title")
+            val width_str = _extract_arg(args, "width")
+            val height_str = _extract_arg(args, "height")
+            return self.tool_window_create(title, width_str, height_str)
+        elif tool_name == "window_close":
+            val id_str = _extract_arg(args, "id")
+            return self.tool_window_close(id_str)
+        elif tool_name == "window_list":
+            return self.tool_window_list()
+        elif tool_name == "window_focus":
+            val id_str = _extract_arg(args, "id")
+            return self.tool_window_focus(id_str)
+        elif tool_name == "widget_set":
+            val wid_str = _extract_arg(args, "window_id")
+            val dsl = _extract_arg(args, "widget_dsl")
+            return self.tool_widget_set(wid_str, dsl)
+        elif tool_name == "widget_read":
+            val wid_str = _extract_arg(args, "window_id")
+            return self.tool_widget_read(wid_str)
+        elif tool_name == "widget_action":
+            val wid_str = _extract_arg(args, "window_id")
+            val action = _extract_arg(args, "action")
+            return self.tool_widget_action(wid_str, action)
+        elif tool_name == "screenshot":
+            return self.tool_screenshot()
+        elif tool_name == "screen_read_text":
+            return self.tool_screen_read_text()
+        elif tool_name == "system_info":
+            return self.tool_system_info()
+        elif tool_name == "system_exec":
+            val command = _extract_arg(args, "command")
+            return self.tool_system_exec(command)
+        else:
+            return "error: unknown tool '{tool_name}'"
+
+    # =================================================================
+    # File Tools
+    # =================================================================
+
+    me tool_file_read(path: text) -> text:
+        """Read file contents via VFS.
+        Opens the file with read flags, reads up to 64KB, then closes."""
+        val flags = FileFlags(
+            read: true, write: false, append: false,
+            create: false, truncate: false, directory: false
+        )
+        val open_result = self.vfs.open(path, flags)
+        match open_result:
+            Ok(fd):
+                val mount = self.vfs.resolve_mount(path)
+                if mount == nil:
+                    return "error: no filesystem for {path}"
+                val entry = mount
+                val read_result = entry.fs.read(fd.node, 65536)
+                entry.fs.close(fd.node)
+                match read_result:
+                    Ok(bytes):
+                        # Convert bytes to text (simplified)
+                        var content = ""
+                        for b in bytes:
+                            content = "{content}{b}"
+                        return content
+                    Err(e):
+                        return "error: read failed: {e}"
+            Err(e):
+                return "error: {e}"
+
+    me tool_file_write(path: text, content: text) -> text:
+        """Write file via VFS.
+        Opens with write+create flags, writes content, then closes."""
+        val flags = FileFlags(
+            read: false, write: true, append: false,
+            create: true, truncate: true, directory: false
+        )
+        val open_result = self.vfs.open(path, flags)
+        match open_result:
+            Ok(fd):
+                val mount = self.vfs.resolve_mount(path)
+                if mount == nil:
+                    return "error: no filesystem for {path}"
+                val entry = mount
+                # Convert text to bytes (simplified)
+                var data: [u8] = []
+                var i = 0
+                while i < content.len():
+                    data = data + [content[i]]
+                    i = i + 1
+                val write_result = entry.fs.write(fd.node, data)
+                entry.fs.close(fd.node)
+                match write_result:
+                    Ok(bytes_written):
+                        return "ok: wrote {bytes_written} bytes to {path}"
+                    Err(e):
+                        return "error: write failed: {e}"
+            Err(e):
+                return "error: {e}"
+
+    fn tool_file_list(path: text) -> text:
+        """List directory via VFS, return as formatted text."""
+        val result = self.vfs.readdir(path)
+        match result:
+            Ok(entries):
+                var out = "Directory: {path}\n"
+                for entry in entries:
+                    val kind_str = _fs_node_kind_str(entry.node.kind)
+                    val size_str = "{entry.node.size}"
+                    out = "{out}  {kind_str}  {size_str}  {entry.name}\n"
+                return out
+            Err(e):
+                return "error: {e}"
+
+    fn tool_file_search(path: text, pattern: text) -> text:
+        """Search files by name pattern under path."""
+        val result = self.vfs.readdir(path)
+        match result:
+            Ok(entries):
+                var matches: [text] = []
+                for entry in entries:
+                    if entry.name.contains(pattern):
+                        matches = matches + [entry.name]
+                if matches.len() == 0:
+                    return "No files matching '{pattern}' in {path}"
+                var out = "Matches for '{pattern}' in {path}:\n"
+                for m in matches:
+                    out = "{out}  {m}\n"
+                return out
+            Err(e):
+                return "error: {e}"
+
+    # =================================================================
+    # Process Tools
+    # =================================================================
+
+    fn tool_process_list() -> text:
+        """List running processes (PID, name, state, CPU%)."""
+        if self.processes.len() == 0:
+            return "No processes running."
+        var out = "PID     Name                State       CPU%\n"
+        out = "{out}------  ------------------  ----------  ----\n"
+        for proc in self.processes:
+            out = "{out}{proc.pid}  {proc.name}  {proc.state}  {proc.cpu_pct}\n"
+        return out
+
+    me tool_process_spawn(binary: text) -> text:
+        """Spawn new process. Returns PID."""
+        val pid = self.next_window_id
+        self.next_window_id = self.next_window_id + 1
+        val proc = ProcessInfo(
+            pid: pid,
+            name: binary,
+            state: "Running",
+            cpu_pct: "0.0"
+        )
+        self.processes = self.processes + [proc]
+        return "ok: spawned process {pid} ({binary})"
+
+    me tool_process_kill(pid_str: text) -> text:
+        """Kill process by PID."""
+        var new_procs: [ProcessInfo] = []
+        var found = false
+        for proc in self.processes:
+            if "{proc.pid}" == pid_str:
+                found = true
+            else:
+                new_procs = new_procs + [proc]
+        if found:
+            self.processes = new_procs
+            return "ok: killed process {pid_str}"
+        else:
+            return "error: process {pid_str} not found"
+
+    # =================================================================
+    # Window Tools
+    # =================================================================
+
+    me tool_window_create(title: text, width_str: text, height_str: text) -> text:
+        """Create new window, return window ID."""
+        val wid = self.next_window_id
+        self.next_window_id = self.next_window_id + 1
+        val surface_id = "window_{wid}"
+
+        # Create empty tree for the window surface
+        val root = WidgetNode.new(surface_id, "panel")
+        val tree = build_tree(root)
+        self.bridge.session.open_surface(surface_id, tree)
+
+        # Unfocus all, focus new
+        var updated: [WindowInfo] = []
+        for w in self.windows:
+            val unfocused = WindowInfo(
+                id: w.id,
+                title: w.title,
+                width: w.width,
+                height: w.height,
+                focused: false,
+                surface_id: w.surface_id
+            )
+            updated = updated + [unfocused]
+        self.windows = updated
+
+        val info = WindowInfo(
+            id: wid,
+            title: title,
+            width: 800,
+            height: 600,
+            focused: true,
+            surface_id: surface_id
+        )
+        self.windows = self.windows + [info]
+        return "ok: created window {wid} ({title})"
+
+    me tool_window_close(id_str: text) -> text:
+        """Close window by ID."""
+        var new_wins: [WindowInfo] = []
+        var found = false
+        for w in self.windows:
+            if "{w.id}" == id_str:
+                found = true
+                # Close the surface
+                val surface_id = w.surface_id
+                if self.bridge.session.has_surface(surface_id):
+                    val handle = self.bridge.session.open_surface(surface_id, build_tree(WidgetNode.new("empty", "panel")))
+                    self.bridge.session.close_surface(handle)
+            else:
+                new_wins = new_wins + [w]
+        if found:
+            self.windows = new_wins
+            return "ok: closed window {id_str}"
+        else:
+            return "error: window {id_str} not found"
+
+    fn tool_window_list() -> text:
+        """List open windows (ID, title, size, focused)."""
+        if self.windows.len() == 0:
+            return "No windows open."
+        var out = "ID    Title               Size        Focused\n"
+        out = "{out}----  ------------------  ----------  -------\n"
+        for w in self.windows:
+            val focused_str = if w.focused: "yes" else: "no"
+            out = "{out}{w.id}  {w.title}  {w.width}x{w.height}  {focused_str}\n"
+        return out
+
+    me tool_window_focus(id_str: text) -> text:
+        """Focus a window by ID."""
+        var found = false
+        var updated: [WindowInfo] = []
+        for w in self.windows:
+            val is_target = "{w.id}" == id_str
+            if is_target:
+                found = true
+            val new_w = WindowInfo(
+                id: w.id,
+                title: w.title,
+                width: w.width,
+                height: w.height,
+                focused: is_target,
+                surface_id: w.surface_id
+            )
+            updated = updated + [new_w]
+        if found:
+            self.windows = updated
+            return "ok: focused window {id_str}"
+        else:
+            return "error: window {id_str} not found"
+
+    # =================================================================
+    # Widget Tools (LLM-friendly GUI)
+    # =================================================================
+
+    me tool_widget_set(window_id_str: text, widget_dsl: text) -> text:
+        """Parse widget DSL and set as window's widget tree.
+
+        Example DSL:
+          column:
+            text("Hello, World!")
+            button("Click me", action: "greet")
+            table(headers: ["Name", "Value"], rows: [["foo", "42"]])
+        """
+        val win = _find_window(self.windows, window_id_str)
+        if win == nil:
+            return "error: window {window_id_str} not found"
+
+        val surface_id = win.surface_id
+        val result = self.evaluator.evaluate(widget_dsl)
+        match result:
+            Ok(session):
+                val new_tree = session.current_tree()
+                self.bridge.session.update_tree(new_tree)
+                self.bridge.render()
+                return "ok: widget tree updated for window {window_id_str}"
+            Err(e):
+                return "error: DSL parse failed: {e}"
+
+    fn tool_widget_read(window_id_str: text) -> text:
+        """Return current widget tree as text description.
+        LLM can read this to understand current UI state."""
+        val win = _find_window(self.windows, window_id_str)
+        if win == nil:
+            return "error: window {window_id_str} not found"
+
+        val surface_id = win.surface_id
+        val tree_opt = self.bridge.session.get_surface(surface_id)
+        if tree_opt == nil:
+            return "error: no surface for window {window_id_str}"
+
+        val tree = tree_opt
+        val root = tree.root_node()
+        return _render_widget_tree_text(root, 0)
+
+    me tool_widget_action(window_id_str: text, action: text) -> text:
+        """Trigger a UI action (button click, menu select)."""
+        val win = _find_window(self.windows, window_id_str)
+        if win == nil:
+            return "error: window {window_id_str} not found"
+
+        self.bridge.session.dispatch(UIEvent.Action(name: action))
+        self.bridge.render()
+        return "ok: dispatched action '{action}' to window {window_id_str}"
+
+    # =================================================================
+    # Screen Tools
+    # =================================================================
+
+    fn tool_screenshot() -> text:
+        """Return text description of current screen state.
+        Lists windows, their positions, and widget tree summaries."""
+        if self.windows.len() == 0:
+            return "Screen: empty (no windows)"
+        var out = "Screen State:\n"
+        out = "{out}=============\n"
+        for w in self.windows:
+            val focused_str = if w.focused: " [FOCUSED]" else: ""
+            out = "{out}\nWindow {w.id}: {w.title}{focused_str} ({w.width}x{w.height})\n"
+            val surface_id = w.surface_id
+            val tree_opt = self.bridge.session.get_surface(surface_id)
+            if tree_opt != nil:
+                val tree = tree_opt
+                val root = tree.root_node()
+                out = "{out}{_render_widget_tree_text(root, 1)}"
+            else:
+                out = "{out}  (empty)\n"
+        return out
+
+    fn tool_screen_read_text() -> text:
+        """Extract all visible text from screen (accessibility).
+        Returns plain text content from all windows."""
+        var out = ""
+        for w in self.windows:
+            val surface_id = w.surface_id
+            val tree_opt = self.bridge.session.get_surface(surface_id)
+            if tree_opt != nil:
+                val tree = tree_opt
+                val root = tree.root_node()
+                out = "{out}{_extract_text_content(root)}"
+        if out == "":
+            return "(no visible text)"
+        return out
+
+    # =================================================================
+    # System Tools
+    # =================================================================
+
+    fn tool_system_info() -> text:
+        """Memory usage, CPU usage, uptime, hostname."""
+        var out = "System Information\n"
+        out = "{out}==================\n"
+        out = "{out}Hostname:  {self.hostname}\n"
+        out = "{out}Uptime:    {self.uptime_sec}s\n"
+        out = "{out}Processes: {self.processes.len()}\n"
+        out = "{out}Windows:   {self.windows.len()}\n"
+        out = "{out}Surfaces:  {self.bridge.session.surface_count()}\n"
+        return out
+
+    fn tool_system_exec(command: text) -> text:
+        """Execute shell command, return output.
+        In OS context, this dispatches to the shell service."""
+        return "exec: command execution not yet available in SimpleOS"
+
+    me update_uptime(seconds: u64):
+        """Update tracked uptime (called by OS tick)."""
+        self.uptime_sec = seconds
+
+    me register_process(pid: u64, name: text):
+        """Register a process in the tracking list."""
+        val proc = ProcessInfo(
+            pid: pid,
+            name: name,
+            state: "Running",
+            cpu_pct: "0.0"
+        )
+        self.processes = self.processes + [proc]
+
+# =========================================================================
+# Module-level Helpers
+# =========================================================================
+
+fn _extract_arg(args_json: text, key: text) -> text:
+    """Simple JSON field extraction for tool arguments.
+    Expects flat JSON object like {"key": "value", ...}."""
+    val search = "\"" + key + "\""
+    val idx = args_json.index_of(search)
+    match idx:
+        Some(i):
+            # Find the colon after the key
+            val after_key = args_json[i + search.len():]
+            val colon_idx = after_key.index_of(":")
+            match colon_idx:
+                Some(ci):
+                    val after_colon = after_key[ci + 1:].strip()
+                    if after_colon.starts_with("\""):
+                        # String value: find closing quote
+                        val value_start = 1
+                        val rest = after_colon[1:]
+                        val end_quote = rest.index_of("\"")
+                        match end_quote:
+                            Some(ei):
+                                return rest[0:ei]
+                            _:
+                                return rest
+                    else:
+                        # Number or other: read until comma or }
+                        var end_idx = after_colon.len()
+                        val comma = after_colon.index_of(",")
+                        match comma:
+                            Some(ci2):
+                                end_idx = ci2
+                            _:
+                                pass_dn
+                        val brace = after_colon.index_of("}")
+                        match brace:
+                            Some(bi):
+                                if bi < end_idx:
+                                    end_idx = bi
+                            _:
+                                pass_dn
+                        return after_colon[0:end_idx].strip()
+                _:
+                    return ""
+        _:
+            return ""
+
+fn _find_window(windows: [WindowInfo], id_str: text) -> WindowInfo?:
+    """Find a window by ID string."""
+    for w in windows:
+        if "{w.id}" == id_str:
+            return w
+    return nil
+
+fn _fs_node_kind_str(kind: FsNodeKind) -> text:
+    """Convert FsNodeKind to display string."""
+    match kind:
+        File: return "FILE"
+        Directory: return "DIR "
+        Symlink: return "LINK"
+        Device: return "DEV "
+        Pipe: return "PIPE"
+
+fn _render_widget_tree_text(node: WidgetNode, depth: i32) -> text:
+    """Render a widget tree as indented text for LLM reading."""
+    var indent = ""
+    var i = 0
+    while i < depth:
+        indent = "{indent}  "
+        i = i + 1
+    var out = "{indent}{node.widget_summary()}\n"
+    val children = node.children()
+    for child in children:
+        out = "{out}{_render_widget_tree_text(child, depth + 1)}"
+    return out
+
+fn _extract_text_content(node: WidgetNode) -> text:
+    """Recursively extract all text content from a widget tree."""
+    var out = ""
+    val summary = node.widget_summary()
+    if summary != "":
+        out = "{out}{summary}\n"
+    val children = node.children()
+    for child in children:
+        out = "{out}{_extract_text_content(child)}"
+    return out

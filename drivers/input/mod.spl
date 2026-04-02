@@ -1,0 +1,10 @@
+# PS/2 Input Drivers
+#
+# Exports keyboard and mouse drivers for the compositor.
+#
+# Modules:
+#   - ps2_keyboard.spl — PS/2 keyboard scancode-to-key mapping
+#   - ps2_mouse.spl    — PS/2 mouse 3-byte packet parsing, cursor tracking
+
+use os.drivers.input.ps2_keyboard.{Ps2Keyboard, Key, KeyEvent, scancode_to_key}
+use os.drivers.input.ps2_mouse.{Ps2Mouse, MouseState, MouseEvent}

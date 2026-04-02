@@ -1,0 +1,305 @@
+# UI Session — Unified Session Model
+#
+# Central shared-state container that owns UIState, WidgetStore,
+# Viewport, ChangeLog, LifecycleRegistry, and SurfaceManager.
+# All state transitions flow through the session, enabling
+# shared state across CLI, TUI, and GUI backends.
+
+use common.ui.widget.{WidgetNode, UITree, UIState, UIEvent, UIMode}
+use common.ui.widget_store.{WidgetStore}
+use common.ui.viewport.{Viewport, default_viewport}
+use common.ui.changelog.{ChangeLog, default_changelog}
+use common.ui.lifecycle.{LifecycleRegistry, LifecycleEvent, new_lifecycle_registry, emit_lifecycle_events, describe_lifecycle_event}
+use common.ui.diff.{diff_trees_with}
+use common.ui.state.{update_state}
+use common.ui.surface.{SurfaceHandle, SurfaceManager, new_surface_manager}
+use common.ui.profile.{ProfileResolver, ProfileSet, ProfileSetEntry, Orientation, LayoutProfile, compute_profile}
+use common.ui.capability.{Capability}
+use common.ui.capability_policy.{CapabilityPolicy, check_capability, require_capability}
+
+# =========================================================================
+# UISession
+# =========================================================================
+
+class UISession:
+    state: UIState
+    store: WidgetStore
+    viewport: Viewport
+    changelog: ChangeLog
+    lifecycle: LifecycleRegistry
+    surfaces: SurfaceManager
+    profile_resolver: ProfileResolver
+    profile_sets: [ProfileSetEntry]
+    capability_policy: CapabilityPolicy
+
+    static fn new(tree: UITree) -> UISession:
+        """Create a session with a main tree and default settings."""
+        val store = WidgetStore.new()
+        var sm = new_surface_manager()
+        sm.open("main", tree)
+        return UISession(
+            state: UIState.new(tree),
+            store: store,
+            viewport: default_viewport(),
+            changelog: default_changelog(),
+            lifecycle: new_lifecycle_registry(),
+            surfaces: sm,
+            profile_resolver: ProfileResolver.new(),
+            profile_sets: [],
+            capability_policy: CapabilityPolicy.new("main")
+        )
+
+    static fn new_with_store(tree: UITree, store: WidgetStore) -> UISession:
+        """Create a session with a pre-populated widget store."""
+        var sm = new_surface_manager()
+        sm.open("main", tree)
+        return UISession(
+            state: UIState.new(tree),
+            store: store,
+            viewport: default_viewport(),
+            changelog: default_changelog(),
+            lifecycle: new_lifecycle_registry(),
+            surfaces: sm,
+            profile_resolver: ProfileResolver.new(),
+            profile_sets: [],
+            capability_policy: CapabilityPolicy.new("main")
+        )
+
+    static fn new_with_policy(tree: UITree, policy: CapabilityPolicy) -> UISession:
+        """Create a session with a specific capability policy."""
+        val store = WidgetStore.new()
+        var sm = new_surface_manager()
+        sm.open("main", tree)
+        return UISession(
+            state: UIState.new(tree),
+            store: store,
+            viewport: default_viewport(),
+            changelog: default_changelog(),
+            lifecycle: new_lifecycle_registry(),
+            surfaces: sm,
+            profile_resolver: ProfileResolver.new(),
+            profile_sets: [],
+            capability_policy: policy
+        )
+
+# =========================================================================
+# Constructor Shorthand
+# =========================================================================
+
+fn new_session(tree: UITree) -> UISession:
+    """Create a new UI session with the given tree."""
+    return UISession.new(tree)
+
+# =========================================================================
+# UISession Methods
+# =========================================================================
+
+impl UISession:
+
+    # -- State access --------------------------------------------------------
+
+    fn current_state() -> UIState:
+        """Get the current UI state."""
+        return self.state
+
+    fn current_tree() -> UITree:
+        """Get the current widget tree."""
+        return self.state.tree
+
+    fn current_mode() -> text:
+        """Get the current mode name (NORMAL, COMMAND, etc.)."""
+        return self.state.mode_name()
+
+    fn focused_widget() -> text:
+        """Get the ID of the currently focused widget."""
+        return self.state.focused_id
+
+    fn recent_changes(count: i32) -> [text]:
+        """Get human-readable descriptions of recent lifecycle events."""
+        return self.changelog.recent_descriptions(count)
+
+    fn viewport_width() -> i32:
+        """Get viewport width."""
+        return self.viewport.width
+
+    fn viewport_height() -> i32:
+        """Get viewport height."""
+        return self.viewport.height
+
+    fn active_backend() -> text:
+        """Get the name of the active backend."""
+        return self.viewport.active_backend
+
+    # -- State mutation ------------------------------------------------------
+
+    me dispatch(event: UIEvent):
+        """Process a UI event through the state update pipeline."""
+        self.state = update_state(self.state, event)
+        # Check for resize events and trigger profile switching
+        match event:
+            UIEvent.Resize(width, height):
+                val old_orientation = self.profile_resolver.orientation()
+                self.profile_resolver.update(self.viewport)
+                if self.profile_resolver.orientation_changed(old_orientation):
+                    self._apply_profiles(self.profile_resolver.orientation())
+            _:
+                pass_dn
+
+    me update_tree(new_tree: UITree):
+        """Replace the main tree, computing diff and emitting lifecycle events."""
+        val old_root = self.state.tree.root_node()
+        val new_root = new_tree.root_node()
+        val patches = diff_trees_with(old_root, new_root, self.store)
+        emit_lifecycle_events(self.lifecycle, patches)
+        # Push lifecycle events to changelog
+        for event in self.lifecycle.event_log:
+            self.changelog.push(event)
+        self.lifecycle.clear_log()
+        # Update state with new tree
+        self.state = UIState(
+            tree: new_tree,
+            mode: self.state.mode,
+            focused_id: self.state.focused_id,
+            command_buffer: self.state.command_buffer
+        )
+        # Update main surface
+        if self.surfaces.has("main"):
+            self.surfaces.update_tree("main", new_tree)
+
+    # -- Viewport management -------------------------------------------------
+
+    me set_viewport(width: i32, height: i32, backend: text):
+        """Set viewport dimensions. Only the active backend can update."""
+        val current_backend = self.viewport.active_backend
+        if current_backend == backend or current_backend == "none":
+            self.viewport = Viewport(
+                width: width,
+                height: height,
+                active_backend: backend
+            )
+
+    me set_active_backend(name: text):
+        """Set which backend is the active renderer."""
+        self.viewport = Viewport(
+            width: self.viewport.width,
+            height: self.viewport.height,
+            active_backend: name
+        )
+
+    # -- Surface lifecycle ---------------------------------------------------
+
+    me open_surface(id: text, tree: UITree) -> SurfaceHandle:
+        """Open a named surface with the given tree."""
+        return self.surfaces.open(id, tree)
+
+    me close_surface(handle: SurfaceHandle) -> bool:
+        """Close a surface by its handle. Returns false if stale."""
+        return self.surfaces.close(handle)
+
+    fn get_surface(id: text) -> UITree?:
+        """Get the tree for a named surface."""
+        return self.surfaces.get(id)
+
+    fn has_surface(id: text) -> bool:
+        """Check whether a named surface exists."""
+        return self.surfaces.has(id)
+
+    fn surface_count() -> i32:
+        """How many surfaces are open."""
+        return self.surfaces.surface_count()
+
+    me set_active_surface(id: text):
+        """Set which surface is active."""
+        self.surfaces.set_active(id)
+
+    fn active_surface() -> text:
+        """Get the active surface ID."""
+        return self.surfaces.active()
+
+    fn validate_surface_handle(handle: SurfaceHandle) -> bool:
+        """Check whether a surface handle is still valid."""
+        return self.surfaces.validate_handle(handle)
+
+    me update_surface_tree(handle: SurfaceHandle, new_tree: UITree):
+        """Update a surface's tree. Does nothing if handle is stale."""
+        if not self.surfaces.validate_handle(handle):
+            return
+        val old_tree = self.surfaces.get(handle.id)
+        if old_tree == nil:
+            return
+        val old_root = old_tree.root_node()
+        val new_root = new_tree.root_node()
+        # Diff and emit
+        val patches = diff_trees_with(old_root, new_root, self.store)
+        emit_lifecycle_events(self.lifecycle, patches)
+        for event in self.lifecycle.event_log:
+            self.changelog.push(event)
+        self.lifecycle.clear_log()
+        # Commit new tree
+        self.surfaces.update_tree(handle.id, new_tree)
+
+    # -- Profile management --------------------------------------------------
+
+    me register_profile_set(surface_id: text, profiles: ProfileSet):
+        """Register landscape/portrait profiles for a surface."""
+        # Replace existing entry for this surface, or append
+        var new_sets: [ProfileSetEntry] = []
+        var found = false
+        for entry in self.profile_sets:
+            if entry.surface_id == surface_id:
+                new_sets = new_sets.push(ProfileSetEntry(surface_id: surface_id, profiles: profiles))
+                found = true
+            else:
+                new_sets = new_sets.push(entry)
+        if not found:
+            new_sets = new_sets.push(ProfileSetEntry(surface_id: surface_id, profiles: profiles))
+        self.profile_sets = new_sets
+
+    me _apply_profiles(orientation: Orientation):
+        """Switch all registered surfaces to the matching profile."""
+        for entry in self.profile_sets:
+            val new_root = entry.profiles.resolve(orientation)
+            val new_tree = UITree.new(new_root)
+            if entry.surface_id == "main":
+                self.update_tree(new_tree)
+            else:
+                if self.surfaces.has(entry.surface_id):
+                    self.surfaces.update_tree(entry.surface_id, new_tree)
+        # Reset focus if the focused widget no longer exists
+        val ids = self.state.tree.all_widget_ids()
+        var focus_valid = false
+        for id in ids:
+            if id == self.state.focused_id:
+                focus_valid = true
+        if not focus_valid and ids.len() > 0:
+            self.state = UIState(
+                tree: self.state.tree,
+                mode: self.state.mode,
+                focused_id: ids[0],
+                command_buffer: self.state.command_buffer
+            )
+
+    fn current_profile() -> LayoutProfile:
+        """Get the current computed layout profile."""
+        return self.profile_resolver.current_profile()
+
+    fn current_orientation() -> Orientation:
+        """Get the current detected orientation."""
+        return self.profile_resolver.orientation()
+
+    # -- Capability enforcement -----------------------------------------------
+
+    fn check_cap(cap: Capability) -> Result<bool, text>:
+        """Check if a capability is allowed by this session's policy."""
+        return check_capability(self.capability_policy, cap)
+
+    me set_capability_policy(policy: CapabilityPolicy):
+        """Replace the session's capability policy."""
+        self.capability_policy = policy
+
+    me open_surface_gated(id: text, tree: UITree, required_cap: Capability) -> Result<SurfaceHandle, text>:
+        """Open a surface only if the required capability is granted."""
+        val cap_check = check_capability(self.capability_policy, required_cap)
+        match cap_check:
+            Ok(_): Ok(self.surfaces.open(id, tree))
+            Err(msg): Err(msg)

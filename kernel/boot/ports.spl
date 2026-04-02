@@ -1,0 +1,44 @@
+# Boot Layer — Output Port
+#
+# Contract: what the boot layer provides to memory and other layers.
+# No input port — boot is the first layer.
+
+use os.kernel.types.memory_types.{PhysAddr, VirtAddr}
+use os.kernel.arch.arch_context.{Architecture}
+
+struct BootOutputPort:
+    """Boot layer output: memory map, framebuffer, RSDP, serial."""
+    memory_map: [BootMemoryRegion]
+    framebuffer: FramebufferInfo
+    rsdp_addr: PhysAddr?            # ACPI RSDP (nil if not available)
+    kernel_phys_base: PhysAddr
+    kernel_virt_base: VirtAddr
+    kernel_size: u64
+    serial_base: u64                # Port I/O (0x3F8) or MMIO base (0x09000000, 0x10000000)
+    serial_is_mmio: bool            # false for x86_64 port I/O, true for ARM/RISC-V MMIO
+    arch: Architecture              # Target architecture
+    hhdm_offset: u64                # Higher-half direct map offset (0 if none)
+
+struct BootMemoryRegion:
+    """Physical memory region from bootloader."""
+    base: PhysAddr
+    size: u64
+    kind: MemoryRegionKind
+
+enum MemoryRegionKind:
+    Usable              # Free for OS use
+    Reserved            # BIOS/firmware reserved
+    AcpiReclaimable     # Can be reclaimed after ACPI init
+    AcpiNvs             # ACPI Non-Volatile Storage
+    BadMemory           # Defective
+    BootloaderReclaimable  # Bootloader data, reclaimable after boot
+    Framebuffer         # Display framebuffer
+    Kernel              # Loaded kernel image
+
+struct FramebufferInfo:
+    """Bootloader-provided framebuffer."""
+    addr: PhysAddr
+    width: u32
+    height: u32
+    pitch: u32          # Bytes per scanline
+    bpp: u32            # Bits per pixel (usually 32)

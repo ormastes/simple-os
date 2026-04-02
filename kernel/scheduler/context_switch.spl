@@ -1,0 +1,115 @@
+# Context Switch — arch_adapt Transform Bridge
+#
+# Low-level context save/restore wrappers for x86_64.
+# The actual save/restore happens in the interrupt stub (assembly);
+# these Simple-level wrappers provide the bridge between the
+# scheduler's TaskContext and the hardware registers.
+#
+# Architecture: x86_64 (arch_adapt transform replaces for other targets)
+
+use os.kernel.types.task_types.{TaskContext}
+
+# ============================================================================
+# Context Save
+# ============================================================================
+
+fn context_save(ctx: TaskContext) -> TaskContext:
+    """Save current CPU registers into a TaskContext.
+
+    Called at interrupt/syscall entry. The interrupt stub has already
+    pushed registers onto the kernel stack; this function copies them
+    into the TaskContext structure for the scheduler to store.
+
+    In practice, the interrupt entry stub fills the TaskContext fields
+    directly. This wrapper provides the Simple-level interface.
+    """
+    # Inline assembly: read registers into ctx fields
+    # RDI already points to ctx (System V ABI first argument)
+    asm:
+        "mov [rdi],      rax"       # ctx.rax
+        "mov [rdi + 8],  rbx"       # ctx.rbx
+        "mov [rdi + 16], rcx"       # ctx.rcx
+        "mov [rdi + 24], rdx"       # ctx.rdx
+        "mov [rdi + 32], rsi"       # ctx.rsi
+        "mov [rdi + 40], rdi"       # ctx.rdi (save original)
+        "mov [rdi + 48], rbp"       # ctx.rbp
+        "mov [rdi + 56], rsp"       # ctx.rsp
+        "mov [rdi + 64], r8"        # ctx.r8
+        "mov [rdi + 72], r9"        # ctx.r9
+        "mov [rdi + 80], r10"       # ctx.r10
+        "mov [rdi + 88], r11"       # ctx.r11
+        "mov [rdi + 96], r12"       # ctx.r12
+        "mov [rdi + 104], r13"      # ctx.r13
+        "mov [rdi + 112], r14"      # ctx.r14
+        "mov [rdi + 120], r15"      # ctx.r15
+        # RIP, RFLAGS, CS, SS are on the interrupt stack frame —
+        # the stub copies them before calling this function.
+        # options: [volatile]
+    ctx
+
+# ============================================================================
+# Context Restore
+# ============================================================================
+
+fn context_restore(ctx: TaskContext):
+    """Restore CPU registers from a TaskContext and return to task.
+
+    Called at interrupt/syscall exit. Loads all general-purpose registers
+    from the TaskContext, sets up the iret frame, and executes iretq to
+    return to the task.
+
+    This function does NOT return — it transfers control to the
+    restored task via iretq.
+    """
+    # RDI points to ctx (System V ABI)
+    asm:
+        # Restore GPRs
+        "mov rax, [rdi]"            # ctx.rax
+        "mov rbx, [rdi + 8]"        # ctx.rbx
+        "mov rcx, [rdi + 16]"       # ctx.rcx
+        "mov rdx, [rdi + 24]"       # ctx.rdx
+        "mov rsi, [rdi + 32]"       # ctx.rsi
+        "mov rbp, [rdi + 48]"       # ctx.rbp
+        "mov r8,  [rdi + 64]"       # ctx.r8
+        "mov r9,  [rdi + 72]"       # ctx.r9
+        "mov r10, [rdi + 80]"       # ctx.r10
+        "mov r11, [rdi + 88]"       # ctx.r11
+        "mov r12, [rdi + 96]"       # ctx.r12
+        "mov r13, [rdi + 104]"      # ctx.r13
+        "mov r14, [rdi + 112]"      # ctx.r14
+        "mov r15, [rdi + 120]"      # ctx.r15
+
+        # Build iret frame on stack:
+        #   SS, RSP, RFLAGS, CS, RIP  (pushed in reverse order)
+        "push qword [rdi + 152]"    # SS   (offset 19*8 = ctx.ss)
+        "push qword [rdi + 56]"     # RSP  (offset 7*8 = ctx.rsp)
+        "push qword [rdi + 136]"    # RFLAGS (offset 17*8 = ctx.rflags)
+        "push qword [rdi + 144]"    # CS   (offset 18*8 = ctx.cs)
+        "push qword [rdi + 128]"    # RIP  (offset 16*8 = ctx.rip)
+
+        # Restore RDI last (it holds the ctx pointer)
+        "mov rdi, [rdi + 40]"       # ctx.rdi
+
+        # Return from interrupt — transfers control to task
+        "iretq"
+        # options: [volatile, noreturn]
+
+# ============================================================================
+# Switch Tasks (Scheduler-Level)
+# ============================================================================
+
+fn switch_context(old_ctx: TaskContext, new_ctx: TaskContext) -> TaskContext:
+    """High-level context switch: save current, restore next.
+
+    Called by the scheduler when preempting a task. Saves the current
+    CPU state into old_ctx, then restores new_ctx. Returns the saved
+    old_ctx for storage in the TCB.
+
+    Note: In the actual interrupt path, context_save and context_restore
+    are called separately by the interrupt stub. This function is a
+    convenience for voluntary context switches (yield, block).
+    """
+    val saved = context_save(old_ctx)
+    context_restore(new_ctx)
+    # context_restore does not return; this is unreachable
+    saved

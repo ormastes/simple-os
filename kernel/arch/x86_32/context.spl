@@ -1,0 +1,74 @@
+# x86_32 Context Switch HAL — Register Save/Restore
+#
+# Implements context switching for x86 32-bit protected mode.
+# Context switching involves saving/restoring:
+#   - General purpose registers (eax, ebx, ecx, edx, esi, edi, ebp)
+#   - Stack pointer (esp), instruction pointer (eip)
+#   - Flags (eflags)
+#   - Segment registers (cs, ss, ds, es)
+#   - FPU state (fsave/frstor)
+#   - CR3 (page directory base, for address space switch)
+#
+# The actual register save/restore is done in assembly.
+# See os.kernel.arch.arch_context.X86Context for the register state layout.
+
+use os.kernel.arch.arch_context.{X86Context}
+
+# ============================================================================
+# X86_32ContextSwitch
+# ============================================================================
+
+struct X86_32ContextSwitch:
+    """x86_32 context switching implementation.
+
+    Stub -- will implement assembly-based register save/restore
+    for preemptive multitasking in 32-bit protected mode.
+
+    Named X86_32ContextSwitch (not X86_32Context) to avoid collision
+    with the X86Context register state struct in arch_context.spl.
+    """
+    pass_dn
+
+impl X86_32ContextSwitch:
+    fn init():
+        """Initialize context switching (set up initial kernel stack frame)."""
+        pass_todo("set up initial kernel thread context for 32-bit mode")
+
+    fn create(entry_point: u32, stack_top: u32, user_mode: bool) -> X86Context:
+        """Create a new CPU context for a thread.
+
+        Sets up the register state so that when switched to,
+        execution begins at entry_point with the given stack.
+
+        For user mode, sets segment selectors to ring 3 segments;
+        for kernel mode, uses ring 0 segments.
+        """
+        pass_todo("construct X86Context with entry_point as eip, stack_top as esp")
+
+    fn switch(from_ctx: X86Context, to_ctx: X86Context):
+        """Switch from one context to another.
+
+        Saves current register state into from_ctx, loads to_ctx.
+        This is the core context switch -- implemented in assembly.
+
+        The 32-bit context switch saves/restores:
+        eax, ebx, ecx, edx, esi, edi, ebp, esp, eip, eflags,
+        and segment registers cs, ss, ds, es.
+        """
+        pass_todo("assembly: save regs to from_ctx, load regs from to_ctx, ret")
+
+    fn save_fpu(ctx: X86Context):
+        """Save FPU/SSE state for context.
+
+        Uses FSAVE (or FXSAVE if SSE is available) to save the
+        floating-point unit state to the context's fpu_state region.
+        """
+        pass_todo("fsave or fxsave to ctx.fpu_state region")
+
+    fn restore_fpu(ctx: X86Context):
+        """Restore FPU/SSE state for context.
+
+        Uses FRSTOR (or FXRSTOR if SSE is available) to restore the
+        floating-point unit state from the context's fpu_state region.
+        """
+        pass_todo("frstor or fxrstor from ctx.fpu_state region")

@@ -1,0 +1,334 @@
+@allow(unnamed_duplicate_typed_args)
+# ARM Cortex-M Nested Vectored Interrupt Controller (NVIC)
+#
+# Manages interrupts and exceptions for ARM Cortex-M processors.
+# The NVIC provides:
+# - Up to 256 external interrupt sources
+# - 8-bit priority levels (configurable grouping)
+# - Automatic state saving and restoration
+# - Tail-chaining for back-to-back interrupts
+#
+# Memory-mapped registers:
+# - NVIC_ISER: Interrupt Set-Enable Registers (0xE000E100)
+# - NVIC_ICER: Interrupt Clear-Enable Registers (0xE000E180)
+# - NVIC_ISPR: Interrupt Set-Pending Registers (0xE000E200)
+# - NVIC_ICPR: Interrupt Clear-Pending Registers (0xE000E280)
+# - NVIC_IABR: Interrupt Active Bit Registers (0xE000E300)
+# - NVIC_IPR: Interrupt Priority Registers (0xE000E400)
+
+
+# ARM Cortex-M Exception Numbers
+enum ExceptionVector:
+    # Core exceptions
+    Reset = 1           # Reset
+    Nmi = 2             # Non-Maskable Interrupt
+    HardFault = 3       # All faults when not enabled
+    MemManage = 4       # Memory management fault
+    BusFault = 5        # Pre-fetch/memory access fault
+    UsageFault = 6      # Undefined instruction or illegal state
+    Reserved1 = 7       # Reserved
+    Reserved2 = 8       # Reserved
+    Reserved3 = 9       # Reserved
+    Reserved4 = 10      # Reserved
+    SvCall = 11         # System service call
+    DebugMon = 12       # Debug monitor
+    Reserved5 = 13      # Reserved
+    PendSV = 14         # Pendable system service
+    SysTick = 15        # System tick timer
+
+    # External interrupts start at 16
+    Irq0 = 16
+    Irq1 = 17
+    Irq2 = 18
+    # ... up to 240 IRQs
+
+impl ExceptionVector:
+    fn to_i64() -> i64:
+        match self:
+            case ExceptionVector.Reset: 1
+            case ExceptionVector.Nmi: 2
+            case ExceptionVector.HardFault: 3
+            case ExceptionVector.MemManage: 4
+            case ExceptionVector.BusFault: 5
+            case ExceptionVector.UsageFault: 6
+            case ExceptionVector.SvCall: 11
+            case ExceptionVector.DebugMon: 12
+            case ExceptionVector.PendSV: 14
+            case ExceptionVector.SysTick: 15
+            case ExceptionVector.Irq0: 16
+            case ExceptionVector.Irq1: 17
+            case ExceptionVector.Irq2: 18
+            case _: 0
+
+    fn name() -> text:
+        match self:
+            case ExceptionVector.Reset: "Reset"
+            case ExceptionVector.Nmi: "NMI"
+            case ExceptionVector.HardFault: "HardFault"
+            case ExceptionVector.MemManage: "MemManage"
+            case ExceptionVector.BusFault: "BusFault"
+            case ExceptionVector.UsageFault: "UsageFault"
+            case ExceptionVector.SvCall: "SVCall"
+            case ExceptionVector.DebugMon: "DebugMon"
+            case ExceptionVector.PendSV: "PendSV"
+            case ExceptionVector.SysTick: "SysTick"
+            case _: "IRQ"
+
+# ARM Cortex-M Vector Table
+#
+# The vector table is an array of 32-bit addresses.
+# Entry 0: Initial stack pointer value
+# Entry 1-15: Exception handlers
+# Entry 16+: External IRQ handlers
+#
+# Note: Requires @repr(C) and proper alignment (@align(256))
+struct VectorTable:
+    """ARM Cortex-M vector table structure."""
+    initial_sp: u32          # 0: Initial stack pointer
+    reset: u32               # 1: Reset handler
+    nmi: u32                 # 2: NMI handler
+    hard_fault: u32          # 3: Hard fault handler
+    mem_manage: u32          # 4: Memory management fault
+    bus_fault: u32           # 5: Bus fault
+    usage_fault: u32         # 6: Usage fault
+    reserved1: u32           # 7: Reserved
+    reserved2: u32           # 8: Reserved
+    reserved3: u32           # 9: Reserved
+    reserved4: u32           # 10: Reserved
+    svcall: u32              # 11: SVC handler
+    debug_mon: u32           # 12: Debug monitor
+    reserved5: u32           # 13: Reserved
+    pendsv: u32              # 14: PendSV handler
+    systick: u32             # 15: SysTick handler
+    # External interrupts follow (up to 240)
+    # irqs: [u32; 240]
+
+impl VectorTable:
+    fn empty(stack_top: u32) -> VectorTable:
+        VectorTable(
+            initial_sp: stack_top,
+            reset: 0,
+            nmi: 0,
+            hard_fault: 0,
+            mem_manage: 0,
+            bus_fault: 0,
+            usage_fault: 0,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            reserved4: 0,
+            svcall: 0,
+            debug_mon: 0,
+            reserved5: 0,
+            pendsv: 0,
+            systick: 0
+        )
+
+    me set_handler(vector: ExceptionVector, handler_addr: u32):
+        """Set a handler address for an exception vector."""
+        match vector:
+            case ExceptionVector.Reset:
+                self.reset = handler_addr
+            case ExceptionVector.Nmi:
+                self.nmi = handler_addr
+            case ExceptionVector.HardFault:
+                self.hard_fault = handler_addr
+            case ExceptionVector.MemManage:
+                self.mem_manage = handler_addr
+            case ExceptionVector.BusFault:
+                self.bus_fault = handler_addr
+            case ExceptionVector.UsageFault:
+                self.usage_fault = handler_addr
+            case ExceptionVector.SvCall:
+                self.svcall = handler_addr
+            case ExceptionVector.DebugMon:
+                self.debug_mon = handler_addr
+            case ExceptionVector.PendSV:
+                self.pendsv = handler_addr
+            case ExceptionVector.SysTick:
+                self.systick = handler_addr
+            case _:
+                pass  # External IRQs handled separately
+
+# NVIC Memory-Mapped Registers
+struct NvicRegisters:
+    """NVIC register base addresses."""
+    iser_base: u32 = 0xE000E100  # Interrupt Set-Enable Registers
+    icer_base: u32 = 0xE000E180  # Interrupt Clear-Enable Registers
+    ispr_base: u32 = 0xE000E200  # Interrupt Set-Pending Registers
+    icpr_base: u32 = 0xE000E280  # Interrupt Clear-Pending Registers
+    iabr_base: u32 = 0xE000E300  # Interrupt Active Bit Registers
+    ipr_base: u32 = 0xE000E400   # Interrupt Priority Registers
+
+impl NvicRegisters:
+    fn default_() -> NvicRegisters:
+        NvicRegisters(
+            iser_base: 0xE000E100,
+            icer_base: 0xE000E180,
+            ispr_base: 0xE000E200,
+            icpr_base: 0xE000E280,
+            iabr_base: 0xE000E300,
+            ipr_base: 0xE000E400
+        )
+
+# System Control Block (SCB) Registers
+val SCB_AIRCR: u32 = 0xE000ED0C  # Application Interrupt/Reset Control
+val SCB_SHCSR: u32 = 0xE000ED24  # System Handler Control/State
+
+# Initialize NVIC
+fn nvic_init():
+    """Initialize the NVIC with default configuration."""
+    # Disable all interrupts
+    var i: i64 = 0
+    while i < 240:
+        nvic_disable_irq(i)
+        i = i + 1
+
+    # Set default priority for all interrupts
+    i = 0
+    while i < 240:
+        nvic_set_priority(i, 128)  # Mid-priority
+        i = i + 1
+
+    # Configure priority grouping (optional)
+    # nvic_set_priority_grouping(0)  # 0 = all priority, no sub-priority
+
+# Enable an interrupt
+fn nvic_enable_irq(irq: i64):
+    """Enable an external interrupt (IRQ 0-239)."""
+    if irq < 0 or irq >= 240:
+        return
+
+    val reg_idx = irq / 32
+    val bit_idx = irq % 32
+    val nvic = NvicRegisters.default_()
+    val iser_addr = nvic.iser_base + (reg_idx * 4)
+
+    # Set the enable bit
+    # Note: Would use @volatile variable at address in real implementation
+    # unsafe:
+    #     val reg = @address(iser_addr) @volatile var: u32
+    #     reg = reg | (1 << bit_idx)
+    pass
+
+# Disable an interrupt
+fn nvic_disable_irq(irq: i64):
+    """Disable an external interrupt (IRQ 0-239)."""
+    if irq < 0 or irq >= 240:
+        return
+
+    val reg_idx = irq / 32
+    val bit_idx = irq % 32
+    val nvic = NvicRegisters.default_()
+    val icer_addr = nvic.icer_base + (reg_idx * 4)
+
+    # Set the disable bit
+    # unsafe:
+    #     val reg = @address(icer_addr) @volatile var: u32
+    #     reg = reg | (1 << bit_idx)
+    pass
+
+# Set interrupt priority
+fn nvic_set_priority(irq: i64, priority: i64):
+    """Set priority for an interrupt (0 = highest, 255 = lowest)."""
+    if irq < 0 or irq >= 240:
+        return
+
+    val nvic = NvicRegisters.default_()
+    val ipr_addr = nvic.ipr_base + irq
+
+    # Set 8-bit priority value
+    # unsafe:
+    #     val reg = @address(ipr_addr) @volatile var: u8
+    #     reg = priority as u8
+    pass
+
+# Trigger a software interrupt
+fn nvic_set_pending(irq: i64):
+    """Manually trigger an interrupt."""
+    if irq < 0 or irq >= 240:
+        return
+
+    val reg_idx = irq / 32
+    val bit_idx = irq % 32
+    val nvic = NvicRegisters.default_()
+    val ispr_addr = nvic.ispr_base + (reg_idx * 4)
+
+    # Set the pending bit
+    # unsafe:
+    #     val reg = @address(ispr_addr) @volatile var: u32
+    #     reg = reg | (1 << bit_idx)
+    pass
+
+# Clear pending interrupt
+fn nvic_clear_pending(irq: i64):
+    """Clear a pending interrupt."""
+    if irq < 0 or irq >= 240:
+        return
+
+    val reg_idx = irq / 32
+    val bit_idx = irq % 32
+    val nvic = NvicRegisters.default_()
+    val icpr_addr = nvic.icpr_base + (reg_idx * 4)
+
+    # Set the clear-pending bit
+    # unsafe:
+    #     val reg = @address(icpr_addr) @volatile var: u32
+    #     reg = reg | (1 << bit_idx)
+    pass
+
+# Check if interrupt is active
+fn nvic_is_active(irq: i64) -> bool:
+    """Check if an interrupt is currently being serviced."""
+    if irq < 0 or irq >= 240:
+        return false
+
+    val reg_idx = irq / 32
+    val bit_idx = irq % 32
+    val nvic = NvicRegisters.default_()
+    val iabr_addr = nvic.iabr_base + (reg_idx * 4)
+
+    # Read the active bit
+    # unsafe:
+    #     val reg = @address(iabr_addr) @volatile val: u32
+    #     return (reg & (1 << bit_idx)) != 0
+    false
+
+# Set priority grouping
+fn nvic_set_priority_grouping(group: i64):
+    """Configure priority grouping (PRIGROUP field in AIRCR).
+
+    Group values:
+    - 0: 8 bits priority, 0 bits sub-priority
+    - 1: 7 bits priority, 1 bit sub-priority
+    - ...
+    - 7: 1 bit priority, 7 bits sub-priority
+    """
+    val prigroup = (group & 0x7) << 8
+    val vectkey = 0x05FA0000  # AIRCR write key
+
+    # unsafe:
+    #     val aircr = @address(SCB_AIRCR) @volatile var: u32
+    #     aircr = vectkey | prigroup | (aircr & 0x0000FFFF)
+    pass
+
+# Enable fault handlers
+fn nvic_enable_faults():
+    """Enable usage fault, bus fault, and memory management fault."""
+    # unsafe:
+    #     val shcsr = @address(SCB_SHCSR) @volatile var: u32
+    #     shcsr = shcsr | (1 << 18) | (1 << 17) | (1 << 16)
+    pass
+
+# Example vector table definition
+# Would be placed in linker script at 0x00000000 or 0x08000000
+#
+# @repr(C)
+# @align(256)
+# val vector_table: VectorTable = VectorTable(
+#     initial_sp: 0x20010000,  # Top of RAM
+#     reset: reset_handler as u32,
+#     nmi: nmi_handler as u32,
+#     hard_fault: hard_fault_handler as u32,
+#     ...
+# )

@@ -1,0 +1,181 @@
+@allow(unnamed_duplicate_typed_args)
+# x86 Bare-Metal Boot Implementation
+#
+# Multiboot-compliant entry point for bare-metal x86 systems.
+# This is the REAL implementation (not stub) using inline assembly.
+#
+# Memory Layout (after boot):
+#   0x00100000 - Multiboot header + kernel image
+#   0x00110000 - Stack (64KB, grows downward)
+#   0x000B8000 - VGA text buffer
+
+
+# Multiboot header constants (Multiboot Specification v1)
+val MULTIBOOT_MAGIC: u32 = 0x1BADB002
+val MULTIBOOT_PAGE_ALIGN: u32 = 0x00000001
+val MULTIBOOT_MEMORY_INFO: u32 = 0x00000002
+val MULTIBOOT_FLAGS: u32 = 0x00000003  # PAGE_ALIGN | MEMORY_INFO
+
+# Checksum: -(magic + flags) = -(0x1BADB002 + 0x3) = 0xE4524FFB
+val MULTIBOOT_CHECKSUM: u32 = 0xE4524FFB
+
+# Stack configuration
+val STACK_SIZE: u32 = 65536  # 64KB stack
+
+# Global multiboot info storage
+var g_multiboot_magic: u32 = 0
+var g_multiboot_info_ptr: u32 = 0
+
+# Multiboot info structure (simplified)
+# @repr(C)
+@packed
+struct MultibootInfo:
+    flags: u32
+    mem_lower: u32     # KB of lower memory (0-640KB)
+    mem_upper: u32     # KB of upper memory (1MB+)
+    boot_device: u32
+    cmdline: u32
+    mods_count: u32
+    mods_addr: u32
+
+# Multiboot header - placed in .multiboot section
+# @section(".multiboot")
+# @align(4)
+val multiboot_header: [u32; 3] = [
+    MULTIBOOT_MAGIC,
+    MULTIBOOT_FLAGS,
+    MULTIBOOT_CHECKSUM
+]
+
+# Stack buffer - aligned to 16 bytes for x86 ABI
+# @align(16)
+var stack_buffer: [u8; STACK_SIZE]
+
+# Boot entry point
+# Called by bootloader with:
+#   EAX = 0x2BADB002 (magic number)
+#   EBX = physical address of multiboot info structure
+# @entry
+# @naked
+# @noreturn
+fn _start():
+    """Multiboot entry point - inline assembly bootstrap."""
+    unsafe:
+        asm volatile:
+            # Set up stack pointer (grows downward from top)
+            "lea esp, [stack_buffer + {stack_size}]"
+            "mov ebp, esp"
+
+            # Save multiboot info
+            "mov [{magic_ptr}], eax"
+            "mov [{info_ptr}], ebx"
+
+            # Clear direction flag (SysV ABI requirement)
+            "cld"
+
+            # Call Rust/Simple kernel main
+            "push ebx"      # multiboot_info pointer
+            "push eax"      # magic number
+            "call {main}"
+            "add esp, 8"
+
+            # If kernel_main returns, halt
+            "cli"
+            ".Lhalt:"
+            "hlt"
+            "jmp .Lhalt"
+
+            in(reg) STACK_SIZE
+            in(reg) &g_multiboot_magic as u32
+            in(reg) &g_multiboot_info_ptr as u32
+            in(reg) kernel_main_wrapper as u32
+
+# Wrapper to call kernel_main with proper signature
+fn kernel_main_wrapper(magic: u32, info_ptr: u32):
+    boot_init(magic, info_ptr)
+    kernel_main()
+    halt()
+
+# Initialize from multiboot info
+fn boot_init(magic: u32, info_ptr: u32):
+    """Parse multiboot information structure."""
+    g_multiboot_magic = magic
+    g_multiboot_info_ptr = info_ptr
+
+    if magic != 0x2BADB002:
+        # Invalid magic - bootloader didn't load us correctly
+        return
+
+    if info_ptr == 0:
+        return
+
+    # Cast pointer to multiboot info struct
+    unsafe:
+        val info = @address(info_ptr as u64) @volatile val: MultibootInfo
+
+        # Store memory information
+        if info.flags & 0x01:  # mem_* fields valid
+            print "[BOOT] Memory: {info.mem_lower}KB lower, {info.mem_upper}KB upper"
+
+# Get total available memory (in bytes)
+fn get_memory_size() -> u64:
+    """Return total RAM in bytes from multiboot info."""
+    if g_multiboot_info_ptr == 0:
+        return 0
+
+    unsafe:
+        val info = @address(g_multiboot_info_ptr as u64) @volatile val: MultibootInfo
+
+        if info.flags & 0x01:
+            # mem_lower is KB from 0-640KB
+            # mem_upper is KB from 1MB upward
+            val lower = (info.mem_lower as u64) * 1024
+            val upper = (info.mem_upper as u64) * 1024
+            return lower + upper + (1024 * 1024)  # +1MB
+        else:
+            return 0
+
+# Halt the CPU
+# @noreturn
+fn halt():
+    """Disable interrupts and halt forever."""
+    unsafe:
+        asm volatile:
+            "cli"
+            ".Lhalt_loop:"
+            "hlt"
+            "jmp .Lhalt_loop"
+
+# Default kernel main - override this in your kernel
+fn kernel_main():
+    """Default kernel entry point - override this."""
+    print "[KERNEL] Hello from x86 bare-metal!"
+    print "[KERNEL] Memory: {get_memory_size()} bytes"
+    halt()
+
+# VGA text mode utilities
+val VGA_BUFFER: u32 = 0xB8000
+val VGA_WIDTH: u32 = 80
+val VGA_HEIGHT: u32 = 25
+
+fn vga_write_char(x: u32, y: u32, c: u8, color: u8):
+    """Write character to VGA text buffer."""
+    unsafe:
+        val offset = ((y * VGA_WIDTH) + x) * 2
+        val buffer = @address(VGA_BUFFER as u64 + offset as u64) @volatile var: u16
+        buffer = (color as u16) << 8 | (c as u16)
+
+fn vga_clear():
+    """Clear VGA screen to black."""
+    for y in 0..VGA_HEIGHT:
+        for x in 0..VGA_WIDTH:
+            vga_write_char(x, y, ' ' as u8, 0x07)  # Light grey on black
+
+fn vga_write_string(x: u32, y: u32, s: text, color: u8):
+    """Write string to VGA at position."""
+    var offset = 0
+    for c in s:
+        if (x + offset) >= VGA_WIDTH:
+            break
+        vga_write_char(x + offset, y, c as u8, color)
+        offset = offset + 1

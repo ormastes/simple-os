@@ -1,0 +1,109 @@
+# Simple (.spl) replacement for src/baremetal/qemu_runner.sh
+# QEMU Test Runner for Simple Bare-Metal Binaries
+#
+# Usage:
+#   bin/simple src/baremetal/qemu_runner.spl <binary.elf> [--timeout=30]
+#
+# Exit codes:
+#   0 = Success (QEMU exit via port 0xF4 with value 0)
+#   1 = Test failure
+#   124 = Timeout
+#   Other = QEMU error
+
+use std.io.{shell, shell_output, shell_bool, file_exists}
+use std.io_runtime.{get_args, exit}
+use common.text.{contains, starts_with, trim}
+
+fn main():
+    var timeout_secs = 30
+    var binary = ""
+
+    val args = get_args()
+    for i in 0..args.len():
+        val arg = args[i]
+        if starts_with(arg, "--timeout="):
+            val timeout_str = shell_output("echo '" + arg + "' | cut -d= -f2")
+            timeout_secs = int(trim(timeout_str))
+        else:
+            if binary == "":
+                binary = arg
+
+    if binary == "":
+        print "Usage: bin/simple src/baremetal/qemu_runner.spl <binary.elf> [--timeout=N]"
+        exit(1)
+
+    if file_exists(binary) == false:
+        print "Error: Binary not found: " + binary
+        exit(1)
+
+    # Detect architecture from binary
+    val file_info = shell_output("file '" + binary + "' 2>/dev/null")
+    var arch = ""
+    if contains(file_info, "x86-64"):
+        arch = "x86-64"
+    elif contains(file_info, "i386"):
+        arch = "i386"
+    elif contains(file_info, "ARM"):
+        arch = "ARM"
+    elif contains(file_info, "RISC-V"):
+        arch = "RISC-V"
+
+    var qemu = ""
+    if arch == "x86-64":
+        qemu = "qemu-system-x86_64"
+    elif arch == "i386":
+        qemu = "qemu-system-i386"
+    elif arch == "ARM":
+        qemu = "qemu-system-arm"
+    elif arch == "RISC-V":
+        qemu = "qemu-system-riscv32"
+    else:
+        # Default to i386
+        qemu = "qemu-system-i386"
+
+    # Check if QEMU is available
+    if shell_bool("command -v " + qemu) == false:
+        print "Error: " + qemu + " not found"
+        exit(1)
+
+    print "[QEMU] Running: " + binary
+    print "[QEMU] Architecture: " + arch
+    print "[QEMU] Timeout: " + timeout_secs.to_text() + "s"
+    print "[QEMU] Command: " + qemu + " -kernel " + binary + " -serial stdio -display none -device isa-debug-exit,iobase=0xF4,iosize=0x04"
+    print "----------------------------------------"
+
+    # Run QEMU with timeout
+    # Exit code mapping:
+    #   - QEMU exit code when using isa-debug-exit = (value << 1) | 1
+    #   - So value 0 (success) = exit code 1
+    #   - Value 1 (failure) = exit code 3
+    val qemu_cmd = "timeout " + timeout_secs.to_text() + " " + qemu + " -kernel '" + binary + "' -serial stdio -display none -device isa-debug-exit,iobase=0xF4,iosize=0x04 -no-reboot 2>&1"
+    val result = shell(qemu_cmd)
+    val qemu_exit = result.exit_code
+
+    print result.stdout
+
+    print ""
+    print "----------------------------------------"
+
+    # Map QEMU exit code
+    if qemu_exit == 0:
+        # QEMU exited normally (no debug exit)
+        print "[QEMU] Test completed (no exit code)"
+        exit(0)
+    elif qemu_exit == 1:
+        # Debug exit with value 0 (success)
+        print "[QEMU] Test PASSED"
+        exit(0)
+    elif qemu_exit == 3:
+        # Debug exit with value 1 (failure)
+        print "[QEMU] Test FAILED"
+        exit(1)
+    elif qemu_exit == 124:
+        print "[QEMU] Test TIMEOUT after " + timeout_secs.to_text() + "s"
+        exit(124)
+    else:
+        print "[QEMU] QEMU exited with code: " + qemu_exit.to_text()
+        exit(qemu_exit)
+
+main()

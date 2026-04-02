@@ -1,0 +1,743 @@
+# Shell Application — Interactive Command Shell
+#
+# Interactive shell with built-in commands, environment variables,
+# command history, and pipe-like command parsing. Uses Terminal
+# for I/O display and builds its own UISession.
+#
+# MDSOC: feature dimension, shell layer
+
+use common.ui.builder.{column, menubar, statusbar, text_widget, scroll, build_tree, with_flex}
+use common.ui.widget.{WidgetNode, UITree}
+use common.ui.session.{UISession}
+use os.apps.terminal.terminal.{Terminal}
+use os.kernel.types.fs_types.{DirEntry, FsNode, FsNodeKind}
+use os.services.vfs.vfs.{VfsManager}
+use os.tools.tool_registry.{ToolRegistry, ToolEntry}
+use os.userlib.process.{ProcessEntry, list_tasks, signal, kill}
+use os.userlib.fs.{mount, unmount, mount_list}
+use os.userlib.system.{sysinfo, uptime, hostname}
+use os.userlib.log.{read_recent}
+use os.kernel.types.syscall_types.{SignalKind}
+
+# =========================================================================
+# Shell Application
+# =========================================================================
+
+class ShellApp:
+    """Interactive shell with command execution and history.
+
+    Connects to a Terminal for display and a VfsManager for
+    filesystem operations. Provides POSIX-like built-in commands.
+    """
+    terminal: Terminal
+    cwd: text
+    history: [text]
+    history_pos: i32
+    env: [(text, text)]
+    prompt: text
+    running: bool
+    last_exit_code: i32
+    output_lines: [text]
+    vfs: VfsManager?
+    tool_registry: ToolRegistry?
+
+impl ShellApp:
+
+    static fn new() -> ShellApp:
+        """Create a new shell with default 80x24 terminal."""
+        var term = Terminal.new(80, 24)
+        term.write_string("SimpleOS Shell v0.1\n")
+        term.write_string("Type 'help' for available commands.\n\n")
+        return ShellApp(
+            terminal: term,
+            cwd: "/",
+            history: [],
+            history_pos: -1,
+            env: [("HOME", "/"), ("PATH", "/bin:/usr/bin"), ("SHELL", "/bin/sosh")],
+            prompt: "$ ",
+            running: true,
+            last_exit_code: 0,
+            output_lines: [],
+            vfs: nil,
+            tool_registry: nil
+        )
+
+    static fn with_vfs(vfs: VfsManager) -> ShellApp:
+        """Create a shell connected to a VFS manager."""
+        var shell = ShellApp.new()
+        shell.vfs = vfs
+        return shell
+
+    # -- Main Loop -----------------------------------------------------------
+
+    me run():
+        """Main REPL loop. Reads from terminal input, executes, repeats."""
+        self._show_prompt()
+        while self.running:
+            val input = self.terminal.read_input()
+            if input.contains("\n"):
+                val cmd_line = input.trim()
+                if cmd_line != "":
+                    self.history = self.history.push(cmd_line)
+                    self.history_pos = self.history.len()
+                    self.terminal.write_string("\n")
+                    self.execute(cmd_line)
+                else:
+                    self.terminal.write_string("\n")
+                self._show_prompt()
+
+    me _show_prompt():
+        """Display the shell prompt."""
+        val esc = "\u{001b}"
+        self.terminal.write_string("{esc}[32m{self.cwd}{esc}[0m {self.prompt}")
+
+    # -- Command Execution ---------------------------------------------------
+
+    me execute(cmd: text):
+        """Parse and execute a command string."""
+        val argv = self.parse_command(cmd)
+        if argv.len() == 0:
+            return
+
+        val command = argv[0]
+        var args: [text] = []
+        var i = 1
+        while i < argv.len():
+            args = args.push(argv[i])
+            i = i + 1
+
+        match command:
+            "cd":       self.cmd_cd(args)
+            "ls":       self.cmd_ls(args)
+            "pwd":      self.cmd_pwd()
+            "echo":     self.cmd_echo(args)
+            "cat":      self.cmd_cat(args)
+            "mkdir":    self.cmd_mkdir(args)
+            "rm":       self.cmd_rm(args)
+            "cp":       self.cmd_cp(args)
+            "mv":       self.cmd_mv(args)
+            "grep":     self.cmd_grep(args)
+            "find":     self.cmd_find(args)
+            "ps":       self.cmd_ps()
+            "kill":     self.cmd_kill(args)
+            "mount":    self.cmd_mount(args)
+            "clear":    self.cmd_clear()
+            "help":     self.cmd_help()
+            "exit":     self.cmd_exit()
+            "env":      self.cmd_env()
+            "export":   self.cmd_export(args)
+            "history":  self.cmd_history()
+            "hostname": self.cmd_hostname(args)
+            "uptime":   self.cmd_uptime()
+            "dmesg":    self.cmd_dmesg(args)
+            _:
+                # Try tool registry for external commands
+                if self.tool_registry != nil:
+                    val tool = self.tool_registry.lookup(command)
+                    if tool != nil:
+                        self.last_exit_code = tool.run_fn(args)
+                        return
+                self._write_error("sosh: command not found: {command}")
+                self.last_exit_code = 127
+
+    fn parse_command(input: text) -> [text]:
+        """Split command input into argv tokens.
+
+        Handles single and double quotes, backslash escaping.
+        """
+        var tokens: [text] = []
+        var current = ""
+        var in_single_quote = false
+        var in_double_quote = false
+        var escaped = false
+
+        for ch in input:
+            if escaped:
+                current = "{current}{ch}"
+                escaped = false
+            elif ch == "\\":
+                escaped = true
+            elif ch == "'" and not in_double_quote:
+                in_single_quote = not in_single_quote
+            elif ch == "\"" and not in_single_quote:
+                in_double_quote = not in_double_quote
+            elif ch == " " and not in_single_quote and not in_double_quote:
+                if current != "":
+                    tokens = tokens.push(current)
+                    current = ""
+            else:
+                current = "{current}{ch}"
+
+        if current != "":
+            tokens = tokens.push(current)
+        return tokens
+
+    # -- Built-in Commands ---------------------------------------------------
+
+    me cmd_cd(args: [text]):
+        """Change directory."""
+        val target = if args.len() > 0: args[0] else: self._get_env("HOME")
+        val resolved = self._resolve_path(target)
+        # Verify directory exists via VFS if available
+        if self.vfs != nil:
+            val result = self.vfs.stat(resolved)
+            if result.is_err():
+                self._write_error("cd: no such directory: {resolved}")
+                self.last_exit_code = 1
+                return
+        self.cwd = resolved
+        self.last_exit_code = 0
+
+    me cmd_ls(args: [text]):
+        """List directory contents."""
+        val path = if args.len() > 0: self._resolve_path(args[0]) else: self.cwd
+        val show_all = args.contains("-a")
+        val show_long = args.contains("-l")
+
+        if self.vfs != nil:
+            val result = self.vfs.readdir(path)
+            if result.is_err():
+                self._write_error("ls: cannot access '{path}': {result.unwrap_err()}")
+                self.last_exit_code = 1
+                return
+            val entries = result.unwrap()
+            for entry in entries:
+                if not show_all and entry.name.starts_with("."):
+                    pass_dn
+                else:
+                    if show_long:
+                        val kind_str = match entry.node.kind:
+                            FsNodeKind.Directory => "d"
+                            FsNodeKind.Symlink => "l"
+                            FsNodeKind.Device => "c"
+                            FsNodeKind.Pipe => "p"
+                            _ => "-"
+                        self._write_line("{kind_str}  {entry.node.size}  {entry.name}")
+                    else:
+                        self._write_inline("{entry.name}  ")
+            if not show_long:
+                self.terminal.write_string("\n")
+        else:
+            self._write_line("(no filesystem mounted)")
+        self.last_exit_code = 0
+
+    me cmd_pwd():
+        """Print working directory."""
+        self._write_line(self.cwd)
+        self.last_exit_code = 0
+
+    me cmd_echo(args: [text]):
+        """Echo arguments to terminal."""
+        var output = ""
+        var i = 0
+        for arg in args:
+            if i > 0:
+                output = "{output} "
+            # Expand environment variables ($VAR)
+            output = "{output}{self._expand_vars(arg)}"
+            i = i + 1
+        self._write_line(output)
+        self.last_exit_code = 0
+
+    me cmd_cat(args: [text]):
+        """Display file contents."""
+        if args.len() == 0:
+            self._write_error("cat: missing file operand")
+            self.last_exit_code = 1
+            return
+        for filename in args:
+            val path = self._resolve_path(filename)
+            if self.vfs != nil:
+                val result = self.vfs.read(path)
+                if result.is_err():
+                    self._write_error("cat: {path}: {result.unwrap_err()}")
+                    self.last_exit_code = 1
+                else:
+                    self._write_line(result.unwrap())
+            else:
+                self._write_error("cat: no filesystem mounted")
+                self.last_exit_code = 1
+
+    me cmd_mkdir(args: [text]):
+        """Create a directory."""
+        if args.len() == 0:
+            self._write_error("mkdir: missing operand")
+            self.last_exit_code = 1
+            return
+        for dirname in args:
+            val path = self._resolve_path(dirname)
+            if self.vfs != nil:
+                val result = self.vfs.mkdir(path)
+                if result.is_err():
+                    self._write_error("mkdir: {result.unwrap_err()}")
+                    self.last_exit_code = 1
+            else:
+                self._write_error("mkdir: no filesystem mounted")
+                self.last_exit_code = 1
+        self.last_exit_code = 0
+
+    me cmd_rm(args: [text]):
+        """Remove files."""
+        if args.len() == 0:
+            self._write_error("rm: missing operand")
+            self.last_exit_code = 1
+            return
+        for filename in args:
+            val path = self._resolve_path(filename)
+            if self.vfs != nil:
+                val result = self.vfs.remove(path)
+                if result.is_err():
+                    self._write_error("rm: {result.unwrap_err()}")
+                    self.last_exit_code = 1
+            else:
+                self._write_error("rm: no filesystem mounted")
+                self.last_exit_code = 1
+        self.last_exit_code = 0
+
+    me cmd_cp(args: [text]):
+        """Copy files."""
+        if args.len() < 2:
+            self._write_error("cp: missing operand")
+            self.last_exit_code = 1
+            return
+        val src = self._resolve_path(args[0])
+        val dst = self._resolve_path(args[1])
+        if self.vfs != nil:
+            val read_result = self.vfs.read(src)
+            if read_result.is_err():
+                self._write_error("cp: {read_result.unwrap_err()}")
+                self.last_exit_code = 1
+                return
+            val write_result = self.vfs.write(dst, read_result.unwrap())
+            if write_result.is_err():
+                self._write_error("cp: {write_result.unwrap_err()}")
+                self.last_exit_code = 1
+        else:
+            self._write_error("cp: no filesystem mounted")
+            self.last_exit_code = 1
+
+    me cmd_mv(args: [text]):
+        """Move/rename files."""
+        if args.len() < 2:
+            self._write_error("mv: missing operand")
+            self.last_exit_code = 1
+            return
+        val src = self._resolve_path(args[0])
+        val dst = self._resolve_path(args[1])
+        if self.vfs != nil:
+            val rename_result = self.vfs.rename(src, dst)
+            if rename_result.is_err():
+                self._write_error("mv: {rename_result.unwrap_err()}")
+                self.last_exit_code = 1
+        else:
+            self._write_error("mv: no filesystem mounted")
+            self.last_exit_code = 1
+
+    me cmd_grep(args: [text]):
+        """Search for pattern in files."""
+        if args.len() < 2:
+            self._write_error("grep: usage: grep PATTERN FILE...")
+            self.last_exit_code = 1
+            return
+        val pattern = args[0]
+        var i = 1
+        while i < args.len():
+            val path = self._resolve_path(args[i])
+            if self.vfs != nil:
+                val result = self.vfs.read(path)
+                if result.is_ok():
+                    val content = result.unwrap()
+                    var line_num = 1
+                    for line in content.split("\n"):
+                        if line.contains(pattern):
+                            self._write_line("{args[i]}:{line_num}:{line}")
+                        line_num = line_num + 1
+                else:
+                    self._write_error("grep: {path}: {result.unwrap_err()}")
+            i = i + 1
+        self.last_exit_code = 0
+
+    me cmd_find(args: [text]):
+        """Find files by name."""
+        val start_path = if args.len() > 0: self._resolve_path(args[0]) else: self.cwd
+        val name_pattern = if args.len() > 2 and args[1] == "-name": args[2] else: "*"
+        if self.vfs != nil:
+            self._find_recursive(start_path, name_pattern)
+        else:
+            self._write_error("find: no filesystem mounted")
+            self.last_exit_code = 1
+
+    me _find_recursive(path: text, pattern: text):
+        """Recursively find files matching a pattern."""
+        if self.vfs == nil:
+            return
+        val result = self.vfs.readdir(path)
+        if result.is_err():
+            return
+        val entries = result.unwrap()
+        for entry in entries:
+            val full_path = if path == "/": "/{entry.name}" else: "{path}/{entry.name}"
+            if pattern == "*" or entry.name.contains(pattern):
+                self._write_line(full_path)
+            if entry.node.kind == FsNodeKind.Directory:
+                self._find_recursive(full_path, pattern)
+
+    me cmd_ps():
+        """List running processes from the scheduler."""
+        val result = list_tasks()
+        if result.is_err():
+            self._write_error("ps: {result.unwrap_err()}")
+            self.last_exit_code = 1
+            return
+        val tasks = result.unwrap()
+        self._write_line("  PID  STATE     PRIORITY  NAME")
+        for task in tasks:
+            val state_str = match task.state:
+                case 0: "Ready   "
+                case 1: "Running "
+                case 2: "Blocked "
+                case 3: "Zombie  "
+                case _: "Unknown "
+            val prio_str = match task.priority:
+                case 0: "RT    "
+                case 1: "High  "
+                case 2: "Normal"
+                case 3: "Low   "
+                case 4: "Idle  "
+                case _: "?     "
+            self._write_line("  {task.pid}  {state_str}  {prio_str}  {task.name}")
+        self.last_exit_code = 0
+
+    me cmd_kill(args: [text]):
+        """Send signal to a process."""
+        if args.len() == 0:
+            self._write_error("kill: missing PID")
+            self.last_exit_code = 1
+            return
+        # Parse optional signal flag
+        var sig = SignalKind.Term
+        var pid_str = args[0]
+        if args[0].starts_with("-"):
+            val flag = args[0].slice(1, args[0].len())
+            sig = match flag:
+                "TERM": SignalKind.Term
+                "KILL": SignalKind.Kill
+                "STOP": SignalKind.Stop
+                "CONT": SignalKind.Cont
+                "INT":  SignalKind.Int
+                _:      SignalKind.Term
+            if args.len() < 2:
+                self._write_error("kill: missing PID")
+                self.last_exit_code = 1
+                return
+            pid_str = args[1]
+        val pid = _parse_u64(pid_str)
+        if pid == 0:
+            self._write_error("kill: invalid PID: {pid_str}")
+            self.last_exit_code = 1
+            return
+        val result = signal(pid, sig)
+        if result.is_err():
+            self._write_error("kill: {result.unwrap_err()}")
+            self.last_exit_code = 1
+        else:
+            self.last_exit_code = 0
+
+    me cmd_mount(args: [text]):
+        """Show or add mount points."""
+        if args.len() == 0:
+            # Show current mounts
+            val result = mount_list()
+            if result.is_err():
+                self._write_error("mount: {result.unwrap_err()}")
+                self.last_exit_code = 1
+            else:
+                val mounts = result.unwrap()
+                for m in mounts:
+                    self._write_line(m)
+                self.last_exit_code = 0
+            return
+        if args.len() < 2:
+            self._write_error("mount: usage: mount DEVICE MOUNTPOINT [FSTYPE]")
+            self.last_exit_code = 1
+            return
+        val device = args[0]
+        val mount_path = args[1]
+        val fs_type = if args.len() > 2: args[2] else: "fat32"
+        val result = mount(device, mount_path, fs_type)
+        if result.is_err():
+            self._write_error("mount: {result.unwrap_err()}")
+            self.last_exit_code = 1
+        else:
+            self._write_line("mount: mounted {device} on {mount_path} (type {fs_type})")
+            self.last_exit_code = 0
+
+    me cmd_clear():
+        """Clear the terminal screen."""
+        self.terminal.clear()
+        self.last_exit_code = 0
+
+    me cmd_help():
+        """Display help for built-in commands."""
+        self._write_line("SimpleOS Shell Built-in Commands:")
+        self._write_line("")
+        self._write_line("  cd DIR        Change directory")
+        self._write_line("  ls [-a] [-l]  List directory contents")
+        self._write_line("  pwd           Print working directory")
+        self._write_line("  echo ARGS     Print arguments")
+        self._write_line("  cat FILE      Display file contents")
+        self._write_line("  mkdir DIR     Create directory")
+        self._write_line("  rm FILE       Remove file")
+        self._write_line("  cp SRC DST    Copy file")
+        self._write_line("  mv SRC DST    Move/rename file")
+        self._write_line("  grep PAT FILE Search in file")
+        self._write_line("  find DIR      Find files")
+        self._write_line("  ps            List processes")
+        self._write_line("  kill PID      Send signal to process")
+        self._write_line("  mount         Show/add mount points")
+        self._write_line("  env           Show environment variables")
+        self._write_line("  export K=V    Set environment variable")
+        self._write_line("  history       Show command history")
+        self._write_line("  hostname      Show hostname")
+        self._write_line("  uptime        Show system uptime")
+        self._write_line("  dmesg [N]     Show kernel log (last N entries)")
+        self._write_line("  clear         Clear screen")
+        self._write_line("  help          Show this help")
+        self._write_line("  exit          Exit shell")
+        self.last_exit_code = 0
+
+    me cmd_exit():
+        """Exit the shell."""
+        self.running = false
+        self._write_line("logout")
+
+    me cmd_env():
+        """Display all environment variables."""
+        for pair in self.env:
+            self._write_line("{pair.0}={pair.1}")
+        self.last_exit_code = 0
+
+    me cmd_export(args: [text]):
+        """Set an environment variable: export KEY=VALUE."""
+        for arg in args:
+            val eq_pos = _find_char(arg, "=")
+            if eq_pos >= 0:
+                val key = arg.slice(0, eq_pos)
+                val value = arg.slice(eq_pos + 1, arg.len())
+                self._set_env(key, value)
+            else:
+                self._write_error("export: invalid format, use KEY=VALUE")
+                self.last_exit_code = 1
+
+    me cmd_history():
+        """Display command history."""
+        var i = 0
+        for cmd in self.history:
+            self._write_line("  {i + 1}  {cmd}")
+            i = i + 1
+        self.last_exit_code = 0
+
+    me cmd_hostname(args: [text]):
+        """Display or set hostname."""
+        if args.len() == 0:
+            val result = hostname()
+            if result.is_err():
+                self._write_error("hostname: {result.unwrap_err()}")
+                self.last_exit_code = 1
+            else:
+                self._write_line(result.unwrap())
+                self.last_exit_code = 0
+        else:
+            self._write_error("hostname: setting hostname not supported from shell")
+            self.last_exit_code = 1
+
+    me cmd_uptime():
+        """Display system uptime."""
+        val result = uptime()
+        if result.is_err():
+            self._write_error("uptime: {result.unwrap_err()}")
+            self.last_exit_code = 1
+            return
+        val ns = result.unwrap()
+        val seconds = ns / 1000000000
+        val hours = seconds / 3600
+        val minutes = (seconds % 3600) / 60
+        val secs = seconds % 60
+        self._write_line("up {hours}h {minutes}m {secs}s")
+        self.last_exit_code = 0
+
+    me cmd_dmesg(args: [text]):
+        """Display kernel log messages."""
+        val count: u32 = if args.len() > 0: _parse_u64(args[0]).to_u32() else: 50
+        val result = read_recent(count)
+        if result.is_err():
+            self._write_error("dmesg: {result.unwrap_err()}")
+            self.last_exit_code = 1
+            return
+        val entries = result.unwrap()
+        for entry in entries:
+            self._write_line("[{entry.timestamp_ns}] {entry.message}")
+        self.last_exit_code = 0
+
+    # -- Output Helpers ------------------------------------------------------
+
+    me _write_line(line: text):
+        """Write a line to the terminal with newline."""
+        self.terminal.write_string("{line}\n")
+        self.output_lines = self.output_lines.push(line)
+
+    me _write_inline(s: text):
+        """Write text to the terminal without newline."""
+        self.terminal.write_string(s)
+
+    me _write_error(msg: text):
+        """Write an error message in red."""
+        val esc = "\u{001b}"
+        self.terminal.write_string("{esc}[31m{msg}{esc}[0m\n")
+
+    # -- Environment ---------------------------------------------------------
+
+    fn _get_env(key: text) -> text:
+        """Get an environment variable value."""
+        for pair in self.env:
+            if pair.0 == key:
+                return pair.1
+        return ""
+
+    me _set_env(key: text, value: text):
+        """Set an environment variable."""
+        var new_env: [(text, text)] = []
+        var found = false
+        for pair in self.env:
+            if pair.0 == key:
+                new_env = new_env.push((key, value))
+                found = true
+            else:
+                new_env = new_env.push(pair)
+        if not found:
+            new_env = new_env.push((key, value))
+        self.env = new_env
+
+    fn _expand_vars(s: text) -> text:
+        """Expand $VAR references in a string."""
+        var result = ""
+        var in_var = false
+        var var_name = ""
+        for ch in s:
+            if in_var:
+                if ch >= "A" and ch <= "Z" or ch >= "a" and ch <= "z" or ch == "_" or ch >= "0" and ch <= "9":
+                    var_name = "{var_name}{ch}"
+                else:
+                    result = "{result}{self._get_env(var_name)}{ch}"
+                    in_var = false
+                    var_name = ""
+            elif ch == "$":
+                in_var = true
+                var_name = ""
+            else:
+                result = "{result}{ch}"
+        if in_var:
+            result = "{result}{self._get_env(var_name)}"
+        return result
+
+    # -- Path Resolution -----------------------------------------------------
+
+    fn _resolve_path(path: text) -> text:
+        """Resolve a relative path against cwd."""
+        if path.starts_with("/"):
+            return _normalize_path(path)
+        if path == "~":
+            return self._get_env("HOME")
+        if path.starts_with("~/"):
+            return "{self._get_env("HOME")}{path.slice(1, path.len())}"
+        if path == "..":
+            return _parent_path(self.cwd)
+        if path == ".":
+            return self.cwd
+        val full = if self.cwd == "/": "/{path}" else: "{self.cwd}/{path}"
+        return _normalize_path(full)
+
+    # -- UI Construction -----------------------------------------------------
+
+    fn build_ui() -> UISession:
+        """Build the shell UI.
+
+        Delegates to the terminal's build_ui with shell-specific status.
+        """
+        return self.terminal.build_ui()
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn _find_char(s: text, target: text) -> i32:
+    """Find first occurrence of a character in a string. Returns -1 if not found."""
+    var i = 0
+    for ch in s:
+        if ch == target:
+            return i
+        i = i + 1
+    return -1
+
+fn _normalize_path(path: text) -> text:
+    """Normalize a path by resolving . and .. components."""
+    var parts: [text] = []
+    var current = ""
+    for ch in path:
+        if ch == "/":
+            if current == "..":
+                if parts.len() > 0:
+                    var new_parts: [text] = []
+                    var j = 0
+                    while j < parts.len() - 1:
+                        new_parts = new_parts.push(parts[j])
+                        j = j + 1
+                    parts = new_parts
+            elif current != "." and current != "":
+                parts = parts.push(current)
+            current = ""
+        else:
+            current = "{current}{ch}"
+    # Handle trailing component
+    if current == "..":
+        if parts.len() > 0:
+            var new_parts: [text] = []
+            var j = 0
+            while j < parts.len() - 1:
+                new_parts = new_parts.push(parts[j])
+                j = j + 1
+            parts = new_parts
+    elif current != "." and current != "":
+        parts = parts.push(current)
+
+    if parts.len() == 0:
+        return "/"
+    var result = ""
+    for part in parts:
+        result = "{result}/{part}"
+    return result
+
+fn _parse_u64(s: text) -> u64:
+    """Parse a u64 from text, returning 0 on failure."""
+    var result: u64 = 0
+    for ch in s:
+        if ch >= "0" and ch <= "9":
+            val digit = ch.to_i32() - "0".to_i32()
+            result = result * 10 + digit.to_u64()
+        else:
+            return 0
+    return result
+
+fn _parent_path(path: text) -> text:
+    """Get the parent directory of a path."""
+    if path == "/":
+        return "/"
+    var last_slash = 0
+    var i = 0
+    for ch in path:
+        if ch == "/":
+            last_slash = i
+        i = i + 1
+    if last_slash == 0:
+        return "/"
+    return path.slice(0, last_slash)

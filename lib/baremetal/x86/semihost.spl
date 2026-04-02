@@ -1,0 +1,248 @@
+@allow(unnamed_duplicate_typed_args)
+@allow(primitive_api)
+# x86 Semihosting Implementation (QEMU)
+#
+# Provides semihosting support for x86 processors running in QEMU.
+# Uses serial port (COM1) for output and ISA debug exit device for exit.
+#
+# QEMU options required:
+#   -serial stdio                    # Route COM1 to host stdout
+#   -device isa-debug-exit,iobase=0xF4,iosize=0x04  # Debug exit device
+#
+# Note: Unlike ARM/RISC-V, x86 doesn't have standardized semihosting.
+# This implementation uses a custom binary protocol over serial.
+
+use std.baremetal.x86.io.{outb, inb}
+
+# ============================================================================
+# x86 Port I/O Constants
+# ============================================================================
+
+# COM1 Serial Port
+val COM1_DATA: i32 = 0x3F8          # Data register (read/write)
+val COM1_IER: i32 = 0x3F9           # Interrupt Enable Register
+val COM1_FCR: i32 = 0x3FA           # FIFO Control Register
+val COM1_LCR: i32 = 0x3FB           # Line Control Register
+val COM1_MCR: i32 = 0x3FC           # Modem Control Register
+val COM1_LSR: i32 = 0x3FD           # Line Status Register
+
+# ISA Debug Exit (QEMU)
+val DEBUG_EXIT_PORT: i32 = 0xF4     # QEMU debug exit port
+
+# Serial protocol markers
+val PROTO_MAGIC: i32 = 0xAB         # Protocol start marker
+val PROTO_VERSION: i32 = 0x01       # Protocol version
+
+# ============================================================================
+# Helper: Get param count for operation
+# ============================================================================
+
+fn get_param_count(op: i32) -> i32:
+    if op == 0x100:
+        0  # SYS_WRITE_HANDLE - no params
+    elif op == 0x101:
+        1  # SYS_WRITE_HANDLE_P1 - 1 param
+    elif op == 0x102:
+        2  # SYS_WRITE_HANDLE_P2 - 2 params
+    elif op == 0x103:
+        3  # SYS_WRITE_HANDLE_P3 - 3 params
+    else:
+        0
+
+# ============================================================================
+# x86 Semihosting Call Implementation
+# ============================================================================
+
+# Semihosting call with simple arguments
+fn arch_semi_host_call(op: i32, arg0: i32, arg1: i32) -> i32:
+    # SYS_EXIT
+    if op == 0x18:
+        qemu_exit(arg0)
+        0
+    # SYS_EXIT_EXTENDED
+    elif op == 0x20:
+        qemu_exit(arg1)
+        0
+    # Simple extension ops (interned print)
+    elif op >= 0x100 and op <= 0x104:
+        serial_send_semihost(op, arg0, arg1)
+        0
+    else:
+        # Other operations not supported in QEMU
+        -1
+
+# Semihosting call with parameter block
+fn arch_semi_host_call_block(op: i32, arg0: i32, block_ptr: i32) -> i32:
+    # SYS_EXIT
+    if op == 0x18:
+        qemu_exit(0)
+        0
+    # SYS_EXIT_EXTENDED
+    elif op == 0x20:
+        # Would read exit code from param block
+        qemu_exit(0)
+        0
+    # Simple extension ops
+    elif op >= 0x100 and op <= 0x104:
+        serial_send_semihost_block(op, arg0, block_ptr)
+        0
+    else:
+        -1
+
+# ============================================================================
+# QEMU ISA Debug Exit
+# ============================================================================
+
+# Exit QEMU with status code
+# Note: QEMU exit code = (code << 1) | 1
+# So 0 becomes 1, 1 becomes 3, etc.
+fn qemu_exit(code: i32):
+    outb(DEBUG_EXIT_PORT, code)
+    # If we get here, debug exit device not enabled
+    # In real implementation: while true { hlt }
+    print "[QEMU_EXIT] code={code}"
+
+# ============================================================================
+# Serial Port Initialization
+# ============================================================================
+
+# Initialize COM1 for 115200 baud, 8N1
+fn serial_init():
+    # Disable interrupts
+    outb(COM1_IER, 0x00)
+
+    # Enable DLAB (set baud rate divisor)
+    outb(COM1_LCR, 0x80)
+
+    # Set divisor to 1 (115200 baud with 1.8432 MHz crystal)
+    outb(COM1_DATA, 0x01)     # Divisor low byte
+    outb(COM1_IER, 0x00)      # Divisor high byte
+
+    # 8 bits, no parity, one stop bit
+    outb(COM1_LCR, 0x03)
+
+    # Enable FIFO, clear them, with 14-byte threshold
+    outb(COM1_FCR, 0xC7)
+
+    # IRQs enabled, RTS/DSR set
+    outb(COM1_MCR, 0x0B)
+
+# Check if transmit buffer is empty
+fn serial_is_transmit_empty() -> bool:
+    (inb(COM1_LSR) & 0x20) != 0
+
+# Write byte to serial port (blocking)
+fn serial_write_byte(b: i32):
+    while not serial_is_transmit_empty():
+        pass
+    outb(COM1_DATA, b)
+
+# ============================================================================
+# Serial Semihosting Protocol
+# ============================================================================
+
+# Binary protocol format for semihosting over serial:
+#
+# [Magic:1][Version:1][Op:4][Length:4][Payload:N]
+#
+# For interned print (SYS_WRITE_HANDLE*):
+#   Payload = handle (4 bytes) + params (8 bytes each)
+
+fn serial_send_semihost(op: i32, arg0: i32, arg1: i32):
+    val param_count = get_param_count(op)
+    val payload_len = 4 + param_count * 8  # handle + params
+
+    # Send header
+    serial_write_byte(PROTO_MAGIC)
+    serial_write_byte(PROTO_VERSION)
+    serial_write_u32(op)
+    serial_write_u32(payload_len)
+
+    # Send handle
+    serial_write_u32(arg0)
+
+    # Send first param if needed
+    if param_count >= 1:
+        serial_write_i64(arg1)
+
+fn serial_send_semihost_block(op: i32, handle: i32, block_ptr: i32):
+    val param_count = get_param_count(op)
+    val payload_len = 4 + param_count * 8
+
+    # Send header
+    serial_write_byte(PROTO_MAGIC)
+    serial_write_byte(PROTO_VERSION)
+    serial_write_u32(op)
+    serial_write_u32(payload_len)
+
+    # Send handle
+    serial_write_u32(handle)
+
+    # Note: Would read params from block_ptr in real implementation
+
+# Write 32-bit value (little-endian)
+fn serial_write_u32(v: i32):
+    serial_write_byte(v & 0xFF)
+    serial_write_byte((v >> 8) & 0xFF)
+    serial_write_byte((v >> 16) & 0xFF)
+    serial_write_byte((v >> 24) & 0xFF)
+
+# Write 64-bit value (little-endian)
+fn serial_write_i64(v: i64):
+    val low = (v & 0xFFFFFFFF) as i32
+    val high = ((v >> 32) & 0xFFFFFFFF) as i32
+    serial_write_u32(low)
+    serial_write_u32(high)
+
+# ============================================================================
+# Legacy Character Output (Fallback)
+# ============================================================================
+
+# Write single character (bypassing protocol)
+# Useful for panic messages or early boot
+fn semi_writec(c: i32):
+    serial_write_byte(c)
+
+# ============================================================================
+# VGA Text Mode Output (Alternative)
+# ============================================================================
+
+# VGA text buffer address
+val VGA_BUFFER: i64 = 0xB8000
+
+# VGA colors
+val VGA_BLACK: i32 = 0
+val VGA_WHITE: i32 = 15
+val VGA_DEFAULT_COLOR: i32 = (VGA_BLACK * 16) + VGA_WHITE
+
+# Current cursor position
+var vga_row: i32 = 0
+var vga_col: i32 = 0
+
+# Write character to VGA text buffer (stub - requires raw pointer support)
+fn vga_putchar(c: i32):
+    if c == 0x0A:  # Newline
+        vga_row = vga_row + 1
+        vga_col = 0
+        if vga_row >= 25:
+            vga_scroll()
+        return
+
+    # Calculate offset and write to VGA buffer
+    # Note: actual implementation requires raw pointer support
+    val offset = (vga_row * 80 + vga_col) * 2
+    # Would write: *(VGA_BUFFER + offset) = c
+    # Would write: *(VGA_BUFFER + offset + 1) = VGA_DEFAULT_COLOR
+
+    vga_col = vga_col + 1
+    if vga_col >= 80:
+        vga_col = 0
+        vga_row = vga_row + 1
+        if vga_row >= 25:
+            vga_scroll()
+
+# Scroll VGA buffer up one line (stub)
+fn vga_scroll():
+    # Would copy lines 1-24 to 0-23
+    # Would clear last line
+    vga_row = 24

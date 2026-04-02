@@ -1,0 +1,568 @@
+# Text Editor — Modal Editor (vi-like)
+#
+# Modal text editor with Normal, Insert, and Command modes.
+# Supports basic vi keybindings (h/j/k/l navigation, i/a/o insert,
+# dd/yy/p editing, :w/:q commands). Renders as a widget tree
+# using the existing UI builder DSL.
+#
+# MDSOC: feature dimension, editor layer
+
+use common.ui.builder.{column, row, menubar, statusbar, text_widget, scroll, build_tree, build_tree_with_title, with_flex}
+use common.ui.widget.{WidgetNode, UITree, UIEvent}
+use common.ui.session.{UISession}
+use os.services.vfs.vfs.{VfsManager}
+
+# =========================================================================
+# Editor Mode
+# =========================================================================
+
+enum EditorMode:
+    """Editing mode (vi-like)."""
+    Normal
+    Insert
+    Command
+
+fn mode_name(mode: EditorMode) -> text:
+    """Human-readable mode name."""
+    match mode:
+        EditorMode.Normal => "NORMAL"
+        EditorMode.Insert => "INSERT"
+        EditorMode.Command => "COMMAND"
+
+# =========================================================================
+# Text Editor
+# =========================================================================
+
+class TextEditor:
+    """Modal text editor with vi-like keybindings.
+
+    Manages file content as a list of lines, cursor position,
+    scroll offset, and undo/yank buffers.
+    """
+    lines: [text]
+    cursor_row: i32
+    cursor_col: i32
+    scroll_row: i32
+    file_path: text?
+    modified: bool
+    mode: EditorMode
+    command_buffer: text
+    yank_buffer: [text]
+    status_message: text
+    visible_rows: i32
+    visible_cols: i32
+    vfs: VfsManager?
+
+impl TextEditor:
+
+    static fn new() -> TextEditor:
+        """Create a new empty editor."""
+        return TextEditor(
+            lines: [""],
+            cursor_row: 0,
+            cursor_col: 0,
+            scroll_row: 0,
+            file_path: nil,
+            modified: false,
+            mode: EditorMode.Normal,
+            command_buffer: "",
+            yank_buffer: [],
+            status_message: "Ready",
+            visible_rows: 20,
+            visible_cols: 80,
+            vfs: nil
+        )
+
+    static fn with_vfs(vfs: VfsManager) -> TextEditor:
+        """Create an editor connected to a VFS."""
+        var ed = TextEditor.new()
+        ed.vfs = vfs
+        return ed
+
+    # -- File Operations -----------------------------------------------------
+
+    me open_file(path: text) -> Result<bool, text>:
+        """Open a file for editing."""
+        if self.vfs == nil:
+            return Result.Err("no filesystem available")
+        val result = self.vfs.read(path)
+        if result.is_err():
+            return Result.Err("cannot open: {result.unwrap_err()}")
+        val content = result.unwrap()
+        self.lines = _split_lines(content)
+        if self.lines.len() == 0:
+            self.lines = [""]
+        self.file_path = path
+        self.cursor_row = 0
+        self.cursor_col = 0
+        self.scroll_row = 0
+        self.modified = false
+        self.status_message = "Opened {path}"
+        return Result.Ok(true)
+
+    me save_file() -> Result<bool, text>:
+        """Save the current file."""
+        if self.vfs == nil:
+            return Result.Err("no filesystem available")
+        if self.file_path == nil:
+            return Result.Err("no file name")
+        val content = self.lines.join("\n")
+        val result = self.vfs.write(self.file_path, content)
+        if result.is_err():
+            return Result.Err("cannot save: {result.unwrap_err()}")
+        self.modified = false
+        self.status_message = "Saved {self.file_path}"
+        return Result.Ok(true)
+
+    me save_as(path: text) -> Result<bool, text>:
+        """Save the file to a new path."""
+        self.file_path = path
+        return self.save_file()
+
+    # -- Text Editing --------------------------------------------------------
+
+    me insert_char(ch: text):
+        """Insert a character at cursor position."""
+        if self.cursor_row >= self.lines.len():
+            return
+        val line = self.lines[self.cursor_row]
+        val before = line.slice(0, self.cursor_col)
+        val after = line.slice(self.cursor_col, line.len())
+        self.lines[self.cursor_row] = "{before}{ch}{after}"
+        self.cursor_col = self.cursor_col + 1
+        self.modified = true
+
+    me delete_char():
+        """Delete the character at cursor position."""
+        if self.cursor_row >= self.lines.len():
+            return
+        val line = self.lines[self.cursor_row]
+        if self.cursor_col >= line.len():
+            # Join with next line
+            if self.cursor_row < self.lines.len() - 1:
+                val next_line = self.lines[self.cursor_row + 1]
+                self.lines[self.cursor_row] = "{line}{next_line}"
+                self._remove_line(self.cursor_row + 1)
+                self.modified = true
+            return
+        val before = line.slice(0, self.cursor_col)
+        val after = line.slice(self.cursor_col + 1, line.len())
+        self.lines[self.cursor_row] = "{before}{after}"
+        self.modified = true
+
+    me delete_char_before():
+        """Delete the character before cursor (backspace)."""
+        if self.cursor_col > 0:
+            self.cursor_col = self.cursor_col - 1
+            self.delete_char()
+        elif self.cursor_row > 0:
+            # Join with previous line
+            val prev_line = self.lines[self.cursor_row - 1]
+            val current_line = self.lines[self.cursor_row]
+            self.cursor_col = prev_line.len()
+            self.lines[self.cursor_row - 1] = "{prev_line}{current_line}"
+            self._remove_line(self.cursor_row)
+            self.cursor_row = self.cursor_row - 1
+            self.modified = true
+
+    me newline():
+        """Insert a newline at cursor, splitting the current line."""
+        if self.cursor_row >= self.lines.len():
+            return
+        val line = self.lines[self.cursor_row]
+        val before = line.slice(0, self.cursor_col)
+        val after = line.slice(self.cursor_col, line.len())
+        self.lines[self.cursor_row] = before
+        self._insert_line(self.cursor_row + 1, after)
+        self.cursor_row = self.cursor_row + 1
+        self.cursor_col = 0
+        self.modified = true
+
+    me _remove_line(index: i32):
+        """Remove a line at the given index."""
+        var new_lines: [text] = []
+        var i = 0
+        for line in self.lines:
+            if i != index:
+                new_lines = new_lines.push(line)
+            i = i + 1
+        self.lines = new_lines
+
+    me _insert_line(index: i32, line_text: text):
+        """Insert a line at the given index."""
+        var new_lines: [text] = []
+        var i = 0
+        var inserted = false
+        for line in self.lines:
+            if i == index:
+                new_lines = new_lines.push(line_text)
+                inserted = true
+            new_lines = new_lines.push(line)
+            i = i + 1
+        if not inserted:
+            new_lines = new_lines.push(line_text)
+        self.lines = new_lines
+
+    # -- Key Handling --------------------------------------------------------
+
+    me handle_normal_key(key: text):
+        """Handle a key press in Normal mode (vi keybindings)."""
+        match key:
+            # Movement
+            "h":
+                if self.cursor_col > 0:
+                    self.cursor_col = self.cursor_col - 1
+            "l":
+                val line_len = self._current_line_len()
+                if self.cursor_col < line_len - 1:
+                    self.cursor_col = self.cursor_col + 1
+            "j":
+                if self.cursor_row < self.lines.len() - 1:
+                    self.cursor_row = self.cursor_row + 1
+                    self._clamp_col()
+            "k":
+                if self.cursor_row > 0:
+                    self.cursor_row = self.cursor_row - 1
+                    self._clamp_col()
+            "0":
+                self.cursor_col = 0
+            "$":
+                self.cursor_col = self._current_line_len()
+            "w":
+                self._move_word_forward()
+            "b":
+                self._move_word_backward()
+            "G":
+                self.cursor_row = self.lines.len() - 1
+                self._clamp_col()
+            # Mode switching
+            "i":
+                self.mode = EditorMode.Insert
+                self.status_message = "-- INSERT --"
+            "a":
+                self.cursor_col = self.cursor_col + 1
+                self.mode = EditorMode.Insert
+                self.status_message = "-- INSERT --"
+            "o":
+                self._insert_line(self.cursor_row + 1, "")
+                self.cursor_row = self.cursor_row + 1
+                self.cursor_col = 0
+                self.mode = EditorMode.Insert
+                self.modified = true
+                self.status_message = "-- INSERT --"
+            "O":
+                self._insert_line(self.cursor_row, "")
+                self.cursor_col = 0
+                self.mode = EditorMode.Insert
+                self.modified = true
+                self.status_message = "-- INSERT --"
+            # Editing
+            "x":
+                self.delete_char()
+            "d":
+                # dd: delete line (simplified, awaits second 'd')
+                self._delete_line()
+            "y":
+                # yy: yank line (simplified)
+                self._yank_line()
+            "p":
+                self._paste_below()
+            "u":
+                self.status_message = "undo not yet implemented"
+            # Command mode
+            ":":
+                self.mode = EditorMode.Command
+                self.command_buffer = ""
+                self.status_message = ":"
+            _:
+                pass_dn
+        self._ensure_scroll()
+
+    me handle_insert_key(key: text):
+        """Handle a key press in Insert mode."""
+        match key:
+            "escape":
+                self.mode = EditorMode.Normal
+                if self.cursor_col > 0:
+                    self.cursor_col = self.cursor_col - 1
+                self.status_message = ""
+            "enter":
+                self.newline()
+            "backspace":
+                self.delete_char_before()
+            "tab":
+                self.insert_char(" ")
+                self.insert_char(" ")
+                self.insert_char(" ")
+                self.insert_char(" ")
+            _:
+                if key.len() == 1:
+                    self.insert_char(key)
+        self._ensure_scroll()
+
+    me handle_command_key(key: text):
+        """Handle a key press in Command mode."""
+        match key:
+            "escape":
+                self.mode = EditorMode.Normal
+                self.command_buffer = ""
+                self.status_message = ""
+            "enter":
+                self._execute_command()
+            "backspace":
+                if self.command_buffer.len() > 0:
+                    self.command_buffer = self.command_buffer.slice(0, self.command_buffer.len() - 1)
+                    self.status_message = ":{self.command_buffer}"
+                else:
+                    self.mode = EditorMode.Normal
+                    self.status_message = ""
+            _:
+                self.command_buffer = "{self.command_buffer}{key}"
+                self.status_message = ":{self.command_buffer}"
+
+    # -- Command Execution ---------------------------------------------------
+
+    me _execute_command():
+        """Execute a :command."""
+        val cmd = self.command_buffer
+        self.mode = EditorMode.Normal
+        self.command_buffer = ""
+
+        match cmd:
+            "w":
+                val result = self.save_file()
+                if result.is_err():
+                    self.status_message = result.unwrap_err()
+            "q":
+                if self.modified:
+                    self.status_message = "No write since last change (use :q! to override)"
+                else:
+                    self.status_message = "quit"
+            "q!":
+                self.status_message = "quit"
+            "wq":
+                val save_result = self.save_file()
+                if save_result.is_ok():
+                    self.status_message = "quit"
+                else:
+                    self.status_message = save_result.unwrap_err()
+            _:
+                # Check for :w <filename>
+                if cmd.starts_with("w "):
+                    val path = cmd.slice(2, cmd.len()).trim()
+                    val save_result = self.save_as(path)
+                    if save_result.is_err():
+                        self.status_message = save_result.unwrap_err()
+                # Check for :<line_number> (go to line)
+                elif _is_number(cmd):
+                    val target = _parse_int(cmd, 0)
+                    if target > 0 and target <= self.lines.len():
+                        self.cursor_row = target - 1
+                        self._clamp_col()
+                        self._ensure_scroll()
+                        self.status_message = ""
+                else:
+                    self.status_message = "Unknown command: {cmd}"
+
+    # -- Line Operations (vi) ------------------------------------------------
+
+    me _delete_line():
+        """Delete the current line (dd)."""
+        if self.lines.len() <= 1:
+            self.yank_buffer = [self.lines[0]]
+            self.lines[0] = ""
+            self.cursor_col = 0
+            self.modified = true
+            return
+        self.yank_buffer = [self.lines[self.cursor_row]]
+        self._remove_line(self.cursor_row)
+        if self.cursor_row >= self.lines.len():
+            self.cursor_row = self.lines.len() - 1
+        self._clamp_col()
+        self.modified = true
+
+    me _yank_line():
+        """Yank (copy) the current line (yy)."""
+        if self.cursor_row < self.lines.len():
+            self.yank_buffer = [self.lines[self.cursor_row]]
+            self.status_message = "1 line yanked"
+
+    me _paste_below():
+        """Paste yanked lines below cursor (p)."""
+        if self.yank_buffer.len() == 0:
+            return
+        var insert_at = self.cursor_row + 1
+        for line in self.yank_buffer:
+            self._insert_line(insert_at, line)
+            insert_at = insert_at + 1
+        self.cursor_row = self.cursor_row + 1
+        self.cursor_col = 0
+        self.modified = true
+
+    # -- Cursor Helpers ------------------------------------------------------
+
+    fn _current_line_len() -> i32:
+        """Get the length of the current line."""
+        if self.cursor_row >= self.lines.len():
+            return 0
+        return self.lines[self.cursor_row].len()
+
+    me _clamp_col():
+        """Clamp cursor column to line length."""
+        val line_len = self._current_line_len()
+        if self.cursor_col >= line_len:
+            self.cursor_col = if line_len > 0: line_len - 1 else: 0
+
+    me _ensure_scroll():
+        """Ensure cursor is visible within the scroll viewport."""
+        if self.cursor_row < self.scroll_row:
+            self.scroll_row = self.cursor_row
+        if self.cursor_row >= self.scroll_row + self.visible_rows:
+            self.scroll_row = self.cursor_row - self.visible_rows + 1
+
+    me _move_word_forward():
+        """Move cursor to the start of the next word."""
+        if self.cursor_row >= self.lines.len():
+            return
+        val line = self.lines[self.cursor_row]
+        var col = self.cursor_col
+        # Skip current word
+        while col < line.len() and _char_at(line, col) != " ":
+            col = col + 1
+        # Skip spaces
+        while col < line.len() and _char_at(line, col) == " ":
+            col = col + 1
+        if col >= line.len() and self.cursor_row < self.lines.len() - 1:
+            self.cursor_row = self.cursor_row + 1
+            self.cursor_col = 0
+        else:
+            self.cursor_col = col
+
+    me _move_word_backward():
+        """Move cursor to the start of the previous word."""
+        if self.cursor_row >= self.lines.len():
+            return
+        val line = self.lines[self.cursor_row]
+        var col = self.cursor_col
+        if col > 0:
+            col = col - 1
+        # Skip spaces backward
+        while col > 0 and _char_at(line, col) == " ":
+            col = col - 1
+        # Skip word backward
+        while col > 0 and _char_at(line, col - 1) != " ":
+            col = col - 1
+        self.cursor_col = col
+
+    # -- UI Construction -----------------------------------------------------
+
+    fn build_ui() -> UISession:
+        """Build the editor UI.
+
+        Layout:
+          Menubar: File | Edit | Search
+          Scrollable line display (line numbers + content)
+          Statusbar: mode | cursor position | file info
+        """
+        var line_widgets: [WidgetNode] = []
+        var row_idx = self.scroll_row
+        var visible = 0
+        while visible < self.visible_rows and row_idx < self.lines.len():
+            val line_num = row_idx + 1
+            val line_content = self.lines[row_idx]
+            val num_str = _pad_left("{line_num}", 4)
+            # Show cursor position indicator
+            val display = if row_idx == self.cursor_row:
+                val before = line_content.slice(0, self.cursor_col)
+                val cursor_ch = if self.cursor_col < line_content.len():
+                    _char_at(line_content, self.cursor_col)
+                else:
+                    " "
+                val after = if self.cursor_col + 1 < line_content.len():
+                    line_content.slice(self.cursor_col + 1, line_content.len())
+                else:
+                    ""
+                val esc = "\u{001b}"
+                "{num_str} {before}{esc}[7m{cursor_ch}{esc}[0m{after}"
+            else:
+                "{num_str} {line_content}"
+            line_widgets = line_widgets.push(text_widget("ed_line_{row_idx}", display))
+            row_idx = row_idx + 1
+            visible = visible + 1
+
+        # Fill remaining visible rows with tildes
+        while visible < self.visible_rows:
+            val tilde_num = self.scroll_row + visible + 1
+            line_widgets = line_widgets.push(
+                text_widget("ed_line_{tilde_num}", "   ~ ")
+            )
+            visible = visible + 1
+
+        val file_display = if self.file_path != nil: self.file_path else: "[No Name]"
+        val mod_indicator = if self.modified: " [+]" else: ""
+        val mode_str = mode_name(self.mode)
+
+        val root = column("editor_root", [
+            menubar("ed_menu", ["File", "Edit", "Search"]),
+            with_flex(scroll("ed_scroll", self.visible_rows, line_widgets), 1),
+            statusbar("ed_status",
+                "{mode_str} | Ln {self.cursor_row + 1}, Col {self.cursor_col + 1}",
+                "{file_display}{mod_indicator} | {self.lines.len()} lines"
+            ),
+            text_widget("ed_cmdline", self.status_message)
+        ])
+
+        val tree = build_tree_with_title(root, "Editor - {file_display}", "dark")
+        return UISession.new(tree)
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn _split_lines(content: text) -> [text]:
+    """Split content into lines."""
+    var lines: [text] = []
+    var current = ""
+    for ch in content:
+        if ch == "\n":
+            lines = lines.push(current)
+            current = ""
+        else:
+            current = "{current}{ch}"
+    lines = lines.push(current)
+    return lines
+
+fn _char_at(s: text, index: i32) -> text:
+    """Get character at index (returns space if out of bounds)."""
+    if index < 0 or index >= s.len():
+        return " "
+    return s.slice(index, index + 1)
+
+fn _pad_left(s: text, width: i32) -> text:
+    """Pad a string on the left with spaces to reach width."""
+    var result = s
+    while result.len() < width:
+        result = " {result}"
+    return result
+
+fn _parse_int(s: text, default_val: i32) -> i32:
+    """Parse integer from text."""
+    if s == "":
+        return default_val
+    var result: i32 = 0
+    for ch in s:
+        if ch >= "0" and ch <= "9":
+            val digit = ch.to_i32() - "0".to_i32()
+            result = result * 10 + digit
+        else:
+            return default_val
+    return result
+
+fn _is_number(s: text) -> bool:
+    """Check if a string is all digits."""
+    if s == "":
+        return false
+    for ch in s:
+        if ch < "0" or ch > "9":
+            return false
+    return true

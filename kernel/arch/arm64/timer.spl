@@ -1,0 +1,175 @@
+# ARM64 Timer — ARM Generic Timer
+#
+# Implements the ARM Generic Timer for QEMU virt machine.
+# The ARM Generic Timer provides a system counter and per-CPU timers
+# accessible via system registers (no MMIO needed).
+#
+# Key system registers:
+#   CNTFRQ_EL0   — Counter frequency (set by firmware, read-only at EL1)
+#   CNTPCT_EL0   — Physical counter value (always incrementing)
+#   CNTP_TVAL_EL0 — Timer value (countdown to interrupt)
+#   CNTP_CTL_EL0  — Timer control register:
+#     Bit 0: ENABLE  — enable timer
+#     Bit 1: IMASK   — interrupt mask (1 = masked, 0 = enabled)
+#     Bit 2: ISTATUS — interrupt status (read-only)
+#
+# On QEMU virt, the timer frequency is typically 62.5 MHz (62500000 Hz)
+# but should be read from CNTFRQ_EL0 at runtime.
+#
+# Timer IRQ: PPI #14 = IRQ 30 (non-secure physical timer)
+
+use os.kernel.arch.arm64.console.{uart_writeln}
+
+# ============================================================================
+# ARM Generic Timer System Register Access
+# ============================================================================
+
+extern fn rt_arm64_mrs_cntfrq_el0() -> u64
+extern fn rt_arm64_mrs_cntpct_el0() -> u64
+extern fn rt_arm64_msr_cntp_tval_el0(val: u64)
+extern fn rt_arm64_mrs_cntp_tval_el0() -> u64
+extern fn rt_arm64_msr_cntp_ctl_el0(val: u64)
+extern fn rt_arm64_mrs_cntp_ctl_el0() -> u64
+
+# ============================================================================
+# Timer Control Bits (CNTP_CTL_EL0)
+# ============================================================================
+
+val CTL_ENABLE: u64 = 1 << 0      # Enable the timer
+val CTL_IMASK: u64 = 1 << 1       # Interrupt mask (1=masked)
+val CTL_ISTATUS: u64 = 1 << 2     # Interrupt status (read-only)
+
+# ============================================================================
+# Timer IRQ Number
+# ============================================================================
+
+val TIMER_IRQ: u32 = 30           # Non-secure physical timer PPI (16 + 14 = 30)
+
+# ============================================================================
+# Global Timer State
+# ============================================================================
+
+var g_timer_freq: u64 = 0         # Cached timer frequency (Hz)
+
+# ============================================================================
+# Arm64Timer
+# ============================================================================
+
+struct Arm64Timer:
+    """ARM Generic Timer implementation.
+
+    Uses the non-secure physical timer (CNTP_*) accessible at EL1.
+    The timer fires IRQ 30 (PPI #14) when the countdown reaches zero.
+    """
+    pass_dn
+
+impl Arm64Timer:
+    fn init(frequency_hz: u64):
+        """Initialize the ARM Generic Timer.
+
+        Reads the counter frequency from CNTFRQ_EL0 and enables the timer.
+        The frequency_hz parameter is stored but the actual frequency comes
+        from the hardware register (set by firmware/QEMU).
+        """
+        # Read hardware counter frequency
+        g_timer_freq = rt_arm64_mrs_cntfrq_el0()
+        uart_writeln("[TIMER] Counter frequency: {g_timer_freq} Hz")
+
+        if g_timer_freq == 0:
+            uart_writeln("[TIMER] WARNING: CNTFRQ_EL0 is 0, using provided frequency")
+            g_timer_freq = frequency_hz
+
+        # Disable timer initially (enable when deadline is set)
+        rt_arm64_msr_cntp_ctl_el0(0)
+
+        uart_writeln("[TIMER] ARM Generic Timer initialized")
+
+    fn set_deadline(ticks: u64):
+        """Set a one-shot timer deadline.
+
+        Writes the countdown value to CNTP_TVAL_EL0 and enables the timer
+        with interrupts unmasked. The timer will fire IRQ 30 when the
+        countdown reaches zero.
+        """
+        # Set timer value (countdown)
+        rt_arm64_msr_cntp_tval_el0(ticks)
+
+        # Enable timer, unmask interrupt
+        rt_arm64_msr_cntp_ctl_el0(CTL_ENABLE)
+
+    fn set_deadline_us(microseconds: u64):
+        """Set a one-shot timer deadline in microseconds."""
+        if g_timer_freq == 0:
+            return
+        val ticks = (microseconds * g_timer_freq) / 1000000
+        self.set_deadline(ticks)
+
+    fn set_deadline_ms(milliseconds: u64):
+        """Set a one-shot timer deadline in milliseconds."""
+        if g_timer_freq == 0:
+            return
+        val ticks = (milliseconds * g_timer_freq) / 1000
+        self.set_deadline(ticks)
+
+    fn stop():
+        """Stop the timer by disabling it."""
+        rt_arm64_msr_cntp_ctl_el0(0)
+
+    fn mask():
+        """Mask the timer interrupt without disabling the timer."""
+        rt_arm64_msr_cntp_ctl_el0(CTL_ENABLE | CTL_IMASK)
+
+    fn unmask():
+        """Unmask the timer interrupt."""
+        rt_arm64_msr_cntp_ctl_el0(CTL_ENABLE)
+
+    fn current_ticks() -> u64:
+        """Read the current physical counter value (CNTPCT_EL0).
+
+        This counter increments monotonically at the frequency
+        returned by ticks_per_second().
+        """
+        rt_arm64_mrs_cntpct_el0()
+
+    fn ticks_per_second() -> u64:
+        """Return the timer frequency in ticks per second.
+
+        Reads from the cached value (originally from CNTFRQ_EL0).
+        """
+        g_timer_freq
+
+    fn is_pending() -> bool:
+        """Check if the timer interrupt is pending (ISTATUS bit)."""
+        val ctl = rt_arm64_mrs_cntp_ctl_el0()
+        (ctl & CTL_ISTATUS) != 0
+
+    fn elapsed_ns(start_ticks: u64) -> u64:
+        """Calculate elapsed nanoseconds since a given tick count."""
+        if g_timer_freq == 0:
+            return 0
+        val elapsed = rt_arm64_mrs_cntpct_el0() - start_ticks
+        (elapsed * 1000000000) / g_timer_freq
+
+    fn elapsed_us(start_ticks: u64) -> u64:
+        """Calculate elapsed microseconds since a given tick count."""
+        if g_timer_freq == 0:
+            return 0
+        val elapsed = rt_arm64_mrs_cntpct_el0() - start_ticks
+        (elapsed * 1000000) / g_timer_freq
+
+# ============================================================================
+# Module-Level Convenience Functions
+# ============================================================================
+
+fn timer_init():
+    """Initialize ARM Generic Timer (module-level convenience)."""
+    var timer = Arm64Timer()
+    timer.init(0)
+
+fn timer_current_ticks() -> u64:
+    """Read current counter (module-level convenience)."""
+    rt_arm64_mrs_cntpct_el0()
+
+fn timer_frequency() -> u64:
+    """Get timer frequency in Hz (module-level convenience)."""
+    g_timer_freq

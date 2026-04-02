@@ -1,0 +1,227 @@
+# UI Layout Profiles
+#
+# Orientation detection, size classes, and adaptive layout profiles.
+# Enables automatic layout switching based on viewport dimensions.
+#
+# Inspired by SwiftUI size classes, Jetpack Compose WindowSizeClass,
+# and Flutter OrientationBuilder.
+
+use common.ui.widget.{WidgetNode}
+use common.ui.viewport.{Viewport}
+
+# =========================================================================
+# Enums
+# =========================================================================
+
+enum Orientation:
+    Landscape
+    Portrait
+    Square
+
+enum SizeClass:
+    Compact
+    Regular
+    Expanded
+
+# =========================================================================
+# Breakpoints
+# =========================================================================
+
+struct Breakpoints:
+    compact_max: i32
+    regular_max: i32
+
+fn default_breakpoints() -> Breakpoints:
+    """Pixel-based breakpoints for GUI backends (web, electron, tauri)."""
+    return Breakpoints(compact_max: 600, regular_max: 1200)
+
+fn terminal_breakpoints() -> Breakpoints:
+    """Character-column breakpoints for TUI backend."""
+    return Breakpoints(compact_max: 80, regular_max: 160)
+
+# =========================================================================
+# Detection Functions
+# =========================================================================
+
+fn detect_orientation(width: i32, height: i32) -> Orientation:
+    """Detect orientation from dimensions."""
+    if width > height:
+        return Orientation.Landscape
+    elif height > width:
+        return Orientation.Portrait
+    else:
+        return Orientation.Square
+
+fn classify(dimension: i32, bp: Breakpoints) -> SizeClass:
+    """Classify a dimension into a size class using breakpoints."""
+    if dimension < bp.compact_max:
+        return SizeClass.Compact
+    elif dimension < bp.regular_max:
+        return SizeClass.Regular
+    else:
+        return SizeClass.Expanded
+
+fn breakpoints_for_backend(backend: text) -> Breakpoints:
+    """Select appropriate breakpoints based on backend name."""
+    if backend == "tui":
+        return terminal_breakpoints()
+    return default_breakpoints()
+
+# =========================================================================
+# LayoutProfile
+# =========================================================================
+
+struct LayoutProfile:
+    horizontal: SizeClass
+    vertical: SizeClass
+    orientation: Orientation
+    width: i32
+    height: i32
+
+fn compute_profile(viewport: Viewport) -> LayoutProfile:
+    """Compute a full layout profile from viewport state."""
+    val bp = breakpoints_for_backend(viewport.active_backend)
+    return LayoutProfile(
+        horizontal: classify(viewport.width, bp),
+        vertical: classify(viewport.height, bp),
+        orientation: detect_orientation(viewport.width, viewport.height),
+        width: viewport.width,
+        height: viewport.height
+    )
+
+fn default_profile() -> LayoutProfile:
+    """Default 80x24 landscape profile (terminal default)."""
+    return LayoutProfile(
+        horizontal: SizeClass.Regular,
+        vertical: SizeClass.Compact,
+        orientation: Orientation.Landscape,
+        width: 80,
+        height: 24
+    )
+
+impl LayoutProfile:
+    fn is_landscape() -> bool:
+        return self.orientation == Orientation.Landscape or self.orientation == Orientation.Square
+
+    fn is_portrait() -> bool:
+        return self.orientation == Orientation.Portrait
+
+    fn is_compact() -> bool:
+        return self.horizontal == SizeClass.Compact
+
+    fn is_expanded() -> bool:
+        return self.horizontal == SizeClass.Expanded
+
+    fn describe() -> text:
+        val o = match self.orientation:
+            Orientation.Landscape: "landscape"
+            Orientation.Portrait: "portrait"
+            Orientation.Square: "square"
+        val h = match self.horizontal:
+            SizeClass.Compact: "compact"
+            SizeClass.Regular: "regular"
+            SizeClass.Expanded: "expanded"
+        return "{o} {h} ({self.width}x{self.height})"
+
+# =========================================================================
+# ProfileSet
+# =========================================================================
+
+class ProfileSet:
+    landscape_root: WidgetNode?
+    portrait_root: WidgetNode?
+    default_root: WidgetNode
+
+    static fn new(default_root: WidgetNode) -> ProfileSet:
+        """Create a profile set with only a default layout."""
+        return ProfileSet(
+            landscape_root: nil,
+            portrait_root: nil,
+            default_root: default_root
+        )
+
+    me with_landscape(node: WidgetNode) -> ProfileSet:
+        """Set the landscape profile root."""
+        self.landscape_root = node
+        return self
+
+    me with_portrait(node: WidgetNode) -> ProfileSet:
+        """Set the portrait profile root."""
+        self.portrait_root = node
+        return self
+
+    fn resolve(orientation: Orientation) -> WidgetNode:
+        """Return the widget tree for the given orientation, or default."""
+        match orientation:
+            Orientation.Landscape | Orientation.Square:
+                if self.landscape_root != nil:
+                    return self.landscape_root
+            Orientation.Portrait:
+                if self.portrait_root != nil:
+                    return self.portrait_root
+        return self.default_root
+
+    fn has_profile(orientation: Orientation) -> bool:
+        """Check if an explicit profile exists for the given orientation."""
+        match orientation:
+            Orientation.Landscape | Orientation.Square:
+                return self.landscape_root != nil
+            Orientation.Portrait:
+                return self.portrait_root != nil
+
+# =========================================================================
+# ProfileSetEntry (for list-based storage in UISession)
+# =========================================================================
+
+struct ProfileSetEntry:
+    surface_id: text
+    profiles: ProfileSet
+
+# =========================================================================
+# ProfileResolver
+# =========================================================================
+
+class ProfileResolver:
+    current: LayoutProfile
+    breakpoints: Breakpoints
+
+    static fn new() -> ProfileResolver:
+        """Create a resolver with default breakpoints and 80x24 profile."""
+        return ProfileResolver(
+            current: default_profile(),
+            breakpoints: terminal_breakpoints()
+        )
+
+    static fn new_with_breakpoints(bp: Breakpoints) -> ProfileResolver:
+        """Create a resolver with custom breakpoints."""
+        return ProfileResolver(
+            current: default_profile(),
+            breakpoints: bp
+        )
+
+    me update(viewport: Viewport):
+        """Recompute the layout profile from current viewport."""
+        self.breakpoints = breakpoints_for_backend(viewport.active_backend)
+        self.current = LayoutProfile(
+            horizontal: classify(viewport.width, self.breakpoints),
+            vertical: classify(viewport.height, self.breakpoints),
+            orientation: detect_orientation(viewport.width, viewport.height),
+            width: viewport.width,
+            height: viewport.height
+        )
+
+    fn current_profile() -> LayoutProfile:
+        return self.current
+
+    fn orientation() -> Orientation:
+        return self.current.orientation
+
+    fn horizontal_class() -> SizeClass:
+        return self.current.horizontal
+
+    fn vertical_class() -> SizeClass:
+        return self.current.vertical
+
+    fn orientation_changed(old: Orientation) -> bool:
+        """Check if the current orientation differs from the given old one."""
+        return self.current.orientation != old

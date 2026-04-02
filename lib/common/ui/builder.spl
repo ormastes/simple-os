@@ -1,0 +1,491 @@
+# UI Builder API
+#
+# Fluent builder functions for constructing widget trees in code.
+# Alternative to SDN/HTML description files.
+#
+# Usage:
+#   val ui = column("main",
+#       menubar("menu", ["File", "Edit", "View"]),
+#       row("content",
+#           panel("sidebar", text("nav", "Navigation")),
+#           panel("editor", input("search", "Search..."))
+#       ),
+#       statusbar("status", "{app.mode}", "{app.title}")
+#   )
+
+use common.ui.widget.{WidgetNode, UITree, WidgetProp}
+use common.ui.profile.{Orientation, SizeClass, LayoutProfile, ProfileSet}
+
+# =========================================================================
+# Container Builders
+# =========================================================================
+
+fn column(id: text, children: [WidgetNode]) -> WidgetNode:
+    """Create a vertical layout container (VBox)."""
+    var node = WidgetNode.new(id, "panel")
+    node = node.set_layout("vbox")
+    for child in children:
+        node = node.add_child(child)
+    return node
+
+fn row(id: text, children: [WidgetNode]) -> WidgetNode:
+    """Create a horizontal layout container (HBox)."""
+    var node = WidgetNode.new(id, "panel")
+    node = node.set_layout("hbox")
+    for child in children:
+        node = node.add_child(child)
+    return node
+
+fn grid_layout(id: text, children: [WidgetNode]) -> WidgetNode:
+    """Create a grid layout container."""
+    var node = WidgetNode.new(id, "panel")
+    node = node.set_layout("grid")
+    for child in children:
+        node = node.add_child(child)
+    return node
+
+fn panel(id: text, title: text, children: [WidgetNode]) -> WidgetNode:
+    """Create a titled panel with children."""
+    var node = WidgetNode.new(id, "panel")
+    node = node.set_prop("title", title)
+    node = node.set_layout("vbox")
+    for child in children:
+        node = node.add_child(child)
+    return node
+
+# =========================================================================
+# Leaf Widget Builders
+# =========================================================================
+
+fn text_widget(id: text, content: text) -> WidgetNode:
+    """Create a text display widget."""
+    var node = WidgetNode.new(id, "text")
+    node = node.set_prop("content", content)
+    return node
+
+fn label(id: text, label_text: text) -> WidgetNode:
+    """Create a label widget."""
+    var node = WidgetNode.new(id, "text")
+    node = node.set_prop("label", label_text)
+    return node
+
+fn input(id: text, placeholder: text) -> WidgetNode:
+    """Create a text input widget."""
+    var node = WidgetNode.new(id, "input")
+    node = node.set_prop("placeholder", placeholder)
+    return node
+
+fn button(id: text, label_text: text, action: text) -> WidgetNode:
+    """Create a button widget."""
+    var node = WidgetNode.new(id, "button")
+    node = node.set_prop("label", label_text)
+    node = node.set_prop("action", action)
+    return node
+
+fn checkbox(id: text, label_text: text, checked: bool) -> WidgetNode:
+    """Create a checkbox widget."""
+    var node = WidgetNode.new(id, "checkbox")
+    node = node.set_prop("label", label_text)
+    node = node.set_prop("checked", if checked: "true" else: "false")
+    return node
+
+fn dropdown(id: text, items: [text]) -> WidgetNode:
+    """Create a dropdown select widget."""
+    var node = WidgetNode.new(id, "dropdown")
+    var child_nodes: [WidgetNode] = []
+    var idx = 0
+    for item in items:
+        var item_node = WidgetNode.new("{id}_opt_{idx}", "text")
+        item_node = item_node.set_prop("label", item)
+        child_nodes = child_nodes.push(item_node)
+        idx = idx + 1
+    for child in child_nodes:
+        node = node.add_child(child)
+    return node
+
+fn text_field(id: text, value: text, placeholder: text) -> WidgetNode:
+    """Create a text field with value and placeholder."""
+    var node = WidgetNode.new(id, "textfield")
+    node = node.set_prop("value", value)
+    node = node.set_prop("placeholder", placeholder)
+    return node
+
+fn image(id: text, src: text, alt: text) -> WidgetNode:
+    """Create an image widget."""
+    var node = WidgetNode.new(id, "image")
+    node = node.set_prop("src", src)
+    node = node.set_prop("alt", alt)
+    return node
+
+fn divider(id: text) -> WidgetNode:
+    """Create a horizontal divider."""
+    return WidgetNode.new(id, "divider")
+
+fn dialog(id: text, title: text, children: [WidgetNode]) -> WidgetNode:
+    """Create a dialog/modal widget."""
+    var node = WidgetNode.new(id, "dialog")
+    node = node.set_prop("title", title)
+    node = node.set_layout("vbox")
+    for child in children:
+        node = node.add_child(child)
+    return node
+
+fn tooltip(id: text, content: text, target_id: text) -> WidgetNode:
+    """Create a tooltip widget."""
+    var node = WidgetNode.new(id, "tooltip")
+    node = node.set_prop("content", content)
+    node = node.set_prop("target", target_id)
+    return node
+
+fn progress(id: text, value: i32) -> WidgetNode:
+    """Create a progress bar widget."""
+    var node = WidgetNode.new(id, "progress")
+    node = node.set_prop("value", "{value}")
+    return node
+
+# =========================================================================
+# Composite Widget Builders
+# =========================================================================
+
+fn menubar(id: text, items: [text]) -> WidgetNode:
+    """Create a menu bar with labeled items."""
+    var node = WidgetNode.new(id, "menubar")
+    var children: [WidgetNode] = []
+    var idx = 0
+    for item in items:
+        var menu_node = WidgetNode.new("{id}_menu_{idx}", "text")
+        menu_node = menu_node.set_prop("label", item)
+        children = children.push(menu_node)
+        idx = idx + 1
+    for child in children:
+        node = node.add_child(child)
+    return node
+
+fn menu_separator(id: text) -> WidgetNode:
+    """Create a menu separator item."""
+    var node = WidgetNode.new(id, "text")
+    node = node.set_prop("label", "|")
+    node = node.set_prop("is_separator", "true")
+    return node
+
+fn menu_with_submenu(id: text, label_text: text, children: [WidgetNode]) -> WidgetNode:
+    """Create a menu item with a submenu."""
+    var node = WidgetNode.new(id, "text")
+    node = node.set_prop("label", label_text)
+    node = node.set_prop("has_submenu", "true")
+    for child in children:
+        node = node.add_child(child)
+    return node
+
+fn menubar_rich(id: text, items: [WidgetNode]) -> WidgetNode:
+    """Create a menu bar with mixed WidgetNode children (items, separators, submenus)."""
+    var node = WidgetNode.new(id, "menubar")
+    for item in items:
+        node = node.add_child(item)
+    return node
+
+fn statusbar(id: text, left: text, right: text) -> WidgetNode:
+    """Create a status bar with left and right sections."""
+    var node = WidgetNode.new(id, "statusbar")
+    node = node.set_prop("left", left)
+    node = node.set_prop("right", right)
+    return node
+
+fn tabs(id: text, tab_labels: [text]) -> WidgetNode:
+    """Create a tab bar with labeled tabs."""
+    var node = WidgetNode.new(id, "tabs")
+    var children: [WidgetNode] = []
+    var idx = 0
+    for tab_label in tab_labels:
+        var tab_node = WidgetNode.new("{id}_tab_{idx}", "text")
+        tab_node = tab_node.set_prop("label", tab_label)
+        children = children.push(tab_node)
+        idx = idx + 1
+    for child in children:
+        node = node.add_child(child)
+    return node
+
+fn list_widget(id: text, items: [text]) -> WidgetNode:
+    """Create a list widget with labeled items."""
+    var node = WidgetNode.new(id, "list")
+    var children: [WidgetNode] = []
+    var idx = 0
+    for item in items:
+        var item_node = WidgetNode.new("{id}_item_{idx}", "text")
+        item_node = item_node.set_prop("label", item)
+        children = children.push(item_node)
+        idx = idx + 1
+    for child in children:
+        node = node.add_child(child)
+    return node
+
+fn table_widget(id: text, headers: [text], rows: [[text]]) -> WidgetNode:
+    """Create a table widget with column headers and data rows."""
+    var node = WidgetNode.new(id, "table")
+    # Join headers with "|" separator
+    var header_str = ""
+    var h_idx = 0
+    for header in headers:
+        if h_idx > 0:
+            header_str = "{header_str}|"
+        header_str = "{header_str}{header}"
+        h_idx = h_idx + 1
+    node = node.set_prop("headers", header_str)
+    node = node.set_prop("sort_column", "")
+    node = node.set_prop("sort_dir", "asc")
+    node = node.set_prop("filter_text", "")
+    # Children: one text node per row, label = cells joined by "|"
+    var children: [WidgetNode] = []
+    var r_idx = 0
+    for row in rows:
+        var cell_str = ""
+        var c_idx = 0
+        for cell in row:
+            if c_idx > 0:
+                cell_str = "{cell_str}|"
+            cell_str = "{cell_str}{cell}"
+            c_idx = c_idx + 1
+        var row_node = WidgetNode.new("{id}_row_{r_idx}", "text")
+        row_node = row_node.set_prop("label", cell_str)
+        children = children.push(row_node)
+        r_idx = r_idx + 1
+    for child in children:
+        node = node.add_child(child)
+    return node
+
+fn table_row(id: text, cells: [text]) -> WidgetNode:
+    """Create a table row node with cells joined by '|'."""
+    var node = WidgetNode.new(id, "text")
+    var cell_str = ""
+    var c_idx = 0
+    for cell in cells:
+        if c_idx > 0:
+            cell_str = "{cell_str}|"
+        cell_str = "{cell_str}{cell}"
+        c_idx = c_idx + 1
+    node = node.set_prop("label", cell_str)
+    return node
+
+# =========================================================================
+# Tree Widget Builders
+# =========================================================================
+
+fn tree_widget(id: text, children: [WidgetNode]) -> WidgetNode:
+    """Create a tree container widget with treenode children."""
+    var node = WidgetNode.new(id, "tree")
+    node = node.set_layout("vbox")
+    for child in children:
+        node = node.add_child(child)
+    return node
+
+fn tree_node(id: text, label_text: text, children: [WidgetNode]) -> WidgetNode:
+    """Create a tree node with a label and nested treenode children."""
+    var node = WidgetNode.new(id, "treenode")
+    node = node.set_prop("label", label_text)
+    node = node.set_prop("expanded", "true")
+    for child in children:
+        node = node.add_child(child)
+    return node
+
+fn tree_leaf(id: text, label_text: text) -> WidgetNode:
+    """Create a tree leaf node (no children, not expandable)."""
+    var node = WidgetNode.new(id, "treenode")
+    node = node.set_prop("label", label_text)
+    node = node.set_prop("expanded", "false")
+    return node
+
+# =========================================================================
+# Scroll and Textarea Builders
+# =========================================================================
+
+fn scroll(id: text, max_height: i32, children: [WidgetNode]) -> WidgetNode:
+    """Create a scrollable container with a maximum visible height."""
+    var node = WidgetNode.new(id, "scroll")
+    node = node.set_prop("max_height", "{max_height}")
+    node = node.set_prop("scroll_offset", "0")
+    node = node.set_layout("vbox")
+    for child in children:
+        node = node.add_child(child)
+    return node
+
+fn textarea(id: text, value: text, placeholder: text, rows: i32) -> WidgetNode:
+    """Create a multi-line text editing area."""
+    var node = WidgetNode.new(id, "textarea")
+    node = node.set_prop("value", value)
+    node = node.set_prop("placeholder", placeholder)
+    node = node.set_prop("rows", "{rows}")
+    return node
+
+# =========================================================================
+# Tree Builder
+# =========================================================================
+
+fn build_tree(root: WidgetNode) -> UITree:
+    """Build a UITree from a root WidgetNode."""
+    return UITree.new(root)
+
+fn build_tree_with_title(root: WidgetNode, title: text, theme: text) -> UITree:
+    """Build a UITree with custom title and theme."""
+    var tree = UITree.new(root)
+    tree = tree.with_title(title)
+    tree = tree.with_theme(theme)
+    tree = tree.with_keybindings({})
+    return tree
+
+# =========================================================================
+# Widget Modifiers
+# =========================================================================
+
+fn with_flex(node: WidgetNode, flex: i32) -> WidgetNode:
+    """Set flex sizing on a widget."""
+    return node.set_prop("flex", "{flex}")
+
+fn with_width(node: WidgetNode, width: i32) -> WidgetNode:
+    """Set fixed width on a widget."""
+    return node.set_prop("width", "{width}")
+
+fn with_height(node: WidgetNode, height: i32) -> WidgetNode:
+    """Set fixed height on a widget."""
+    return node.set_prop("height", "{height}")
+
+fn with_visible(node: WidgetNode, visible: bool) -> WidgetNode:
+    """Set visibility on a widget."""
+    return node.set_visible(visible)
+
+fn with_selected(node: WidgetNode, index: i32) -> WidgetNode:
+    """Set the selected item index on a list widget."""
+    return node.set_prop("selected_index", "{index}")
+
+fn with_disabled(node: WidgetNode) -> WidgetNode:
+    """Mark a widget as disabled (non-interactive)."""
+    return node.set_prop("disabled", "true")
+
+fn with_readonly(node: WidgetNode) -> WidgetNode:
+    """Mark a widget as read-only."""
+    return node.set_prop("readonly", "true")
+
+fn with_error(node: WidgetNode, message: text) -> WidgetNode:
+    """Set error state with a message on a widget."""
+    var n = node.set_prop("error", "true")
+    n = n.set_prop("error_message", message)
+    return n
+
+fn with_validator(node: WidgetNode, pattern: text) -> WidgetNode:
+    """Set a regex validation pattern on a widget."""
+    return node.set_prop("validator", pattern)
+
+fn with_required(node: WidgetNode) -> WidgetNode:
+    """Mark a widget as required."""
+    return node.set_prop("required", "true")
+
+fn with_max_length(node: WidgetNode, max_len: i32) -> WidgetNode:
+    """Set a maximum input length on a widget."""
+    return node.set_prop("max_length", "{max_len}")
+
+fn with_tooltip_text(node: WidgetNode, tip: text) -> WidgetNode:
+    """Set an inline tooltip on any widget."""
+    return node.set_prop("tooltip", tip)
+
+# =========================================================================
+# Lifecycle Hook Modifiers
+# =========================================================================
+
+fn with_on_mount(node: WidgetNode, handler_id: text) -> WidgetNode:
+    """Set the on_mount lifecycle handler id on a widget."""
+    return node.set_prop("on_mount", handler_id)
+
+fn with_on_unmount(node: WidgetNode, handler_id: text) -> WidgetNode:
+    """Set the on_unmount lifecycle handler id on a widget."""
+    return node.set_prop("on_unmount", handler_id)
+
+fn with_on_update(node: WidgetNode, handler_id: text) -> WidgetNode:
+    """Set the on_update lifecycle handler id on a widget."""
+    return node.set_prop("on_update", handler_id)
+
+fn with_on_action(node: WidgetNode, handler_id: text) -> WidgetNode:
+    """Set the on_action lifecycle handler id on a widget."""
+    return node.set_prop("on_action", handler_id)
+
+fn with_on_focus(node: WidgetNode, handler_id: text) -> WidgetNode:
+    """Set the on_focus lifecycle handler id on a widget."""
+    return node.set_prop("on_focus", handler_id)
+
+fn with_on_blur(node: WidgetNode, handler_id: text) -> WidgetNode:
+    """Set the on_blur lifecycle handler id on a widget."""
+    return node.set_prop("on_blur", handler_id)
+
+# =========================================================================
+# Adaptive / Responsive Builders
+# =========================================================================
+
+fn adaptive(id: text, landscape: WidgetNode, portrait: WidgetNode) -> ProfileSet:
+    """Create a profile set with landscape and portrait variants.
+
+    sdoctest:
+        val ps = adaptive("main", row("r", []), column("c", []))
+        expect(ps.has_profile(Orientation.Landscape)).to_equal(true)
+        expect(ps.has_profile(Orientation.Portrait)).to_equal(true)
+    """
+    var ps = ProfileSet.new(landscape)
+    ps = ps.with_landscape(landscape)
+    ps = ps.with_portrait(portrait)
+    return ps
+
+fn with_profile(node: WidgetNode, orientation: Orientation, alternate: WidgetNode) -> ProfileSet:
+    """Create a profile set with a default and one orientation-specific alternate.
+
+    sdoctest:
+        val ps = with_profile(row("r", []), Orientation.Portrait, column("c", []))
+        expect(ps.has_profile(Orientation.Portrait)).to_equal(true)
+    """
+    var ps = ProfileSet.new(node)
+    if orientation == Orientation.Portrait:
+        ps = ps.with_portrait(alternate)
+    else:
+        ps = ps.with_landscape(alternate)
+    return ps
+
+fn adaptive_stack(id: text, children: [WidgetNode], profile: LayoutProfile) -> WidgetNode:
+    """Row in landscape, column in portrait. Like SwiftUI ViewThatFits."""
+    if profile.is_landscape():
+        return row(id, children)
+    return column(id, children)
+
+fn adaptive_sidebar(id: text, sidebar: WidgetNode, content: WidgetNode, profile: LayoutProfile) -> WidgetNode:
+    """Sidebar visible in Regular+, hidden in Compact."""
+    if profile.horizontal == SizeClass.Compact:
+        return column(id, [content])
+    if profile.horizontal == SizeClass.Expanded:
+        val sb = with_width(with_flex(sidebar, 1), profile.width / 3)
+        val ct = with_flex(content, 2)
+        return row(id, [sb, ct])
+    # Regular (default)
+    val sb = with_width(with_flex(sidebar, 1), profile.width / 4)
+    val ct = with_flex(content, 3)
+    return row(id, [sb, ct])
+
+fn adaptive_grid(id: text, children: [WidgetNode], profile: LayoutProfile) -> WidgetNode:
+    """Grid with 1 col in Compact, 2 in Regular, 3+ in Expanded."""
+    var cols = 3
+    if profile.horizontal == SizeClass.Compact:
+        cols = 1
+    else:
+        if profile.horizontal == SizeClass.Regular:
+            cols = 2
+    var node = grid_layout(id, children)
+    node = node.set_prop("columns", "{cols}")
+    return node
+
+fn responsive(id: text, profile: LayoutProfile, compact: WidgetNode, regular: WidgetNode, expanded: WidgetNode) -> WidgetNode:
+    """Pick a widget variant based on horizontal size class."""
+    if profile.horizontal == SizeClass.Compact:
+        return compact
+    if profile.horizontal == SizeClass.Expanded:
+        return expanded
+    return regular
+
+fn responsive_if_wide(id: text, profile: LayoutProfile, narrow: WidgetNode, wide: WidgetNode) -> WidgetNode:
+    """Two-variant responsive: narrow (Compact) vs wide (Regular+)."""
+    if profile.horizontal == SizeClass.Compact:
+        return narrow
+    return wide

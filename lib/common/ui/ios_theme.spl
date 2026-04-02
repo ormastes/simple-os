@@ -1,0 +1,88 @@
+# iOS Theme Presets
+#
+# Factory functions that produce UITheme instances with iOS-inspired styling.
+# Uses composition: IOSDesignTokens extend the base UITheme with rich tokens.
+# The base UITheme fields map to CSS variables consumed by existing widgets.
+
+use common.ui.style.{UITheme, ThemeColors, Spacing, BorderStyle, FontStyle}
+use common.ui.design_tokens.{IOSDesignTokens}
+
+# =========================================================================
+# iOS Font Stack
+# =========================================================================
+
+val IOS_FONT_FAMILY = "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display', 'Helvetica Neue', 'Segoe UI', system-ui, sans-serif"
+
+# =========================================================================
+# iOS Light Theme
+# =========================================================================
+
+fn ios_light() -> UITheme:
+    """Create an iOS-inspired light theme."""
+    return UITheme(
+        name: "ios_light",
+        colors: ThemeColors(
+            background: "#F2F2F7",
+            foreground: "#000000",
+            border: "#C6C6C8",
+            accent: "#007AFF",
+            panel_bg: "#FFFFFF",
+            hover_bg: "#E5E5EA",
+            error: "#FF3B30",
+            warning: "#FF9500",
+            success: "#34C759",
+            info: "#5AC8FA"
+        ),
+        spacing: Spacing(xs: 4, sm: 8, md: 12, lg: 20, xl: 32),
+        border: BorderStyle(width: 0, radius: 10, style: "none"),
+        font: FontStyle(
+            family: IOS_FONT_FAMILY,
+            size: 17,
+            weight: "normal",
+            line_height: 1.29
+        )
+    )
+
+# =========================================================================
+# iOS Dark Theme
+# =========================================================================
+
+fn ios_dark() -> UITheme:
+    """Create an iOS-inspired dark theme."""
+    return UITheme(
+        name: "ios_dark",
+        colors: ThemeColors(
+            background: "#000000",
+            foreground: "#FFFFFF",
+            border: "#38383A",
+            accent: "#0A84FF",
+            panel_bg: "#1C1C1E",
+            hover_bg: "#2C2C2E",
+            error: "#FF453A",
+            warning: "#FF9F0A",
+            success: "#30D158",
+            info: "#64D2FF"
+        ),
+        spacing: Spacing(xs: 4, sm: 8, md: 12, lg: 20, xl: 32),
+        border: BorderStyle(width: 0, radius: 10, style: "none"),
+        font: FontStyle(
+            family: IOS_FONT_FAMILY,
+            size: 17,
+            weight: "normal",
+            line_height: 1.29
+        )
+    )
+
+# =========================================================================
+# Design Tokens Access
+# =========================================================================
+
+fn ios_design_tokens(theme_name: text) -> IOSDesignTokens:
+    """Get the full iOS design token set for a given theme name."""
+    if theme_name == "ios_light":
+        return IOSDesignTokens.light()
+    return IOSDesignTokens.dark()
+
+fn is_ios_theme(theme_name: text) -> bool:
+    """Check if a theme name is an iOS theme."""
+    return theme_name == "ios_light" or theme_name == "ios_dark"

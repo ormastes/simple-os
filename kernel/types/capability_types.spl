@@ -1,0 +1,78 @@
+# Capability Types — Entity Dimension
+#
+# Capability-based security types. Inspired by Capsicum + OpenBSD pledge/unveil.
+# Maps to MDSOC visibility (Public/Internal/Private) and bypass grants.
+
+struct CapabilityToken:
+    """Typed capability token with generation counter for revocation."""
+    kind: CapabilityKind
+    generation: u64         # Revocation counter (matches SurfaceHandle pattern)
+    owner: u64              # TaskId of owning process
+
+enum CapabilityKind:
+    """What a capability permits."""
+    # File system
+    FileRead(path_prefix: text)
+    FileWrite(path_prefix: text)
+    FileCreate(path_prefix: text)
+    FileExec(path_prefix: text)
+
+    # Network
+    NetConnect(port: u16)
+    NetListen(port: u16)
+    NetRaw                  # Raw socket (privileged)
+
+    # Process
+    ProcessSpawn
+    ProcessSignal(target: u64)  # Signal specific task
+    ProcessSignalAny            # Signal any task (privileged)
+
+    # Hardware (for userspace drivers)
+    PortIO(base: u16, count: u16)   # x86 I/O port range
+    Mmio(base: u64, size: u64)      # Memory-mapped I/O region
+    Irq(irq_num: u32)              # Handle specific interrupt
+
+    # IPC
+    IpcConnect(port_name: text)
+    IpcListen(port_name: text)
+
+    # System
+    SystemReboot
+    SystemMount
+    SystemTime
+
+struct CapabilitySet:
+    """Set of capabilities held by a task.
+
+    Monotonically shrinkable only (like OpenBSD pledge):
+    - pledge() removes capabilities permanently
+    - unveil() restricts file path prefixes
+    - No capability can ever be added back once removed
+    """
+    caps: [CapabilityToken]
+    is_pledged: bool        # Once pledged, set can only shrink
+
+impl CapabilitySet:
+    static fn full() -> CapabilitySet:
+        """All capabilities (init process only)."""
+        CapabilitySet(caps: [], is_pledged: false)
+
+    fn has(kind: CapabilityKind) -> bool:
+        """Check if this set contains a matching capability."""
+        for cap in self.caps:
+            if cap.kind == kind:
+                return true
+        false
+
+    me pledge(allowed: [CapabilityKind]):
+        """Permanently restrict to only the listed capabilities.
+        Cannot be called twice — irreversible."""
+        if self.is_pledged:
+            return  # Already pledged, cannot expand
+        var new_caps: [CapabilityToken] = []
+        for cap in self.caps:
+            for kind in allowed:
+                if cap.kind == kind:
+                    new_caps.push(cap)
+        self.caps = new_caps
+        self.is_pledged = true

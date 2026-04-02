@@ -1,0 +1,188 @@
+# RISC-V 32 Interrupt HAL — PLIC + S-Mode Trap Handling
+#
+# Implements interrupt management for RISC-V 32-bit targets.
+# Uses the PLIC (Platform-Level Interrupt Controller) for external
+# interrupts, which is at the same MMIO addresses as rv64 on QEMU virt.
+#
+# PLIC memory map (QEMU virt, same for rv32 and rv64):
+#   0x0C000000 + 4*irq        — Priority registers (per-source)
+#   0x0C001000               — Pending bits (1024 sources, 32 words)
+#   0x0C002000               — Enable bits for context 0 (S-mode, hart 0)
+#   0x0C200000               — Priority threshold for context 0
+#   0x0C200004               — Claim/complete register for context 0
+#
+# S-mode on rv32 uses the same trap handling as rv64, but scause bit 31
+# (not bit 63) indicates an interrupt vs exception.
+
+use os.kernel.boot.mmio.{mmio_read32, mmio_write32}
+use os.kernel.arch.riscv32.cpu.{csrr_sie, csrw_sie, csrw_stvec, csrr_scause}
+use os.kernel.arch.riscv32.cpu.{SIE_SEIE, SIE_STIE, SIE_SSIE, CAUSE_INTERRUPT_BIT}
+
+# ============================================================================
+# PLIC Constants (QEMU virt riscv32)
+# ============================================================================
+
+val PLIC_BASE: u64 = 0x0C000000
+
+# Priority: base + 4 * source_id (source 0 is reserved)
+val PLIC_PRIORITY_BASE: u64 = 0x0C000000
+
+# Pending bits: 32 words starting at offset 0x1000
+val PLIC_PENDING_BASE: u64 = 0x0C001000
+
+# Enable bits for S-mode context 1 (hart 0, S-mode)
+# Context 0 = M-mode hart 0, Context 1 = S-mode hart 0
+val PLIC_ENABLE_BASE: u64 = 0x0C002080
+
+# Threshold + claim for S-mode context 1
+val PLIC_THRESHOLD: u64 = 0x0C201000
+val PLIC_CLAIM: u64 = 0x0C201004
+
+# Maximum number of interrupt sources
+val PLIC_MAX_SOURCE: u32 = 1024
+
+# QEMU virt IRQ assignments
+val UART_IRQ: u32 = 10
+
+# ============================================================================
+# Rv32Interrupt
+# ============================================================================
+
+struct Rv32Interrupt:
+    """RISC-V 32-bit interrupt management (PLIC + S-mode traps).
+
+    Manages the PLIC for external interrupt routing and provides
+    S-mode trap vector setup for the kernel's interrupt handling.
+    """
+    pass_dn
+
+# ============================================================================
+# PLIC Operations
+# ============================================================================
+
+fn _plic_set_priority(source: u32, priority: u32):
+    """Set the priority for an interrupt source (0=disabled, 1..7)."""
+    val addr = PLIC_PRIORITY_BASE + ((source as u64) * 4)
+    mmio_write32(addr, priority)
+
+fn _plic_enable(source: u32):
+    """Enable an interrupt source for S-mode context 1."""
+    val word_idx = source / 32
+    val bit_idx = source % 32
+    val addr = PLIC_ENABLE_BASE + ((word_idx as u64) * 4)
+    val current = mmio_read32(addr)
+    mmio_write32(addr, current | (1 << bit_idx))
+
+fn _plic_disable(source: u32):
+    """Disable an interrupt source for S-mode context 1."""
+    val word_idx = source / 32
+    val bit_idx = source % 32
+    val addr = PLIC_ENABLE_BASE + ((word_idx as u64) * 4)
+    val current = mmio_read32(addr)
+    mmio_write32(addr, current & (~(1 << bit_idx)))
+
+fn _plic_set_threshold(threshold: u32):
+    """Set the priority threshold (interrupts <= threshold are masked)."""
+    mmio_write32(PLIC_THRESHOLD, threshold)
+
+fn _plic_claim() -> u32:
+    """Claim the highest-priority pending interrupt. Returns source ID (0 = none)."""
+    mmio_read32(PLIC_CLAIM)
+
+fn _plic_complete(source: u32):
+    """Signal completion of interrupt handling for a source."""
+    mmio_write32(PLIC_CLAIM, source)
+
+# ============================================================================
+# Trap Vector Setup
+# ============================================================================
+
+fn _set_trap_vector(handler_addr: u32):
+    """Set the S-mode trap vector (stvec).
+
+    Mode bits [1:0]:
+      0 = Direct (all traps go to BASE)
+      1 = Vectored (interrupts go to BASE + 4*cause)
+    """
+    # Use direct mode (mode = 0)
+    csrw_stvec(handler_addr & 0xFFFFFFFC)
+
+# ============================================================================
+# Interrupt Classification
+# ============================================================================
+
+fn is_interrupt(scause: u32) -> bool:
+    """Check if scause represents an interrupt (bit 31 set on rv32)."""
+    (scause & CAUSE_INTERRUPT_BIT) != 0
+
+fn interrupt_code(scause: u32) -> u32:
+    """Extract the interrupt/exception code from scause."""
+    scause & 0x7FFFFFFF
+
+# S-mode interrupt codes
+val CAUSE_S_SOFTWARE_INTERRUPT: u32 = 1
+val CAUSE_S_TIMER_INTERRUPT: u32 = 5
+val CAUSE_S_EXTERNAL_INTERRUPT: u32 = 9
+
+# S-mode exception codes
+val CAUSE_INSTRUCTION_MISALIGNED: u32 = 0
+val CAUSE_INSTRUCTION_ACCESS_FAULT: u32 = 1
+val CAUSE_ILLEGAL_INSTRUCTION: u32 = 2
+val CAUSE_BREAKPOINT: u32 = 3
+val CAUSE_LOAD_MISALIGNED: u32 = 4
+val CAUSE_LOAD_ACCESS_FAULT: u32 = 5
+val CAUSE_STORE_MISALIGNED: u32 = 6
+val CAUSE_STORE_ACCESS_FAULT: u32 = 7
+val CAUSE_ECALL_FROM_U: u32 = 8
+val CAUSE_ECALL_FROM_S: u32 = 9
+val CAUSE_INSTRUCTION_PAGE_FAULT: u32 = 12
+val CAUSE_LOAD_PAGE_FAULT: u32 = 13
+val CAUSE_STORE_PAGE_FAULT: u32 = 15
+
+# ============================================================================
+# HAL Implementation
+# ============================================================================
+
+impl Rv32Interrupt:
+    fn init():
+        """Initialize PLIC and S-mode interrupt handling.
+
+        Sets priority threshold to 0 (accept all priorities > 0),
+        enables S-mode external, timer, and software interrupts in sie.
+        """
+        # Set PLIC threshold to 0 (allow all non-zero priorities)
+        _plic_set_threshold(0)
+
+        # Enable UART interrupt on PLIC
+        _plic_set_priority(UART_IRQ, 1)
+        _plic_enable(UART_IRQ)
+
+        # Enable S-mode interrupts in sie
+        val sie = csrr_sie()
+        csrw_sie(sie | SIE_SEIE | SIE_STIE | SIE_SSIE)
+
+    fn enable_irq(irq: u32):
+        """Enable a specific IRQ on the PLIC."""
+        _plic_set_priority(irq, 1)
+        _plic_enable(irq)
+
+    fn disable_irq(irq: u32):
+        """Disable a specific IRQ on the PLIC."""
+        _plic_disable(irq)
+        _plic_set_priority(irq, 0)
+
+    fn acknowledge(irq: u32):
+        """Acknowledge / end-of-interrupt for the given IRQ."""
+        _plic_complete(irq)
+
+    fn claim() -> u32:
+        """Claim the highest-priority pending interrupt."""
+        _plic_claim()
+
+    fn set_handler(handler_addr: u32):
+        """Set the S-mode trap vector address."""
+        _set_trap_vector(handler_addr)
+
+    fn set_priority(irq: u32, priority: u32):
+        """Set the priority level for a specific IRQ (0=disabled, 1..7)."""
+        _plic_set_priority(irq, priority)

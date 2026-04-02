@@ -1,0 +1,209 @@
+# RISC-V SBI (Supervisor Binary Interface) Ecall Wrappers
+#
+# SBI provides a standardized interface for S-mode software to call
+# firmware services implemented by OpenSBI in M-mode.
+#
+# Ecall convention:
+#   a7 = extension ID (EID)
+#   a6 = function ID (FID)
+#   a0-a5 = arguments
+#   Return: a0 = error code, a1 = value
+#
+# Extension IDs:
+#   0x00-0x0F: Legacy extensions (deprecated but still useful)
+#   0x10: Base extension (mandatory)
+#   0x54494D45 ("TIME"): Timer extension
+#   0x48534D  ("HSM"): Hart State Management
+#   0x53525354 ("SRST"): System Reset
+
+# ============================================================================
+# SBI Error Codes
+# ============================================================================
+
+val SBI_SUCCESS: i64 = 0
+val SBI_ERR_FAILED: i64 = -1
+val SBI_ERR_NOT_SUPPORTED: i64 = -2
+val SBI_ERR_INVALID_PARAM: i64 = -3
+val SBI_ERR_DENIED: i64 = -4
+val SBI_ERR_INVALID_ADDRESS: i64 = -5
+val SBI_ERR_ALREADY_AVAILABLE: i64 = -6
+
+# ============================================================================
+# SBI Extension IDs
+# ============================================================================
+
+val SBI_EXT_LEGACY_CONSOLE_PUTCHAR: u64 = 0x01
+val SBI_EXT_LEGACY_CONSOLE_GETCHAR: u64 = 0x02
+val SBI_EXT_BASE: u64 = 0x10
+val SBI_EXT_TIMER: u64 = 0x54494D45
+val SBI_EXT_HSM: u64 = 0x48534D
+val SBI_EXT_SYSTEM_RESET: u64 = 0x53525354
+
+# ============================================================================
+# SBI Return Value
+# ============================================================================
+
+@repr("C")
+struct SbiRet:
+    """SBI ecall return value pair."""
+    error: i64
+    value: i64
+
+# ============================================================================
+# Generic SBI Ecall
+# ============================================================================
+
+fn sbi_call(ext: u64, fid: u64, arg0: u64, arg1: u64, arg2: u64,
+            arg3: u64, arg4: u64, arg5: u64) -> SbiRet:
+    """Perform an SBI ecall with the given extension, function, and arguments.
+
+    Registers:
+      a7 = ext (extension ID)
+      a6 = fid (function ID)
+      a0-a5 = arg0-arg5
+    Returns:
+      a0 = error code, a1 = value
+    """
+    var ret_error: i64 = 0
+    var ret_value: i64 = 0
+
+    unsafe:
+        asm volatile:
+            "mv a0, {arg0}"
+            "mv a1, {arg1}"
+            "mv a2, {arg2}"
+            "mv a3, {arg3}"
+            "mv a4, {arg4}"
+            "mv a5, {arg5}"
+            "mv a6, {fid}"
+            "mv a7, {ext}"
+            "ecall"
+            "mv {out_err}, a0"
+            "mv {out_val}, a1"
+            in(reg) arg0
+            in(reg) arg1
+            in(reg) arg2
+            in(reg) arg3
+            in(reg) arg4
+            in(reg) arg5
+            in(reg) fid
+            in(reg) ext
+            out(reg) ret_error
+            out(reg) ret_value
+            clobber("a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7")
+
+    SbiRet(error: ret_error, value: ret_value)
+
+# ============================================================================
+# Legacy Console Extensions
+# ============================================================================
+
+fn sbi_console_putchar(ch: u8):
+    """Write a character to the debug console (legacy SBI extension 0x01).
+
+    This is the simplest way to get output on QEMU — works before
+    UART is initialized. OpenSBI routes this to the UART.
+    """
+    sbi_call(SBI_EXT_LEGACY_CONSOLE_PUTCHAR, 0, ch as u64, 0, 0, 0, 0, 0)
+
+fn sbi_console_getchar() -> i64:
+    """Read a character from the debug console (legacy SBI extension 0x02).
+
+    Returns the character, or -1 if no character is available.
+    """
+    val ret = sbi_call(SBI_EXT_LEGACY_CONSOLE_GETCHAR, 0, 0, 0, 0, 0, 0, 0)
+    ret.error
+
+# ============================================================================
+# Timer Extension (0x54494D45 = "TIME")
+# ============================================================================
+
+fn sbi_set_timer(stime_value: u64):
+    """Schedule an S-mode timer interrupt at the given time value.
+
+    Programs the timer to fire when the time CSR reaches stime_value.
+    This clears any pending timer interrupt.
+    Extension: 0x54494D45 ("TIME"), FID: 0
+    """
+    sbi_call(SBI_EXT_TIMER, 0, stime_value, 0, 0, 0, 0, 0)
+
+# ============================================================================
+# System Reset Extension (0x53525354 = "SRST")
+# ============================================================================
+
+fn sbi_shutdown():
+    """Shut down the system (system reset extension).
+
+    Extension: 0x53525354 ("SRST"), FID: 0
+    reset_type=0 (shutdown), reset_reason=0 (no reason)
+    """
+    sbi_call(SBI_EXT_SYSTEM_RESET, 0, 0, 0, 0, 0, 0, 0)
+
+fn sbi_system_reset(reset_type: u32, reset_reason: u32):
+    """Perform a system reset with the given type and reason.
+
+    reset_type: 0=shutdown, 1=cold_reboot, 2=warm_reboot
+    reset_reason: 0=no_reason, 1=system_failure
+    """
+    sbi_call(SBI_EXT_SYSTEM_RESET, 0, reset_type as u64, reset_reason as u64, 0, 0, 0, 0)
+
+# ============================================================================
+# Hart State Management Extension (0x48534D = "HSM")
+# ============================================================================
+
+fn sbi_hart_start(hartid: u64, start_addr: u64, opaque: u64) -> SbiRet:
+    """Start (or wake) a hart at the given physical address.
+
+    The target hart begins execution at start_addr in S-mode with:
+      a0 = hartid
+      a1 = opaque (passed through from caller)
+    Extension: 0x48534D ("HSM"), FID: 0
+    """
+    sbi_call(SBI_EXT_HSM, 0, hartid, start_addr, opaque, 0, 0, 0)
+
+fn sbi_hart_stop() -> SbiRet:
+    """Stop the calling hart.
+
+    The hart is placed into the stopped state and can be restarted
+    with sbi_hart_start.
+    Extension: 0x48534D ("HSM"), FID: 1
+    """
+    sbi_call(SBI_EXT_HSM, 1, 0, 0, 0, 0, 0, 0)
+
+fn sbi_hart_get_status(hartid: u64) -> SbiRet:
+    """Get the status of a hart.
+
+    Returns: 0=started, 1=stopped, 2=start_pending, 3=stop_pending,
+             4=suspended, 5=suspend_pending, 6=resume_pending
+    Extension: 0x48534D ("HSM"), FID: 2
+    """
+    sbi_call(SBI_EXT_HSM, 2, hartid, 0, 0, 0, 0, 0)
+
+# ============================================================================
+# Base Extension (0x10)
+# ============================================================================
+
+fn sbi_get_spec_version() -> SbiRet:
+    """Get the SBI specification version.
+
+    Returns major in bits [30:24], minor in bits [23:0] of value.
+    Extension: 0x10, FID: 0
+    """
+    sbi_call(SBI_EXT_BASE, 0, 0, 0, 0, 0, 0, 0)
+
+fn sbi_get_impl_id() -> SbiRet:
+    """Get the SBI implementation ID.
+
+    0=Berkeley Boot Loader, 1=OpenSBI, 2=Xvisor, 3=KVM, 4=RustSBI
+    Extension: 0x10, FID: 1
+    """
+    sbi_call(SBI_EXT_BASE, 1, 0, 0, 0, 0, 0, 0)
+
+fn sbi_probe_extension(ext_id: u64) -> bool:
+    """Check if an SBI extension is available.
+
+    Returns true if the extension is supported.
+    Extension: 0x10, FID: 3
+    """
+    val ret = sbi_call(SBI_EXT_BASE, 3, ext_id, 0, 0, 0, 0, 0)
+    ret.value != 0

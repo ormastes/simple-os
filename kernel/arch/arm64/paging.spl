@@ -1,0 +1,561 @@
+# ARM64 Paging — 4-Level Page Table Management (4KB Granule)
+#
+# Implements AArch64 4-level paging with 4KB granule and 48-bit VA.
+# Page table hierarchy: L0 -> L1 -> L2 -> L3
+#
+# Address decomposition (48-bit virtual, 4KB granule):
+#   [47:39] L0 index   (9 bits, 512 entries)
+#   [38:30] L1 index   (9 bits, 512 entries)
+#   [29:21] L2 index   (9 bits, 512 entries)
+#   [20:12] L3 index   (9 bits, 512 entries)
+#   [11:0]  Page offset (12 bits, 4KB)
+#
+# Page Table Entry (PTE) format:
+#   Bit 0:    Valid
+#   Bit 1:    Table (1=table descriptor at L0-L2) / Page (1=page at L3)
+#   Bits 4:2: AttrIndx (MAIR index)
+#   Bit 5:    NS (non-secure)
+#   Bits 7:6: AP (access permission)
+#     00 = RW_EL1, 01 = RW_ALL, 10 = RO_EL1, 11 = RO_ALL
+#   Bits 9:8: SH (shareability)
+#     00 = Non-shareable, 10 = Outer, 11 = Inner
+#   Bit 10:   AF (access flag, must be 1 to avoid access fault)
+#   Bits 47:12: Output address
+#   Bit 52:   Contiguous
+#   Bit 53:   PXN (Privileged eXecute-Never)
+#   Bit 54:   UXN/XN (User/Unprivileged eXecute-Never)
+#
+# MAIR_EL1 configuration:
+#   Index 0: Normal memory (Write-Back, Read-Write-Allocate) = 0xFF
+#   Index 1: Device-nGnRnE (strongly ordered device) = 0x00
+#
+# TCR_EL1 configuration:
+#   T0SZ = 16 (48-bit VA for TTBR0_EL1)
+#   TG0 = 0b00 (4KB granule for TTBR0_EL1)
+#   SH0 = 0b11 (Inner Shareable for TTBR0_EL1)
+#   ORGN0 = 0b01 (Write-Back Write-Allocate for Outer)
+#   IRGN0 = 0b01 (Write-Back Write-Allocate for Inner)
+
+use os.kernel.types.memory_types.{PhysAddr, VirtAddr, PageFrame, VmFlags}
+use os.kernel.boot.mmio.{mmio_read64, mmio_write64}
+use os.kernel.boot.ports.{BootOutputPort}
+use os.kernel.arch.arm64.cpu.{msr_mair_el1, msr_tcr_el1, msr_ttbr0_el1, msr_sctlr_el1, mrs_sctlr_el1, dsb, isb, tlbi_alle1, tlbi_vae1}
+use os.kernel.arch.arm64.console.{uart_writeln}
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+val PAGE_SIZE: u64 = 4096
+val ENTRIES_PER_TABLE: u64 = 512
+val TABLE_SIZE: u64 = 4096          # 512 entries * 8 bytes
+
+# ============================================================================
+# Page Table Entry Bits
+# ============================================================================
+
+val PTE_VALID: u64 = 1 << 0
+val PTE_TABLE: u64 = 1 << 1        # Table descriptor (L0-L2) / Page descriptor (L3)
+
+# AttrIndx — selects MAIR_EL1 attribute index
+val PTE_ATTR_NORMAL: u64 = 0 << 2  # MAIR index 0 = Normal memory
+val PTE_ATTR_DEVICE: u64 = 1 << 2  # MAIR index 1 = Device-nGnRnE
+
+# Access Permission bits [7:6]
+val PTE_AP_RW_EL1: u64 = 0 << 6    # Read/Write at EL1 only
+val PTE_AP_RW_ALL: u64 = 1 << 6    # Read/Write at all ELs
+val PTE_AP_RO_EL1: u64 = 2 << 6    # Read-only at EL1 only
+val PTE_AP_RO_ALL: u64 = 3 << 6    # Read-only at all ELs
+
+# Shareability bits [9:8]
+val PTE_SH_NONE: u64 = 0 << 8      # Non-shareable
+val PTE_SH_OUTER: u64 = 2 << 8     # Outer Shareable
+val PTE_SH_INNER: u64 = 3 << 8     # Inner Shareable
+
+# Access Flag (must be 1 to avoid access fault on first access)
+val PTE_AF: u64 = 1 << 10
+
+# Upper attributes
+val PTE_PXN: u64 = 1 << 53         # Privileged eXecute-Never
+val PTE_UXN: u64 = 1 << 54         # User eXecute-Never (XN)
+
+# Address mask: bits [47:12] for output address
+val PTE_OUTPUT_MASK: u64 = 0x0000FFFFFFFFF000
+
+# ============================================================================
+# MAIR_EL1 Values
+# ============================================================================
+
+# Index 0: Normal memory — Write-Back, Read/Write Allocate
+# Inner: 0xFF = Write-Back, Read-Allocate, Write-Allocate
+# Outer: same
+val MAIR_NORMAL: u64 = 0xFF
+
+# Index 1: Device-nGnRnE — non-Gathering, non-Reordering, non-Early-write-ack
+val MAIR_DEVICE: u64 = 0x00
+
+# Combined MAIR value: index 0 in bits [7:0], index 1 in bits [15:8]
+val MAIR_VALUE: u64 = MAIR_NORMAL | (MAIR_DEVICE << 8)
+
+# ============================================================================
+# TCR_EL1 Configuration
+# ============================================================================
+
+# T0SZ = 16: 48-bit VA space for TTBR0 (64 - 48 = 16)
+val TCR_T0SZ: u64 = 16
+
+# TG0 = 0b00: 4KB granule for TTBR0
+val TCR_TG0_4KB: u64 = 0 << 14
+
+# SH0 = 0b11: Inner Shareable for TTBR0
+val TCR_SH0_INNER: u64 = 3 << 12
+
+# ORGN0 = 0b01: Write-Back Write-Allocate Cacheable for Outer
+val TCR_ORGN0_WBWA: u64 = 1 << 10
+
+# IRGN0 = 0b01: Write-Back Write-Allocate Cacheable for Inner
+val TCR_IRGN0_WBWA: u64 = 1 << 8
+
+val TCR_VALUE: u64 = TCR_T0SZ | TCR_TG0_4KB | TCR_SH0_INNER | TCR_ORGN0_WBWA | TCR_IRGN0_WBWA
+
+# ============================================================================
+# SCTLR_EL1 Bits
+# ============================================================================
+
+val SCTLR_M: u64 = 1 << 0          # MMU enable
+val SCTLR_A: u64 = 1 << 1          # Alignment check enable
+val SCTLR_C: u64 = 1 << 2          # Data cache enable
+val SCTLR_I: u64 = 1 << 12         # Instruction cache enable
+
+# ============================================================================
+# Address Decomposition
+# ============================================================================
+
+fn _l0_index(virt: u64) -> u64:
+    """Extract L0 index from virtual address (bits 47:39)."""
+    (virt >> 39) & 0x1FF
+
+fn _l1_index(virt: u64) -> u64:
+    """Extract L1 index from virtual address (bits 38:30)."""
+    (virt >> 30) & 0x1FF
+
+fn _l2_index(virt: u64) -> u64:
+    """Extract L2 index from virtual address (bits 29:21)."""
+    (virt >> 21) & 0x1FF
+
+fn _l3_index(virt: u64) -> u64:
+    """Extract L3 index from virtual address (bits 20:12)."""
+    (virt >> 12) & 0x1FF
+
+# ============================================================================
+# Page Table Entry Helpers
+# ============================================================================
+
+fn _read_pte(table_phys: u64, index: u64) -> u64:
+    """Read a page table entry. Uses physical address directly (MMU may be off)."""
+    mmio_read64(table_phys + (index * 8))
+
+fn _write_pte(table_phys: u64, index: u64, value: u64):
+    """Write a page table entry. Uses physical address directly."""
+    mmio_write64(table_phys + (index * 8), value)
+
+fn _pte_is_valid(entry: u64) -> bool:
+    """Check if a PTE has the valid bit set."""
+    (entry & PTE_VALID) != 0
+
+fn _pte_output_addr(entry: u64) -> u64:
+    """Extract output address from a PTE (bits 47:12)."""
+    entry & PTE_OUTPUT_MASK
+
+fn _flags_to_pte_bits(flags: VmFlags) -> u64:
+    """Convert VmFlags to ARM64 page table entry bits.
+
+    Maps generic flags to ARM64-specific PTE attributes:
+    - present -> PTE_VALID | PTE_TABLE (L3 page descriptor)
+    - writable -> PTE_AP_RW_EL1 (default is RW at EL1)
+    - !writable -> PTE_AP_RO_EL1
+    - user -> PTE_AP_RW_ALL or PTE_AP_RO_ALL
+    - cache_disable -> PTE_ATTR_DEVICE instead of PTE_ATTR_NORMAL
+    - no_execute -> PTE_PXN | PTE_UXN
+    """
+    var bits: u64 = PTE_VALID | PTE_TABLE | PTE_AF | PTE_SH_INNER
+
+    # Memory attribute (normal vs device)
+    if flags.cache_disable():
+        bits = bits | PTE_ATTR_DEVICE
+    else:
+        bits = bits | PTE_ATTR_NORMAL
+
+    # Access permissions
+    if flags.user():
+        if flags.writable():
+            bits = bits | PTE_AP_RW_ALL
+        else:
+            bits = bits | PTE_AP_RO_ALL
+    else:
+        if not flags.writable():
+            bits = bits | PTE_AP_RO_EL1
+        # else: PTE_AP_RW_EL1 = 0, default
+
+    # Execute-never
+    if flags.no_execute():
+        bits = bits | PTE_PXN | PTE_UXN
+
+    bits
+
+# ============================================================================
+# Global Paging State
+# ============================================================================
+
+var g_root_table_phys: u64 = 0   # Physical address of L0 table
+
+# ============================================================================
+# Simple Page Allocator (bump allocator for page tables)
+# ============================================================================
+
+# During early boot we use a simple bump allocator for page table pages.
+# The real PMM takes over after full initialization.
+var g_page_alloc_next: u64 = 0
+var g_page_alloc_end: u64 = 0
+
+fn _early_alloc_page() -> u64:
+    """Allocate a zeroed 4KB page from the early bump allocator.
+
+    Returns physical address of the page, or 0 on failure.
+    """
+    if g_page_alloc_next == 0:
+        return 0
+    if g_page_alloc_next + PAGE_SIZE > g_page_alloc_end:
+        uart_writeln("[PAGING] FATAL: Early page allocator exhausted")
+        return 0
+
+    val page = g_page_alloc_next
+    g_page_alloc_next = g_page_alloc_next + PAGE_SIZE
+
+    # Zero the page (identity mapped, so phys == virt during early boot)
+    var i: u64 = 0
+    while i < ENTRIES_PER_TABLE:
+        _write_pte(page, i, 0)
+        i = i + 1
+
+    page
+
+fn _init_early_allocator(boot_info: BootOutputPort):
+    """Initialize the early bump allocator from usable boot memory.
+
+    Uses the first usable memory region after the kernel.
+    Reserves 1MB for page tables (256 pages).
+    """
+    var i: u64 = 0
+    while i < boot_info.memory_map.len() as u64:
+        val region = boot_info.memory_map[i as i64]
+        if region.kind.? == MemoryRegionKind.Usable:
+            g_page_alloc_next = region.base.addr
+            # Reserve 1MB for early page tables
+            val alloc_size: u64 = 0x100000
+            if region.size < alloc_size:
+                g_page_alloc_end = region.base.addr + region.size
+            else:
+                g_page_alloc_end = region.base.addr + alloc_size
+            uart_writeln("[PAGING] Early allocator: 0x{g_page_alloc_next}..0x{g_page_alloc_end}")
+            return
+        i = i + 1
+
+    uart_writeln("[PAGING] WARNING: No usable memory for early allocator")
+
+# ============================================================================
+# Table Walk & Mapping
+# ============================================================================
+
+fn _ensure_table_entry(table_phys: u64, index: u64) -> u64:
+    """Ensure a page table entry points to a valid next-level table.
+
+    If the entry is not valid, allocates a new table page.
+    Returns the physical address of the next-level table, or 0 on failure.
+    """
+    val entry = _read_pte(table_phys, index)
+
+    if _pte_is_valid(entry):
+        return _pte_output_addr(entry)
+
+    # Allocate new table
+    val new_table_phys = _early_alloc_page()
+    if new_table_phys == 0:
+        return 0
+
+    # Write table descriptor: Valid + Table + output address
+    val new_entry = new_table_phys | PTE_VALID | PTE_TABLE
+    _write_pte(table_phys, index, new_entry)
+
+    new_table_phys
+
+# ============================================================================
+# Identity Mapping
+# ============================================================================
+
+fn _identity_map_range(start: u64, end: u64, flags: VmFlags):
+    """Identity map a range of physical addresses with given flags.
+
+    Maps at 4KB page granularity through the full 4-level walk.
+    """
+    var addr = start & ~(PAGE_SIZE - 1)  # Align down to page boundary
+    while addr < end:
+        _map_page_internal(addr, addr, flags)
+        addr = addr + PAGE_SIZE
+
+fn _identity_map_boot(boot_info: BootOutputPort):
+    """Create identity mappings for all boot memory regions.
+
+    Maps:
+    - Kernel region as RX (code) / RW (data)
+    - Usable RAM as RW
+    - Device MMIO as device memory (uncacheable)
+    - UART and GIC as device memory
+    """
+    # Map all memory regions from boot info
+    var i: u64 = 0
+    while i < boot_info.memory_map.len() as u64:
+        val region = boot_info.memory_map[i as i64]
+        val base = region.base.addr
+        val end = base + region.size
+
+        match region.kind:
+            MemoryRegionKind.Kernel:
+                # Kernel code+data: RW for now (could split .text/.rodata/.data later)
+                _identity_map_range(base, end, VmFlags.kernel_rw())
+            MemoryRegionKind.Usable:
+                _identity_map_range(base, end, VmFlags.kernel_rw())
+            MemoryRegionKind.Reserved:
+                # Device MMIO regions: uncacheable
+                _identity_map_range(base, end, VmFlags.mmio())
+            _:
+                # Map everything else as kernel RW
+                _identity_map_range(base, end, VmFlags.kernel_rw())
+
+        i = i + 1
+
+    # Explicitly map UART and GIC device regions
+    _identity_map_range(0x08000000, 0x08020000, VmFlags.mmio())  # GIC
+    _identity_map_range(0x09000000, 0x09001000, VmFlags.mmio())  # PL011 UART
+
+    uart_writeln("[PAGING] Identity mapping complete")
+
+# ============================================================================
+# Internal Map/Unmap
+# ============================================================================
+
+fn _map_page_internal(virt: u64, phys: u64, flags: VmFlags) -> bool:
+    """Map a single 4KB page: virt -> phys with given flags.
+
+    Walks L0 -> L1 -> L2 -> L3, creating tables as needed.
+    Writes the final L3 page descriptor.
+    """
+    # Walk L0 -> L1
+    val l1_phys = _ensure_table_entry(g_root_table_phys, _l0_index(virt))
+    if l1_phys == 0:
+        return false
+
+    # Walk L1 -> L2
+    val l2_phys = _ensure_table_entry(l1_phys, _l1_index(virt))
+    if l2_phys == 0:
+        return false
+
+    # Walk L2 -> L3
+    val l3_phys = _ensure_table_entry(l2_phys, _l2_index(virt))
+    if l3_phys == 0:
+        return false
+
+    # Write L3 page descriptor
+    val pte_flags = _flags_to_pte_bits(flags)
+    val entry = (phys & PTE_OUTPUT_MASK) | pte_flags
+    _write_pte(l3_phys, _l3_index(virt), entry)
+
+    true
+
+# ============================================================================
+# Arm64Paging — HAL-Compatible Paging Interface
+# ============================================================================
+
+struct Arm64Paging:
+    """ARM64 4-level paging implementation (4KB granule, 48-bit VA).
+
+    Wraps the page table operations behind a HAL-compatible interface.
+    The kernel's portable memory layer dispatches through this struct
+    for all paging operations.
+    """
+    pass_dn
+
+impl Arm64Paging:
+    fn init(boot_info: BootOutputPort):
+        """Initialize ARM64 paging.
+
+        Steps:
+        1. Initialize early page allocator
+        2. Set MAIR_EL1 for Normal and Device memory types
+        3. Set TCR_EL1 for 48-bit VA with 4KB granule
+        4. Allocate L0 root table
+        5. Identity-map boot memory regions
+        6. Set TTBR0_EL1 to root table
+        7. Enable MMU via SCTLR_EL1
+        """
+        uart_writeln("[PAGING] Initializing ARM64 4-level page tables...")
+
+        # Step 1: Init early allocator
+        _init_early_allocator(boot_info)
+
+        # Step 2: Configure memory attributes
+        msr_mair_el1(MAIR_VALUE)
+        isb()
+        uart_writeln("[PAGING] MAIR_EL1 configured (Normal + Device)")
+
+        # Step 3: Configure translation control
+        msr_tcr_el1(TCR_VALUE)
+        isb()
+        uart_writeln("[PAGING] TCR_EL1 configured (48-bit VA, 4KB granule)")
+
+        # Step 4: Allocate root (L0) table
+        g_root_table_phys = _early_alloc_page()
+        if g_root_table_phys == 0:
+            uart_writeln("[PAGING] FATAL: Could not allocate L0 table")
+            return
+        uart_writeln("[PAGING] L0 table at physical 0x{g_root_table_phys}")
+
+        # Step 5: Identity map
+        _identity_map_boot(boot_info)
+
+        # Step 6: Set TTBR0_EL1
+        msr_ttbr0_el1(g_root_table_phys)
+        isb()
+        uart_writeln("[PAGING] TTBR0_EL1 set to 0x{g_root_table_phys}")
+
+        # Step 7: Invalidate TLB and enable MMU
+        tlbi_alle1()
+        dsb()
+        isb()
+
+        val sctlr = mrs_sctlr_el1()
+        msr_sctlr_el1(sctlr | SCTLR_M | SCTLR_C | SCTLR_I)
+        isb()
+        uart_writeln("[PAGING] MMU enabled (SCTLR_EL1.M=1, C=1, I=1)")
+
+        uart_writeln("[PAGING] ARM64 paging initialization complete")
+
+    fn map_page(virt: VirtAddr, phys: PhysAddr, flags: VmFlags) -> bool:
+        """Map a 4KB virtual page to a physical frame."""
+        val result = _map_page_internal(virt.addr, phys.addr, flags)
+        if result:
+            # Invalidate TLB for this VA
+            tlbi_vae1(virt.addr)
+            dsb()
+            isb()
+        result
+
+    fn unmap_page(virt: VirtAddr) -> bool:
+        """Unmap a 4KB virtual page.
+
+        Walks to the L3 entry and clears it. Does NOT free physical page.
+        """
+        val vaddr = virt.addr
+
+        # Walk to L3 — do NOT create tables (check presence only)
+        val l0_entry = _read_pte(g_root_table_phys, _l0_index(vaddr))
+        if not _pte_is_valid(l0_entry):
+            return false
+
+        val l1_phys = _pte_output_addr(l0_entry)
+        val l1_entry = _read_pte(l1_phys, _l1_index(vaddr))
+        if not _pte_is_valid(l1_entry):
+            return false
+
+        val l2_phys = _pte_output_addr(l1_entry)
+        val l2_entry = _read_pte(l2_phys, _l2_index(vaddr))
+        if not _pte_is_valid(l2_entry):
+            return false
+
+        val l3_phys = _pte_output_addr(l2_entry)
+        val l3_entry = _read_pte(l3_phys, _l3_index(vaddr))
+        if not _pte_is_valid(l3_entry):
+            return false
+
+        # Clear the L3 entry
+        _write_pte(l3_phys, _l3_index(vaddr), 0)
+
+        # Invalidate TLB
+        tlbi_vae1(vaddr)
+        dsb()
+        isb()
+
+        true
+
+    fn translate(virt: VirtAddr) -> PhysAddr?:
+        """Translate virtual address to physical by walking page tables."""
+        val vaddr = virt.addr
+
+        val l0_entry = _read_pte(g_root_table_phys, _l0_index(vaddr))
+        if not _pte_is_valid(l0_entry):
+            return nil
+
+        val l1_phys = _pte_output_addr(l0_entry)
+        val l1_entry = _read_pte(l1_phys, _l1_index(vaddr))
+        if not _pte_is_valid(l1_entry):
+            return nil
+
+        # Check for 1GB block (L1 block descriptor: Valid=1, Table=0)
+        if (l1_entry & PTE_TABLE) == 0:
+            val base = _pte_output_addr(l1_entry)
+            val offset = vaddr & 0x3FFFFFFF  # Lower 30 bits
+            return PhysAddr(addr: base + offset)
+
+        val l2_phys = _pte_output_addr(l1_entry)
+        val l2_entry = _read_pte(l2_phys, _l2_index(vaddr))
+        if not _pte_is_valid(l2_entry):
+            return nil
+
+        # Check for 2MB block (L2 block descriptor: Valid=1, Table=0)
+        if (l2_entry & PTE_TABLE) == 0:
+            val base = _pte_output_addr(l2_entry)
+            val offset = vaddr & 0x1FFFFF  # Lower 21 bits
+            return PhysAddr(addr: base + offset)
+
+        val l3_phys = _pte_output_addr(l2_entry)
+        val l3_entry = _read_pte(l3_phys, _l3_index(vaddr))
+        if not _pte_is_valid(l3_entry):
+            return nil
+
+        val base = _pte_output_addr(l3_entry)
+        val offset = vaddr & 0xFFF  # Lower 12 bits
+        PhysAddr(addr: base + offset)
+
+    fn create_address_space() -> u64:
+        """Allocate a new L0 root page table for a process.
+
+        Returns the physical address of the new L0 table, or 0 on failure.
+        Copies kernel-space entries (upper half) from the kernel L0 table.
+        """
+        val new_l0_phys = _early_alloc_page()
+        if new_l0_phys == 0:
+            return 0
+
+        # Copy kernel-space entries (upper half: indices 256..511)
+        var i: u64 = 256
+        while i < ENTRIES_PER_TABLE:
+            val entry = _read_pte(g_root_table_phys, i)
+            _write_pte(new_l0_phys, i, entry)
+            i = i + 1
+
+        new_l0_phys
+
+    fn switch_address_space(root_phys: u64):
+        """Switch to a different address space by loading TTBR0_EL1."""
+        msr_ttbr0_el1(root_phys)
+        tlbi_alle1()
+        dsb()
+        isb()
+
+    fn page_size() -> u64:
+        """Return page size in bytes (4KB for ARM64)."""
+        PAGE_SIZE
+
+    fn address_levels() -> u64:
+        """Return number of page table levels (4 for ARM64 with 4KB granule)."""
+        4

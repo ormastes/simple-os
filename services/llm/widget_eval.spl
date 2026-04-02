@@ -1,0 +1,419 @@
+# Widget DSL Evaluator — LLM Widget Tree Builder
+#
+# Parses LLM-generated widget descriptions and creates UISession widget trees.
+# Uses the existing builder API (common.ui.builder) for constructing nodes.
+#
+# Input format (indentation-based, SDN-like):
+#
+#   column:
+#       panel(title: "Dashboard"):
+#           row:
+#               label("CPU:")
+#               progress(value: 75, max: 100)
+#           row:
+#               label("Memory:")
+#               progress(value: 2048, max: 8192)
+#       table:
+#           headers: ["PID", "Name", "CPU%"]
+#           rows:
+#               [1, "init", 0.1]
+#               [42, "compositor", 2.5]
+#       statusbar("5 processes running")
+
+use common.ui.widget.{WidgetNode, UITree}
+use common.ui.session.{UISession, new_session}
+use common.ui.builder.{
+    column, row, panel, text_widget, label, button, input,
+    progress, table_widget, statusbar, list_widget, checkbox,
+    divider, build_tree
+}
+
+# =========================================================================
+# Parsed DSL Line
+# =========================================================================
+
+struct DslLine:
+    """A single parsed line from the widget DSL."""
+    indent: i32
+    widget_type: text
+    args: [DslArg]
+    is_container: bool      # true if line ends with ":"
+
+struct DslArg:
+    """A named or positional argument."""
+    name: text              # "" for positional
+    value: text
+
+# =========================================================================
+# WidgetDslEvaluator
+# =========================================================================
+
+class WidgetDslEvaluator:
+    """Parses LLM-generated widget descriptions and creates UISession widget trees."""
+    _id_counter: i32
+
+impl WidgetDslEvaluator:
+
+    static fn new() -> WidgetDslEvaluator:
+        """Create a new evaluator."""
+        return WidgetDslEvaluator(_id_counter: 0)
+
+    me evaluate(dsl: text) -> Result<UISession, text>:
+        """Parse indentation-based DSL and return a populated UISession.
+
+        Maps DSL elements to builder calls: column(), row(), panel(), text(), etc.
+        Returns populated UISession with the widget tree."""
+        val lines = _parse_dsl_lines(dsl)
+        if lines.len() == 0:
+            return Err("Empty DSL input")
+
+        val root_result = self._build_tree_from_lines(lines, 0, lines.len())
+        match root_result:
+            Ok(root_node):
+                val tree = build_tree(root_node)
+                val session = new_session(tree)
+                return Ok(session)
+            Err(e):
+                return Err(e)
+
+    me evaluate_into(dsl: text, session: UISession) -> Result<bool, text>:
+        """Update existing session with new DSL (hot-reload).
+
+        Parses the DSL and replaces the session's main tree."""
+        val lines = _parse_dsl_lines(dsl)
+        if lines.len() == 0:
+            return Err("Empty DSL input")
+
+        val root_result = self._build_tree_from_lines(lines, 0, lines.len())
+        match root_result:
+            Ok(root_node):
+                val tree = build_tree(root_node)
+                session.update_tree(tree)
+                return Ok(true)
+            Err(e):
+                return Err(e)
+
+    # =================================================================
+    # Internal: Tree Building
+    # =================================================================
+
+    me _next_id(prefix: text) -> text:
+        """Generate a unique widget ID."""
+        self._id_counter = self._id_counter + 1
+        return "{prefix}_{self._id_counter}"
+
+    me _build_tree_from_lines(lines: [DslLine], start: i32, end: i32) -> Result<WidgetNode, text>:
+        """Build a widget tree from a range of parsed DSL lines.
+
+        Uses indentation to determine parent-child relationships."""
+        if start >= end:
+            return Err("No lines to build")
+
+        val first = lines[start]
+        val node_result = self._create_widget(first)
+        match node_result:
+            Err(e):
+                return Err(e)
+            Ok(base_node):
+                pass_dn
+
+        var node = base_node
+
+        # If this is a container, find and build children
+        if first.is_container:
+            val child_indent = first.indent + 4
+            var i = start + 1
+            while i < end:
+                val line = lines[i]
+                # Stop if we've gone back to same or lower indent
+                if line.indent <= first.indent:
+                    break
+                # Direct child: at child_indent level
+                if line.indent >= child_indent:
+                    # Find the extent of this child (all lines with indent > line.indent)
+                    val child_start = i
+                    var child_end = i + 1
+                    while child_end < end:
+                        if lines[child_end].indent <= line.indent:
+                            break
+                        child_end = child_end + 1
+
+                    val child_result = self._build_tree_from_lines(lines, child_start, child_end)
+                    match child_result:
+                        Ok(child_node):
+                            node = node.add_child(child_node)
+                        Err(e):
+                            return Err(e)
+                    i = child_end
+                else:
+                    i = i + 1
+
+        return Ok(node)
+
+    me _create_widget(line: DslLine) -> Result<WidgetNode, text>:
+        """Create a single WidgetNode from a parsed DSL line."""
+        val wtype = line.widget_type
+        val args = line.args
+
+        if wtype == "column":
+            val id = self._next_id("col")
+            var node = WidgetNode.new(id, "panel")
+            node = node.set_layout("vbox")
+            return Ok(node)
+
+        elif wtype == "row":
+            val id = self._next_id("row")
+            var node = WidgetNode.new(id, "panel")
+            node = node.set_layout("hbox")
+            return Ok(node)
+
+        elif wtype == "panel":
+            val id = self._next_id("panel")
+            val title = _get_arg(args, "title", 0)
+            var node = WidgetNode.new(id, "panel")
+            node = node.set_layout("vbox")
+            if title != "":
+                node = node.set_prop("title", title)
+            return Ok(node)
+
+        elif wtype == "text":
+            val id = self._next_id("txt")
+            val content = _get_arg(args, "content", 0)
+            var node = WidgetNode.new(id, "text")
+            if content != "":
+                node = node.set_prop("content", content)
+            return Ok(node)
+
+        elif wtype == "label":
+            val id = self._next_id("lbl")
+            val label_text = _get_arg(args, "text", 0)
+            var node = WidgetNode.new(id, "text")
+            node = node.set_prop("label", label_text)
+            return Ok(node)
+
+        elif wtype == "button":
+            val id = self._next_id("btn")
+            val label_text = _get_arg(args, "label", 0)
+            val action = _get_named_arg(args, "action")
+            var node = WidgetNode.new(id, "button")
+            node = node.set_prop("label", label_text)
+            if action != "":
+                node = node.set_prop("action", action)
+            return Ok(node)
+
+        elif wtype == "input":
+            val id = self._next_id("inp")
+            val placeholder = _get_arg(args, "placeholder", 0)
+            var node = WidgetNode.new(id, "input")
+            if placeholder != "":
+                node = node.set_prop("placeholder", placeholder)
+            return Ok(node)
+
+        elif wtype == "progress":
+            val id = self._next_id("prog")
+            val value_str = _get_named_arg(args, "value")
+            var node = WidgetNode.new(id, "progress")
+            if value_str != "":
+                node = node.set_prop("value", value_str)
+            return Ok(node)
+
+        elif wtype == "table":
+            val id = self._next_id("tbl")
+            var node = WidgetNode.new(id, "table")
+            val headers_str = _get_named_arg(args, "headers")
+            if headers_str != "":
+                node = node.set_prop("headers", headers_str)
+            return Ok(node)
+
+        elif wtype == "statusbar":
+            val id = self._next_id("sbar")
+            val left = _get_arg(args, "left", 0)
+            var node = WidgetNode.new(id, "statusbar")
+            node = node.set_prop("left", left)
+            return Ok(node)
+
+        elif wtype == "list":
+            val id = self._next_id("lst")
+            var node = WidgetNode.new(id, "list")
+            return Ok(node)
+
+        elif wtype == "checkbox":
+            val id = self._next_id("chk")
+            val label_text = _get_arg(args, "label", 0)
+            var node = WidgetNode.new(id, "checkbox")
+            if label_text != "":
+                node = node.set_prop("label", label_text)
+            return Ok(node)
+
+        elif wtype == "divider":
+            val id = self._next_id("div")
+            val node = WidgetNode.new(id, "divider")
+            return Ok(node)
+
+        elif wtype == "image":
+            val id = self._next_id("img")
+            val src = _get_named_arg(args, "src")
+            val alt = _get_named_arg(args, "alt")
+            var node = WidgetNode.new(id, "image")
+            if src != "":
+                node = node.set_prop("src", src)
+            if alt != "":
+                node = node.set_prop("alt", alt)
+            return Ok(node)
+
+        elif wtype == "heading":
+            val id = self._next_id("hdg")
+            val content = _get_arg(args, "content", 0)
+            var node = WidgetNode.new(id, "heading")
+            if content != "":
+                node = node.set_prop("content", content)
+            return Ok(node)
+
+        else:
+            # Unknown type: create as generic panel
+            val id = self._next_id("w")
+            var node = WidgetNode.new(id, "panel")
+            return Ok(node)
+
+# =========================================================================
+# DSL Line Parsing
+# =========================================================================
+
+fn _parse_dsl_lines(dsl: text) -> [DslLine]:
+    """Parse a multi-line DSL string into structured DslLine entries."""
+    var normalized = dsl.replace("\r\n", "\n")
+    normalized = normalized.replace("\r", "\n")
+    val raw_lines = normalized.split("\n")
+    var result: [DslLine] = []
+
+    for raw_line in raw_lines:
+        val stripped = raw_line.strip()
+        if stripped == "":
+            continue
+        if stripped.starts_with("#"):
+            continue
+
+        val indent = _count_indent(raw_line)
+        val parsed = _parse_single_line(stripped)
+        val line = DslLine(
+            indent: indent,
+            widget_type: parsed.widget_type,
+            args: parsed.args,
+            is_container: stripped.ends_with(":")
+        )
+        result = result + [line]
+
+    return result
+
+struct _ParsedLine:
+    widget_type: text
+    args: [DslArg]
+
+fn _parse_single_line(stripped: text) -> _ParsedLine:
+    """Parse a single stripped DSL line into widget type and args.
+
+    Formats supported:
+      widget_type:                         (container, no args)
+      widget_type(arg1, key: arg2):        (container with args)
+      widget_type("positional")            (leaf with positional arg)
+      widget_type(key: "value")            (leaf with named arg)
+    """
+    # Remove trailing colon for containers
+    var line = stripped
+    if line.ends_with(":"):
+        line = line[0:line.len() - 1].strip()
+
+    # Find opening paren for args
+    val paren_idx = line.index_of("(")
+    match paren_idx:
+        Some(pi):
+            val wtype = line[0:pi].strip()
+            # Extract args between parens
+            val close_idx = line.index_of(")")
+            var args_str = ""
+            match close_idx:
+                Some(ci):
+                    args_str = line[pi + 1:ci]
+                _:
+                    args_str = line[pi + 1:]
+            val args = _parse_args(args_str)
+            return _ParsedLine(widget_type: wtype, args: args)
+        _:
+            return _ParsedLine(widget_type: line.strip(), args: [])
+
+fn _parse_args(args_str: text) -> [DslArg]:
+    """Parse comma-separated arguments: positional or name: value."""
+    if args_str.strip() == "":
+        return []
+
+    val parts = args_str.split(",")
+    var result: [DslArg] = []
+
+    for part in parts:
+        val trimmed = part.strip()
+        if trimmed == "":
+            continue
+        # Check for named arg (key: value)
+        val colon_idx = trimmed.index_of(":")
+        match colon_idx:
+            Some(ci):
+                val name = trimmed[0:ci].strip()
+                val value = _strip_quotes(trimmed[ci + 1:].strip())
+                result = result + [DslArg(name: name, value: value)]
+            _:
+                # Positional arg
+                val value = _strip_quotes(trimmed)
+                result = result + [DslArg(name: "", value: value)]
+
+    return result
+
+# =========================================================================
+# Argument Helpers
+# =========================================================================
+
+fn _get_arg(args: [DslArg], name: text, pos: i32) -> text:
+    """Get an argument by name or positional index."""
+    # Try named first
+    for arg in args:
+        if arg.name == name:
+            return arg.value
+    # Fall back to positional
+    var idx = 0
+    for arg in args:
+        if arg.name == "":
+            if idx == pos:
+                return arg.value
+            idx = idx + 1
+    return ""
+
+fn _get_named_arg(args: [DslArg], name: text) -> text:
+    """Get a named argument only."""
+    for arg in args:
+        if arg.name == name:
+            return arg.value
+    return ""
+
+fn _strip_quotes(s: text) -> text:
+    """Strip surrounding quotes from a string."""
+    val len = s.len()
+    if len >= 2:
+        if s.starts_with("\""):
+            if s.ends_with("\""):
+                return s[1:len - 1]
+        if s.starts_with("'"):
+            if s.ends_with("'"):
+                return s[1:len - 1]
+    return s
+
+fn _count_indent(line: text) -> i32:
+    """Count leading spaces in a line."""
+    var count = 0
+    var i = 0
+    val len = line.len()
+    while i < len:
+        if line[i] == " ":
+            count = count + 1
+        else:
+            return count
+        i = i + 1
+    return count

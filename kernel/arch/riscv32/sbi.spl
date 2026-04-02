@@ -1,0 +1,141 @@
+# RISC-V 32 SBI Interface — Supervisor Binary Interface Calls
+#
+# SBI (Supervisor Binary Interface) is the standard firmware interface
+# for RISC-V S-mode kernels. The kernel makes ecall instructions to
+# request services from the SBI firmware (OpenSBI on QEMU).
+#
+# SBI calling convention (same for rv32 and rv64):
+#   a7 = extension ID (EID)
+#   a6 = function ID (FID)
+#   a0-a5 = arguments
+#   Returns: a0 = error code, a1 = value
+#
+# On rv32, all register values are 32-bit. For 64-bit values (like
+# timer deadlines), the low word goes in the first register and
+# the high word in the next.
+#
+# SBI extensions used:
+#   0x00 — Legacy: Console Putchar (deprecated but works on QEMU)
+#   0x01 — Legacy: Console Getchar
+#   0x08 — Legacy: Shutdown
+#   0x54494D45 ("TIME") — Timer extension
+#   0x48534D  ("HSM") — Hart State Management
+#   0x53525354 ("SRST") — System Reset
+
+# ============================================================================
+# SBI Call Externs (runtime-provided ecall wrappers)
+# ============================================================================
+
+extern fn rt_rv32_sbi_call(eid: u32, fid: u32, a0: u32, a1: u32, a2: u32) -> (u32, u32)
+
+# ============================================================================
+# SBI Extension IDs
+# ============================================================================
+
+val SBI_EXT_PUTCHAR: u32 = 0x01          # Legacy console putchar
+val SBI_EXT_GETCHAR: u32 = 0x02          # Legacy console getchar
+val SBI_EXT_SHUTDOWN: u32 = 0x08         # Legacy shutdown
+val SBI_EXT_TIMER: u32 = 0x54494D45      # Timer extension ("TIME")
+val SBI_EXT_HSM: u32 = 0x48534D          # Hart State Management
+val SBI_EXT_SRST: u32 = 0x53525354       # System Reset ("SRST")
+
+# SBI Timer function IDs
+val SBI_TIMER_SET_TIMER: u32 = 0
+
+# SBI HSM function IDs
+val SBI_HSM_HART_START: u32 = 0
+val SBI_HSM_HART_STOP: u32 = 1
+val SBI_HSM_HART_STATUS: u32 = 2
+
+# SBI SRST function IDs
+val SBI_SRST_RESET: u32 = 0
+
+# SBI error codes
+val SBI_SUCCESS: u32 = 0
+val SBI_ERR_FAILED: u32 = 0xFFFFFFFF     # -1 as u32
+val SBI_ERR_NOT_SUPPORTED: u32 = 0xFFFFFFFE  # -2 as u32
+val SBI_ERR_INVALID_PARAM: u32 = 0xFFFFFFFD  # -3 as u32
+
+# ============================================================================
+# SBI Call Wrapper
+# ============================================================================
+
+fn sbi_call(eid: u32, fid: u32, a0: u32, a1: u32, a2: u32) -> (u32, u32):
+    """Make an SBI ecall with the given extension/function IDs and arguments.
+
+    Returns (error_code, value).
+    """
+    rt_rv32_sbi_call(eid, fid, a0, a1, a2)
+
+# ============================================================================
+# Legacy Console (works on all SBI implementations)
+# ============================================================================
+
+fn sbi_putchar(ch: u8):
+    """Write a character to the SBI debug console (legacy extension)."""
+    sbi_call(SBI_EXT_PUTCHAR, 0, ch as u32, 0, 0)
+
+fn sbi_getchar() -> i32:
+    """Read a character from the SBI debug console (legacy extension).
+
+    Returns the character, or -1 if no character is available.
+    """
+    val (error, value) = sbi_call(SBI_EXT_GETCHAR, 0, 0, 0, 0)
+    value as i32
+
+# ============================================================================
+# Timer Extension
+# ============================================================================
+
+fn sbi_set_timer(stime_value: u64):
+    """Set the timer to fire at the given absolute mtime value.
+
+    On rv32, the 64-bit value is split: low word in a0, high word in a1.
+    """
+    val lo = (stime_value & 0xFFFFFFFF) as u32
+    val hi = (stime_value >> 32) as u32
+    sbi_call(SBI_EXT_TIMER, SBI_TIMER_SET_TIMER, lo, hi, 0)
+
+# ============================================================================
+# System Reset
+# ============================================================================
+
+fn sbi_shutdown():
+    """Shut down the system via SBI (legacy extension)."""
+    sbi_call(SBI_EXT_SHUTDOWN, 0, 0, 0, 0)
+
+fn sbi_system_reset(reset_type: u32, reset_reason: u32):
+    """Request system reset via SBI SRST extension.
+
+    reset_type: 0=shutdown, 1=cold_reboot, 2=warm_reboot
+    reset_reason: 0=none, 1=system_failure
+    """
+    sbi_call(SBI_EXT_SRST, SBI_SRST_RESET, reset_type, reset_reason, 0)
+
+# ============================================================================
+# Hart State Management
+# ============================================================================
+
+fn sbi_hart_start(hartid: u32, start_addr: u32, opaque: u32) -> u32:
+    """Start a stopped hart at the given address.
+
+    Returns SBI error code (0 = success).
+    """
+    val (error, _value) = sbi_call(SBI_EXT_HSM, SBI_HSM_HART_START, hartid, start_addr, opaque)
+    error
+
+fn sbi_hart_stop() -> u32:
+    """Stop the calling hart.
+
+    Returns SBI error code (should not return on success).
+    """
+    val (error, _value) = sbi_call(SBI_EXT_HSM, SBI_HSM_HART_STOP, 0, 0, 0)
+    error
+
+fn sbi_hart_status(hartid: u32) -> u32:
+    """Get the status of a hart.
+
+    Returns: 0=STARTED, 1=STOPPED, 2=START_PENDING, 3=STOP_PENDING
+    """
+    val (_error, value) = sbi_call(SBI_EXT_HSM, SBI_HSM_HART_STATUS, hartid, 0, 0)
+    value

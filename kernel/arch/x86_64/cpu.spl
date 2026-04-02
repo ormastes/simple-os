@@ -1,0 +1,201 @@
+# x86_64 CPU Primitives — Low-Level CPU Operations
+#
+# Wraps C runtime functions for privileged x86_64 CPU operations:
+# port I/O, control registers, MSRs, interrupt control, descriptor
+# table loading.
+#
+# These are all x86_64-specific instructions that have no equivalent
+# on other architectures (e.g., RISC-V uses CSRs instead of MSRs,
+# MMIO instead of port I/O).
+
+# ============================================================================
+# Port I/O
+# ============================================================================
+
+extern fn rt_port_inb(port: u16) -> u8
+extern fn rt_port_outb(port: u16, value: u8)
+extern fn rt_port_inw(port: u16) -> u16
+extern fn rt_port_outw(port: u16, value: u16)
+extern fn rt_port_inl(port: u16) -> u32
+extern fn rt_port_outl(port: u16, value: u32)
+extern fn rt_port_io_wait()
+
+fn port_inb(port: u16) -> u8:
+    """Read byte from I/O port."""
+    rt_port_inb(port)
+
+fn port_outb(port: u16, value: u8):
+    """Write byte to I/O port."""
+    rt_port_outb(port, value)
+
+fn port_outb_wait(port: u16, value: u8):
+    """Write byte to I/O port with I/O wait."""
+    rt_port_outb(port, value)
+    rt_port_io_wait()
+
+fn port_inw(port: u16) -> u16:
+    """Read word from I/O port."""
+    rt_port_inw(port)
+
+fn port_outw(port: u16, value: u16):
+    """Write word to I/O port."""
+    rt_port_outw(port, value)
+
+fn port_inl(port: u16) -> u32:
+    """Read dword from I/O port."""
+    rt_port_inl(port)
+
+fn port_outl(port: u16, value: u32):
+    """Write dword to I/O port."""
+    rt_port_outl(port, value)
+
+# ============================================================================
+# Control Registers
+# ============================================================================
+
+extern fn rt_read_cr3() -> u64
+extern fn rt_write_cr3(value: u64)
+extern fn rt_read_cr2() -> u64
+extern fn rt_invlpg(addr: u64)
+
+fn read_cr3() -> u64:
+    """Read CR3 (page table base address)."""
+    rt_read_cr3()
+
+fn write_cr3(value: u64):
+    """Write CR3 (switch page tables, flush TLB)."""
+    rt_write_cr3(value)
+
+fn read_cr2() -> u64:
+    """Read CR2 (faulting address after page fault)."""
+    rt_read_cr2()
+
+fn invlpg(addr: u64):
+    """Invalidate TLB entry for given virtual address."""
+    rt_invlpg(addr)
+
+# ============================================================================
+# Model Specific Registers
+# ============================================================================
+
+extern fn rt_read_msr(msr: u32) -> u64
+extern fn rt_write_msr(msr: u32, value: u64)
+
+fn read_msr(msr: u32) -> u64:
+    """Read Model Specific Register."""
+    rt_read_msr(msr)
+
+fn write_msr(msr: u32, value: u64):
+    """Write Model Specific Register."""
+    rt_write_msr(msr, value)
+
+# Common MSR addresses
+val MSR_APIC_BASE: u32 = 0x1B
+val MSR_EFER: u32 = 0xC0000080
+val MSR_STAR: u32 = 0xC0000081        # Syscall segment bases
+val MSR_LSTAR: u32 = 0xC0000082       # Syscall entry point (64-bit)
+val MSR_SFMASK: u32 = 0xC0000084      # Syscall RFLAGS mask
+val MSR_FS_BASE: u32 = 0xC0000100
+val MSR_GS_BASE: u32 = 0xC0000101
+val MSR_KERNEL_GS_BASE: u32 = 0xC0000102
+
+# ============================================================================
+# Interrupt Control
+# ============================================================================
+
+extern fn rt_cli()
+extern fn rt_sti()
+extern fn rt_hlt()
+
+fn cli():
+    """Disable interrupts."""
+    rt_cli()
+
+fn sti():
+    """Enable interrupts."""
+    rt_sti()
+
+fn hlt():
+    """Halt until next interrupt."""
+    rt_hlt()
+
+fn halt_loop():
+    """Halt forever (used for unrecoverable errors)."""
+    cli()
+    while true:
+        hlt()
+
+# ============================================================================
+# Descriptor Table Loading
+# ============================================================================
+
+extern fn rt_lgdt(gdtr_addr: u64)
+extern fn rt_lidt(idtr_addr: u64)
+extern fn rt_ltr(selector: u16)
+
+fn lgdt(gdtr_addr: u64):
+    """Load Global Descriptor Table Register."""
+    rt_lgdt(gdtr_addr)
+
+fn lidt(idtr_addr: u64):
+    """Load Interrupt Descriptor Table Register."""
+    rt_lidt(idtr_addr)
+
+fn ltr(selector: u16):
+    """Load Task Register (TSS selector)."""
+    rt_ltr(selector)
+
+# ============================================================================
+# X86Cpu — HAL-Compatible CPU Interface
+# ============================================================================
+
+struct X86Cpu:
+    """x86_64 CPU primitives.
+
+    Provides architecture-specific CPU operations: port I/O,
+    control registers, MSRs, interrupt control, descriptor table
+    loading, TLB management.
+    """
+    pass_dn
+
+impl X86Cpu:
+    fn cpu_id() -> u64:
+        """Return current CPU ID. Single CPU for now."""
+        0
+
+    fn cpu_address_width() -> u64:
+        """Return virtual address width in bits."""
+        64
+
+    fn cpu_enable_interrupts():
+        """Enable interrupts (STI)."""
+        sti()
+
+    fn cpu_disable_interrupts():
+        """Disable interrupts (CLI)."""
+        cli()
+
+    fn cpu_halt():
+        """Halt until next interrupt (HLT)."""
+        hlt()
+
+    fn cpu_halt_loop():
+        """Disable interrupts and halt forever."""
+        halt_loop()
+
+    fn cpu_flush_tlb(addr: u64):
+        """Invalidate TLB entry for a single virtual address."""
+        invlpg(addr)
+
+    fn cpu_flush_tlb_all():
+        """Flush entire TLB by rewriting CR3."""
+        val cr3 = read_cr3()
+        write_cr3(cr3)
+
+    fn cpu_read_page_table_base() -> u64:
+        """Read current page table base (CR3)."""
+        read_cr3()
+
+    fn cpu_write_page_table_base(addr: u64):
+        """Write page table base (CR3), switching address space."""
+        write_cr3(addr)

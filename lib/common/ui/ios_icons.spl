@@ -1,0 +1,112 @@
+# iOS Icon System
+#
+# Unicode character lookup for common UI icons.
+# Text-based fallback for SF Symbols — works in both TUI and HTML.
+
+fn ios_icon(name: text) -> text:
+    """Return a Unicode character for the given icon name.
+    Names follow SF Symbols naming conventions."""
+    match name:
+        # Navigation
+        "chevron.right" => return "\u{203A}"
+        "chevron.left" => return "\u{2039}"
+        "chevron.down" => return "\u{25BE}"
+        "chevron.up" => return "\u{25B4}"
+        "arrow.left" => return "\u{2190}"
+        "arrow.right" => return "\u{2192}"
+        "arrow.up" => return "\u{2191}"
+        "arrow.down" => return "\u{2193}"
+        "arrow.uturn.left" => return "\u{21A9}"
+
+        # Actions
+        "checkmark" => return "\u{2713}"
+        "xmark" => return "\u{2717}"
+        "plus" => return "+"
+        "minus" => return "\u{2212}"
+        "plus.circle" => return "\u{2295}"
+        "minus.circle" => return "\u{2296}"
+
+        # Search
+        "magnifyingglass" => return "\u{1F50D}"
+
+        # System
+        "gear" => return "\u{2699}"
+        "house" => return "\u{2302}"
+        "bell" => return "\u{1F514}"
+        "bell.fill" => return "\u{1F515}"
+
+        # People
+        "person" => return "\u{1F464}"
+        "person.fill" => return "\u{1F464}"
+        "person.2" => return "\u{1F465}"
+
+        # Favorites
+        "star" => return "\u{2606}"
+        "star.fill" => return "\u{2605}"
+        "heart" => return "\u{2661}"
+        "heart.fill" => return "\u{2665}"
+
+        # Objects
+        "trash" => return "\u{1F5D1}"
+        "pencil" => return "\u{270E}"
+        "pencil.line" => return "\u{270F}"
+        "folder" => return "\u{1F4C1}"
+        "folder.fill" => return "\u{1F4C2}"
+        "doc" => return "\u{1F4C4}"
+        "doc.text" => return "\u{1F4C3}"
+        "paperplane" => return "\u{1F4E8}"
+        "paperplane.fill" => return "\u{2708}"
+        "paperclip" => return "\u{1F4CE}"
+        "calendar" => return "\u{1F4C5}"
+        "clock" => return "\u{1F553}"
+
+        # Media
+        "photo" => return "\u{1F5BC}"
+        "play" => return "\u{25B6}"
+        "pause" => return "\u{23F8}"
+        "stop" => return "\u{23F9}"
+
+        # Shapes
+        "circle" => return "\u{25CB}"
+        "circle.fill" => return "\u{25CF}"
+        "square" => return "\u{25A1}"
+        "square.fill" => return "\u{25A0}"
+        "triangle" => return "\u{25B3}"
+        "triangle.fill" => return "\u{25B2}"
+
+        # Communication
+        "envelope" => return "\u{2709}"
+        "envelope.fill" => return "\u{1F4E7}"
+        "bubble.left" => return "\u{1F4AC}"
+        "phone" => return "\u{260E}"
+
+        # Layout
+        "list.bullet" => return "\u{2630}"
+        "square.grid.2x2" => return "\u{2637}"
+        "sidebar.left" => return "\u{2261}"
+        "line.3.horizontal" => return "\u{2630}"
+
+        # Status
+        "exclamationmark.triangle" => return "\u{26A0}"
+        "info.circle" => return "\u{2139}"
+        "questionmark.circle" => return "?"
+
+        # Office-specific
+        "bold" => return "B"
+        "italic" => return "I"
+        "underline" => return "U"
+        "text.alignleft" => return "\u{2261}"
+        "text.aligncenter" => return "\u{2261}"
+        "text.alignright" => return "\u{2261}"
+        "tablecells" => return "\u{2637}"
+        "chart.bar" => return "\u{2584}"
+        "slider.horizontal.3" => return "\u{2630}"
+
+        _ => return "\u{25CF}"
+
+fn ios_icon_with_fallback(name: text, fallback: text) -> text:
+    """Return an icon for the given name, or the fallback text if not found."""
+    val icon = ios_icon(name)
+    if icon == "\u{25CF}":
+        return fallback
+    return icon

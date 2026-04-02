@@ -1,0 +1,29 @@
+# Scheduler Layer — Input/Output Ports
+#
+# Input: InterruptOutputPort (timer for preemption), MemoryOutputPort (task stacks)
+# Output: task management for IPC and all services.
+
+use os.kernel.types.task_types.{TaskId, TaskState, TaskPriority, TaskContext}
+use os.kernel.interrupts.ports.{InterruptOutputPort}
+use os.kernel.memory.ports.{MemoryOutputPort}
+
+struct SchedulerInputPort:
+    """What scheduler needs from lower layers."""
+    interrupts: InterruptOutputPort
+    memory: MemoryOutputPort
+
+struct SchedulerOutputPort:
+    """What scheduler provides to upper layers."""
+    # Task lifecycle
+    create_fn: fn(u64, TaskPriority) -> TaskId
+    exit_fn: fn(i32)
+    yield_fn: fn()
+
+    # Task state
+    get_current_fn: fn() -> TaskId
+    get_state_fn: fn(TaskId) -> TaskState
+    set_priority_fn: fn(TaskId, TaskPriority)
+
+    # Blocking
+    block_fn: fn(TaskId)
+    unblock_fn: fn(TaskId)

@@ -1,0 +1,96 @@
+# RISC-V 32 Context Switch — Register Save/Restore
+#
+# Context switching for RISC-V 32-bit S-mode.
+# All registers are 32-bit (u32). The saved state includes:
+#   - General purpose registers (x1-x31, excluding x0=zero)
+#   - sepc (supervisor exception program counter)
+#   - sstatus (supervisor status register)
+#   - scause (supervisor cause register)
+#
+# See os.kernel.arch.arch_context.Riscv32Context for the register layout.
+
+use os.kernel.arch.arch_context.{ArchContext, Riscv32Context}
+use os.kernel.arch.riscv32.cpu.{SSTATUS_SPIE, SSTATUS_SPP}
+
+# ============================================================================
+# Rv32ContextSwitch
+# ============================================================================
+
+struct Rv32ContextSwitch:
+    """RISC-V 32-bit context switching implementation.
+
+    Named Rv32ContextSwitch (not Rv32Context) to avoid collision
+    with the Riscv32Context register state struct in arch_context.spl.
+    """
+    pass_dn
+
+# ============================================================================
+# Context Helpers
+# ============================================================================
+
+fn _zero_context() -> Riscv32Context:
+    """Create a zeroed Riscv32Context."""
+    Riscv32Context(
+        ra: 0, sp: 0, gp: 0, tp: 0,
+        t0: 0, t1: 0, t2: 0,
+        s0: 0, s1: 0,
+        a0: 0, a1: 0, a2: 0, a3: 0, a4: 0, a5: 0, a6: 0, a7: 0,
+        s2: 0, s3: 0, s4: 0, s5: 0, s6: 0, s7: 0, s8: 0, s9: 0, s10: 0, s11: 0,
+        t3: 0, t4: 0, t5: 0, t6: 0,
+        sepc: 0, sstatus: 0, scause: 0
+    )
+
+# ============================================================================
+# HAL Implementation
+# ============================================================================
+
+impl Rv32ContextSwitch:
+    fn init():
+        """Initialize context switching (no-op for now)."""
+        pass_do_nothing
+
+    fn create(entry_point: u64, stack_top: u64, arg: u64) -> ArchContext:
+        """Create a new CPU context for a task.
+
+        Sets up the register state so that when switched to,
+        execution begins at entry_point with the given stack.
+
+        entry_point: function address to start executing (truncated to u32)
+        stack_top: top of the stack (truncated to u32)
+        arg: first argument passed in a0 (truncated to u32)
+        """
+        var ctx = _zero_context()
+
+        # sepc = entry point (where sret will jump to)
+        ctx.sepc = entry_point as u32
+
+        # sp = stack top (must be 16-byte aligned)
+        ctx.sp = stack_top as u32
+
+        # a0 = first argument
+        ctx.a0 = arg as u32
+
+        # sstatus: set SPIE (enable interrupts after sret) and SPP (S-mode)
+        ctx.sstatus = SSTATUS_SPIE | SSTATUS_SPP
+
+        ArchContext.Riscv32(ctx: ctx)
+
+    fn context_init(entry: u64, stack: u64, arg: u64) -> ArchContext:
+        """Alias for create() — matches HalContext trait signature."""
+        self.create(entry, stack, arg)
+
+    fn switch(from_ctx: Riscv32Context, to_ctx: Riscv32Context):
+        """Switch from one context to another.
+
+        Saves current register state into from_ctx, loads to_ctx.
+        This is the core context switch — implemented in assembly.
+        """
+        pass_todo("assembly: save regs to from_ctx, load regs from to_ctx, sret")
+
+    fn save() -> ArchContext:
+        """Save the current CPU register state."""
+        pass_todo("assembly: read all registers into Riscv32Context")
+
+    fn restore(ctx: ArchContext):
+        """Restore a previously saved CPU register state."""
+        pass_todo("assembly: write all registers from Riscv32Context, sret")

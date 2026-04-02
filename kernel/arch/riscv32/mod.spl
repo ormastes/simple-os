@@ -1,0 +1,44 @@
+# RISC-V 32 HAL Implementation — Module Root
+#
+# Aggregates all riscv32-specific HAL implementations.
+# Each submodule wraps architecture-specific primitives behind
+# a HAL-compatible interface for the kernel's portable layers.
+#
+# RISC-V 32 targets the QEMU virt machine in S-mode (via OpenSBI).
+# Key differences from rv64: 32-bit registers, Sv32 paging (2-level),
+# kernel loaded at 0x80400000.
+
+use os.kernel.arch.riscv32.console.{Rv32Console}
+use os.kernel.arch.riscv32.boot.{Rv32Boot}
+use os.kernel.arch.riscv32.cpu.{Rv32Cpu}
+use os.kernel.arch.riscv32.paging.{Rv32Paging}
+use os.kernel.arch.riscv32.interrupt.{Rv32Interrupt}
+use os.kernel.arch.riscv32.timer.{Rv32Timer}
+use os.kernel.arch.riscv32.context.{Rv32ContextSwitch}
+
+struct Riscv32Hal:
+    """RISC-V 32-bit Hardware Abstraction Layer.
+
+    Composes all riscv32-specific HAL subsystems into a single aggregate.
+    The kernel portable layer dispatches through this struct to access
+    architecture-specific functionality.
+    """
+    console: Rv32Console
+    boot: Rv32Boot
+    cpu: Rv32Cpu
+    paging: Rv32Paging
+    interrupt: Rv32Interrupt
+    timer: Rv32Timer
+    context: Rv32ContextSwitch
+
+fn create_riscv32_hal() -> Riscv32Hal:
+    """Create RISC-V 32 HAL with default configuration."""
+    Riscv32Hal(
+        console: Rv32Console(),
+        boot: Rv32Boot(),
+        cpu: Rv32Cpu(),
+        paging: Rv32Paging(),
+        interrupt: Rv32Interrupt(),
+        timer: Rv32Timer(),
+        context: Rv32ContextSwitch()
+    )

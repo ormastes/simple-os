@@ -1,0 +1,111 @@
+# Async UI Event Loop
+#
+# Core async event loop that all backends use. Events are pushed to a
+# channel-based bus by backends, and the loop processes them and queues
+# render requests. Render batching ensures only the latest state is
+# drawn when multiple events arrive between frames.
+#
+# Usage:
+#   val bus = new_event_bus()
+#   # Backend pushes events: bus.events.send(UIEvent.KeyPress(key: "j"))
+#   run_async_ui(bus, initial_state, \s: render(s))
+
+use common.ui.widget.{UIState, UIEvent}
+use common.ui.state.{update_state}
+use nogc_async_mut.concurrent.channel.{Channel, channel_new}
+use nogc_async_mut.async_host.runtime.{HostRuntime}
+
+# =========================================================================
+# UIEventBus — channel-based event transport
+# =========================================================================
+
+struct UIEventBus:
+    """Channel pair for async UI communication.
+
+    events:       backends push UIEvent values here
+    render_queue: loop pushes UIState snapshots for the renderer
+    running:      flag to stop the loop
+    """
+    events: Channel
+    render_queue: Channel
+    running: bool
+
+fn new_event_bus() -> UIEventBus:
+    """Create a fresh event bus with open channels."""
+    return UIEventBus(
+        events: channel_new(),
+        render_queue: channel_new(),
+        running: true
+    )
+
+# =========================================================================
+# Async main loop
+# =========================================================================
+
+fn run_async_ui(bus: UIEventBus, initial_state: UIState, render_fn: fn(UIState)):
+    """Run the async UI event loop.
+
+    Blocks the calling thread until the loop finishes (Quit event or
+    channel close). Uses HostRuntime.block_on internally.
+
+    Args:
+        bus:           Event bus for communication
+        initial_state: Starting UIState
+        render_fn:     Callback invoked with the latest state to render
+    """
+    val runtime = HostRuntime.new()
+    runtime.block_on(async_main_loop(bus, initial_state, render_fn))
+
+fn async_main_loop(bus: UIEventBus, initial_state: UIState, render_fn: fn(UIState)):
+    """Inner loop — polls events, updates state, batches renders.
+
+    Runs until bus.running becomes false (Quit event) or the event
+    channel is closed.
+    """
+    var current_state = initial_state
+
+    # Initial render so the user sees something immediately
+    render_fn(current_state)
+
+    while bus.running:
+        # --- Event phase: drain all pending events ---
+        val event = bus.events.try_recv()
+        if event != nil:
+            match event:
+                UIEvent.Quit:
+                    bus.running = false
+                _:
+                    current_state = update_state(current_state, event)
+                    # Queue a render with the updated state
+                    bus.render_queue.send(current_state)
+
+        # If the event channel is closed and empty, stop
+        if event == nil and bus.events.is_closed():
+            bus.running = false
+
+        # --- Render phase: batch — only render latest ---
+        var latest_state: UIState? = nil
+        var has_render = true
+        while has_render:
+            val queued = bus.render_queue.try_recv()
+            if queued != nil:
+                latest_state = queued
+            else:
+                has_render = false
+
+        if latest_state != nil:
+            render_fn(latest_state)
+
+# =========================================================================
+# Convenience helpers
+# =========================================================================
+
+fn stop_event_bus(bus: UIEventBus):
+    """Gracefully shut down the event bus."""
+    bus.running = false
+    bus.events.close()
+    bus.render_queue.close()
+
+fn send_event(bus: UIEventBus, event: UIEvent):
+    """Push an event into the bus (thread-safe, non-blocking)."""
+    bus.events.send(event)

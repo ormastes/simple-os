@@ -1,0 +1,11 @@
+# @platform: baremetal
+#
+# Bare-Metal Common Module
+#
+# Platform-independent utilities for bare-metal development.
+#
+# Components:
+# - test_harness: SSpec-compatible test framework for bare-metal
+
+
+mod test_harness

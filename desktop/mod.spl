@@ -1,0 +1,12 @@
+# SimpleOS Desktop Environment
+#
+# Desktop shell and system UI built on existing widget builder DSL:
+#   - Taskbar (window list, system tray, clock)
+#   - App launcher
+#   - Settings panel
+#   - Notification system
+#
+# Modules:
+#   - shell.spl — DesktopShell: taskbar, launcher, window list, clock
+
+use os.desktop.shell.{DesktopShell}

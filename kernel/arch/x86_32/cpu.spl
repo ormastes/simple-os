@@ -1,0 +1,196 @@
+# x86_32 CPU Primitives — Low-Level CPU Operations
+#
+# Wraps C runtime functions for privileged x86 32-bit CPU operations:
+# port I/O, control registers, interrupt control, descriptor table loading.
+#
+# These are x86-specific instructions. Unlike x86_64, there are no MSRs
+# for SYSCALL/SYSRET, no SWAPGS, and control registers are 32-bit.
+
+# ============================================================================
+# Port I/O
+# ============================================================================
+
+extern fn rt_port_inb(port: u16) -> u8
+extern fn rt_port_outb(port: u16, value: u8)
+extern fn rt_port_inw(port: u16) -> u16
+extern fn rt_port_outw(port: u16, value: u16)
+extern fn rt_port_inl(port: u16) -> u32
+extern fn rt_port_outl(port: u16, value: u32)
+extern fn rt_port_io_wait()
+
+fn port_inb(port: u16) -> u8:
+    """Read byte from I/O port."""
+    rt_port_inb(port)
+
+fn port_outb(port: u16, value: u8):
+    """Write byte to I/O port."""
+    rt_port_outb(port, value)
+
+fn port_outb_wait(port: u16, value: u8):
+    """Write byte to I/O port with I/O wait."""
+    rt_port_outb(port, value)
+    rt_port_io_wait()
+
+fn port_inw(port: u16) -> u16:
+    """Read word from I/O port."""
+    rt_port_inw(port)
+
+fn port_outw(port: u16, value: u16):
+    """Write word to I/O port."""
+    rt_port_outw(port, value)
+
+fn port_inl(port: u16) -> u32:
+    """Read dword from I/O port."""
+    rt_port_inl(port)
+
+fn port_outl(port: u16, value: u32):
+    """Write dword to I/O port."""
+    rt_port_outl(port, value)
+
+# ============================================================================
+# Control Registers (32-bit)
+# ============================================================================
+
+extern fn rt_read_cr0() -> u32
+extern fn rt_write_cr0(value: u32)
+extern fn rt_read_cr2() -> u32
+extern fn rt_read_cr3() -> u32
+extern fn rt_write_cr3(value: u32)
+extern fn rt_invlpg(addr: u32)
+
+fn read_cr0() -> u32:
+    """Read CR0 (system control flags: PE, PG, etc.)."""
+    rt_read_cr0()
+
+fn write_cr0(value: u32):
+    """Write CR0 (enable/disable paging, protection, etc.)."""
+    rt_write_cr0(value)
+
+fn read_cr2() -> u32:
+    """Read CR2 (faulting address after page fault)."""
+    rt_read_cr2()
+
+fn read_cr3() -> u32:
+    """Read CR3 (page directory base address)."""
+    rt_read_cr3()
+
+fn write_cr3(value: u32):
+    """Write CR3 (switch page directory, flush TLB)."""
+    rt_write_cr3(value)
+
+fn invlpg(addr: u32):
+    """Invalidate TLB entry for given virtual address."""
+    rt_invlpg(addr)
+
+# ============================================================================
+# Interrupt Control
+# ============================================================================
+
+extern fn rt_cli()
+extern fn rt_sti()
+extern fn rt_hlt()
+
+fn cli():
+    """Disable interrupts."""
+    rt_cli()
+
+fn sti():
+    """Enable interrupts."""
+    rt_sti()
+
+fn hlt():
+    """Halt until next interrupt."""
+    rt_hlt()
+
+fn halt_loop():
+    """Halt forever (used for unrecoverable errors)."""
+    cli()
+    while true:
+        hlt()
+
+# ============================================================================
+# Descriptor Table Loading
+# ============================================================================
+
+extern fn rt_lgdt(gdtr_addr: u32)
+extern fn rt_lidt(idtr_addr: u32)
+extern fn rt_ltr(selector: u16)
+
+fn lgdt(gdtr_addr: u32):
+    """Load Global Descriptor Table Register."""
+    rt_lgdt(gdtr_addr)
+
+fn lidt(idtr_addr: u32):
+    """Load Interrupt Descriptor Table Register."""
+    rt_lidt(idtr_addr)
+
+fn ltr(selector: u16):
+    """Load Task Register (TSS selector)."""
+    rt_ltr(selector)
+
+# ============================================================================
+# GDT Segment Selectors (x86_32 standard layout)
+# ============================================================================
+
+val GDT_NULL: u16 = 0x00           # Null descriptor (required)
+val GDT_KERNEL_CODE: u16 = 0x08    # Ring 0 code segment (32-bit)
+val GDT_KERNEL_DATA: u16 = 0x10    # Ring 0 data segment
+val GDT_USER_CODE: u16 = 0x18      # Ring 3 code segment (32-bit)
+val GDT_USER_DATA: u16 = 0x20      # Ring 3 data segment
+val GDT_TSS: u16 = 0x28            # Task State Segment
+
+# ============================================================================
+# X86_32Cpu — HAL-Compatible CPU Interface
+# ============================================================================
+
+struct X86_32Cpu:
+    """x86_32 CPU primitives.
+
+    Provides architecture-specific CPU operations: port I/O,
+    control registers, interrupt control, descriptor table
+    loading, TLB management. No MSR access (limited in 32-bit
+    protected mode compared to x86_64 long mode).
+    """
+    pass_dn
+
+impl X86_32Cpu:
+    fn cpu_id() -> u64:
+        """Return current CPU ID. Single CPU for now."""
+        0
+
+    fn cpu_address_width() -> u64:
+        """Return virtual address width in bits."""
+        32
+
+    fn cpu_enable_interrupts():
+        """Enable interrupts (STI)."""
+        sti()
+
+    fn cpu_disable_interrupts():
+        """Disable interrupts (CLI)."""
+        cli()
+
+    fn cpu_halt():
+        """Halt until next interrupt (HLT)."""
+        hlt()
+
+    fn cpu_halt_loop():
+        """Disable interrupts and halt forever."""
+        halt_loop()
+
+    fn cpu_flush_tlb(addr: u32):
+        """Invalidate TLB entry for a single virtual address."""
+        invlpg(addr)
+
+    fn cpu_flush_tlb_all():
+        """Flush entire TLB by rewriting CR3."""
+        val cr3 = read_cr3()
+        write_cr3(cr3)
+
+    fn cpu_read_page_table_base() -> u32:
+        """Read current page directory base (CR3)."""
+        read_cr3()
+
+    fn cpu_write_page_table_base(addr: u32):
+        """Write page directory base (CR3), switching address space."""
+        write_cr3(addr)

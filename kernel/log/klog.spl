@@ -1,0 +1,80 @@
+# Kernel Log Ring Buffer
+# MDSOC: entity dimension, kernel log layer
+
+use os.kernel.types.syscall_types.{KLogEntry}
+
+struct KernelLog:
+    entries: [KLogEntry]
+    capacity: u64
+    head: u64
+    total_written: u64
+
+impl KernelLog:
+    static fn new(capacity: u64) -> KernelLog:
+        val entries: [KLogEntry] = []
+        var i: u64 = 0
+        # Pre-allocate ring buffer slots
+        while i < capacity:
+            entries.push(KLogEntry(level: 0, facility: 0, pid: 0, message: "", timestamp: 0))
+            i = i + 1
+        KernelLog(entries: entries, capacity: capacity, head: 0, total_written: 0)
+
+    me write(level: u8, facility: u16, pid: u64, message: text):
+        val index = self.head % self.capacity
+        val timestamp = self.total_written
+        self.entries[index] = KLogEntry(
+            level: level,
+            facility: facility,
+            pid: pid,
+            message: message,
+            timestamp: timestamp
+        )
+        self.head = (self.head + 1) % self.capacity
+        self.total_written = self.total_written + 1
+
+    fn read(min_level: u8, offset: u64, max_count: u64) -> [KLogEntry]:
+        val result: [KLogEntry] = []
+        val buf_len = self.len()
+        if buf_len == 0:
+            return result
+
+        # Determine the oldest entry position in the ring
+        val oldest_index = if self.total_written <= self.capacity:
+            0
+        else:
+            self.head
+
+        var skipped: u64 = 0
+        var collected: u64 = 0
+        var i: u64 = 0
+
+        while i < buf_len:
+            if collected >= max_count:
+                break
+
+            val ring_index = (oldest_index + i) % self.capacity
+            val entry = self.entries[ring_index]
+            i = i + 1
+
+            # Filter by minimum severity level
+            if entry.level < min_level:
+                continue
+
+            # Skip entries before the requested offset
+            if skipped < offset:
+                skipped = skipped + 1
+                continue
+
+            result.push(entry)
+            collected = collected + 1
+
+        result
+
+    fn len() -> u64:
+        if self.total_written < self.capacity:
+            self.total_written
+        else:
+            self.capacity
+
+    fn total() -> u64:
+        self.total_written

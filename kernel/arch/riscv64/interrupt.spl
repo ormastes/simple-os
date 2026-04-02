@@ -1,0 +1,234 @@
+# RISC-V 64 Interrupt HAL — PLIC + stvec Setup
+#
+# Implements interrupt management for RISC-V 64-bit in S-mode:
+# - PLIC (Platform-Level Interrupt Controller) for external interrupts
+# - stvec configuration for trap vector
+# - IRQ enable/disable, acknowledge, priority management
+#
+# PLIC register layout (QEMU virt, base 0x0C000000):
+#   0x000000 + 4*irq      : Priority registers (32-bit, irq 1..1023)
+#   0x001000 + 4*(irq/32) : Pending bits (read-only)
+#   0x002000 + 0x80*ctx   : Enable bits per context (ctx = hart*2 + mode)
+#   0x200000 + 0x1000*ctx : Priority threshold + claim/complete per context
+#
+# S-mode context for hart N = N*2 + 1 (M-mode=N*2, S-mode=N*2+1)
+
+use os.kernel.boot.mmio.{mmio_read32, mmio_write32}
+use os.kernel.arch.riscv64.cpu.{csrw_stvec, csrs_sie, csrc_sie, SIE_SEIE, SIE_STIE, SIE_SSIE}
+use os.kernel.arch.riscv64.console.{serial_writeln}
+
+# ============================================================================
+# PLIC Constants (QEMU virt)
+# ============================================================================
+
+val PLIC_BASE: u64 = 0x0C000000
+
+# PLIC register offsets
+val PLIC_PRIORITY_BASE: u64 = 0x000000          # Priority for IRQ N at offset 4*N
+val PLIC_PENDING_BASE: u64 = 0x001000           # Pending bits, 32 IRQs per word
+val PLIC_ENABLE_BASE: u64 = 0x002000            # Enable bits, 0x80 per context
+val PLIC_CONTEXT_BASE: u64 = 0x200000           # Threshold+claim, 0x1000 per context
+
+# Within a context block:
+val PLIC_THRESHOLD_OFFSET: u64 = 0x00           # Priority threshold (32-bit)
+val PLIC_CLAIM_OFFSET: u64 = 0x04               # Claim/complete (32-bit)
+
+# PLIC limits
+val PLIC_MAX_IRQ: u32 = 1023
+val PLIC_MAX_PRIORITY: u32 = 7
+
+# ============================================================================
+# PLIC Context Calculation
+# ============================================================================
+
+fn _plic_s_context(hart_id: u64) -> u64:
+    """Calculate PLIC S-mode context number for a given hart.
+
+    PLIC contexts: M-mode = hart*2, S-mode = hart*2+1
+    """
+    hart_id * 2 + 1
+
+fn _plic_enable_addr(context: u64, irq: u32) -> u64:
+    """Calculate PLIC enable register address for an IRQ in a context."""
+    val word_index = (irq / 32) as u64
+    PLIC_BASE + PLIC_ENABLE_BASE + (context * 0x80) + (word_index * 4)
+
+fn _plic_priority_addr(irq: u32) -> u64:
+    """Calculate PLIC priority register address for an IRQ."""
+    PLIC_BASE + PLIC_PRIORITY_BASE + ((irq as u64) * 4)
+
+fn _plic_threshold_addr(context: u64) -> u64:
+    """Calculate PLIC threshold register address for a context."""
+    PLIC_BASE + PLIC_CONTEXT_BASE + (context * 0x1000) + PLIC_THRESHOLD_OFFSET
+
+fn _plic_claim_addr(context: u64) -> u64:
+    """Calculate PLIC claim/complete register address for a context."""
+    PLIC_BASE + PLIC_CONTEXT_BASE + (context * 0x1000) + PLIC_CLAIM_OFFSET
+
+# ============================================================================
+# PLIC Operations
+# ============================================================================
+
+fn _plic_set_priority(irq: u32, priority: u32):
+    """Set the priority of an IRQ (0=disabled, 1..7=priority levels)."""
+    val addr = _plic_priority_addr(irq)
+    val prio = if priority > PLIC_MAX_PRIORITY: PLIC_MAX_PRIORITY else: priority
+    mmio_write32(addr, prio)
+
+fn _plic_set_threshold(context: u64, threshold: u32):
+    """Set the priority threshold for a context.
+
+    IRQs with priority <= threshold are masked.
+    threshold=0 means all enabled IRQs can fire.
+    """
+    val addr = _plic_threshold_addr(context)
+    mmio_write32(addr, threshold)
+
+fn _plic_enable_irq(context: u64, irq: u32):
+    """Enable an IRQ for a given PLIC context."""
+    val addr = _plic_enable_addr(context, irq)
+    val bit_index = irq % 32
+    val current = mmio_read32(addr)
+    mmio_write32(addr, current | (1 << bit_index))
+
+fn _plic_disable_irq(context: u64, irq: u32):
+    """Disable an IRQ for a given PLIC context."""
+    val addr = _plic_enable_addr(context, irq)
+    val bit_index = irq % 32
+    val current = mmio_read32(addr)
+    mmio_write32(addr, current & ~(1 << bit_index))
+
+fn _plic_claim(context: u64) -> u32:
+    """Claim the highest-priority pending IRQ for a context.
+
+    Returns the IRQ number, or 0 if no IRQ is pending.
+    """
+    val addr = _plic_claim_addr(context)
+    mmio_read32(addr)
+
+fn _plic_complete(context: u64, irq: u32):
+    """Signal completion of IRQ handling for a context.
+
+    Must be called after handling a claimed IRQ.
+    """
+    val addr = _plic_claim_addr(context)
+    mmio_write32(addr, irq)
+
+# ============================================================================
+# Global State
+# ============================================================================
+
+# Current hart's PLIC S-mode context
+var g_plic_context: u64 = 0
+
+# Trap handler table (up to 64 entries for simplicity)
+val MAX_HANDLERS: u64 = 64
+var g_handler_table: [u64; 64] = [0; 64]
+
+# ============================================================================
+# Trap Vector (extern — implemented in assembly or linked separately)
+# ============================================================================
+
+extern fn _rv64_trap_vector()
+
+# ============================================================================
+# Rv64Interrupt
+# ============================================================================
+
+struct Rv64Interrupt:
+    """RISC-V 64-bit interrupt management (PLIC + stvec).
+
+    Manages the PLIC for external interrupts and configures
+    the stvec CSR for S-mode trap handling.
+    """
+    pass_dn
+
+impl Rv64Interrupt:
+    fn init():
+        """Initialize PLIC and configure stvec.
+
+        Sets stvec to the trap vector address, configures PLIC
+        threshold to 0 (accept all priorities), and enables
+        S-mode external, timer, and software interrupts in sie.
+        """
+        serial_writeln("[INT] Initializing RISC-V interrupt controller...")
+
+        # Calculate S-mode context for hart 0
+        g_plic_context = _plic_s_context(0)
+
+        # Set PLIC threshold to 0 (accept all priorities)
+        _plic_set_threshold(g_plic_context, 0)
+
+        # Set stvec to trap vector (direct mode — bit 0 = 0)
+        val trap_addr = _rv64_trap_vector as u64
+        csrw_stvec(trap_addr & ~0x03)   # Clear mode bits, use direct mode
+
+        # Enable S-mode external, timer, and software interrupts
+        csrs_sie(SIE_SEIE | SIE_STIE | SIE_SSIE)
+
+        serial_writeln("[INT] PLIC context={g_plic_context}, threshold=0")
+        serial_writeln("[INT] stvec set, SIE enabled (external+timer+software)")
+
+    fn enable_irq(irq: u32):
+        """Enable a specific external IRQ line on the PLIC."""
+        if irq == 0 or irq > PLIC_MAX_IRQ:
+            return
+        _plic_enable_irq(g_plic_context, irq)
+        # Set default priority to 1 if not already set
+        _plic_set_priority(irq, 1)
+
+    fn disable_irq(irq: u32):
+        """Disable a specific external IRQ line on the PLIC."""
+        if irq == 0 or irq > PLIC_MAX_IRQ:
+            return
+        _plic_disable_irq(g_plic_context, irq)
+
+    fn acknowledge(irq: u32):
+        """Acknowledge (complete) an IRQ after handling it."""
+        _plic_complete(g_plic_context, irq)
+
+    fn claim() -> u32:
+        """Claim the highest-priority pending IRQ. Returns 0 if none."""
+        _plic_claim(g_plic_context)
+
+    fn set_handler(irq: u32, handler: u64):
+        """Register a handler function address for an IRQ."""
+        if (irq as u64) < MAX_HANDLERS:
+            g_handler_table[irq as u64] = handler
+
+    fn get_handler(irq: u32) -> u64:
+        """Get the registered handler for an IRQ."""
+        if (irq as u64) < MAX_HANDLERS:
+            return g_handler_table[irq as u64]
+        0
+
+    fn set_priority(irq: u32, priority: u32):
+        """Set the priority level for a given IRQ."""
+        _plic_set_priority(irq, priority)
+
+    fn set_threshold(threshold: u32):
+        """Set the PLIC priority threshold for the current hart."""
+        _plic_set_threshold(g_plic_context, threshold)
+
+# ============================================================================
+# S-Mode Trap Dispatcher
+# ============================================================================
+
+fn rv64_handle_external_interrupt():
+    """Handle an S-mode external interrupt via PLIC claim/complete.
+
+    Called from the trap vector when scause indicates external interrupt.
+    """
+    val irq = _plic_claim(g_plic_context)
+    if irq == 0:
+        return      # Spurious interrupt
+
+    # Look up handler
+    if (irq as u64) < MAX_HANDLERS:
+        val handler = g_handler_table[irq as u64]
+        if handler != 0:
+            # Call the handler (cast u64 to function pointer)
+            pass_todo("call handler function pointer for IRQ")
+
+    # Complete the IRQ
+    _plic_complete(g_plic_context, irq)

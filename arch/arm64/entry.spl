@@ -1,0 +1,32 @@
+# ARM64 Entry — Boot shim for AArch64 QEMU virt
+#
+# Performs REAL hardware initialization:
+# 1. PL011 UART init via MMIO at 0x09000000 (real register writes)
+# 2. QEMU virt memory map construction (hardcoded but real addresses)
+# 3. Hands off to kernel_main() which runs real PMM + scheduler code
+
+use os.kernel.arch.arm64.console.{Arm64Console, uart_init, uart_writeln}
+use os.kernel.arch.arm64.boot.{Arm64Boot}
+
+fn _start():
+    """ARM64 entry point — called from assembly startup code.
+
+    Initializes PL011 UART via real MMIO register writes,
+    constructs BootOutputPort from QEMU virt memory map,
+    then calls kernel_main() for PMM/scheduler initialization.
+    """
+    # Real PL011 UART init: disables UART, sets baud rate divisors,
+    # configures 8N1+FIFO, enables TX/RX via MMIO writes
+    uart_init()
+    uart_writeln("SimpleOS ARM64 boot")
+    uart_writeln("[BOOT] PL011 UART initialized at 0x09000000")
+
+    # Real memory map construction: kernel region at 0x40000000,
+    # usable RAM 0x40200000-0x48000000, device MMIO 0x08000000-0x0A000000
+    val boot_info = Arm64Boot.build_boot_output()
+    uart_writeln("[BOOT] Memory map parsed: {boot_info.memory_map.len()} regions")
+
+    # Call real kernel main — runs PMM bitmap init, scheduler ReadyQueue creation
+    kernel_main(boot_info)
+
+    uart_writeln("[BOOT] ARM64 boot complete")
