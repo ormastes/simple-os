@@ -1,0 +1,65 @@
+## SimpleOS GUI Application Template
+##
+## Copy this file to start a new SimpleOS graphical application.
+## See src/os/port/gui/README.md for the full porting guide.
+
+use std.os.gui
+
+## Application metadata -- update these for your app.
+val APP_ID = "com.example.template"
+val APP_TITLE = "SimpleOS App"
+val APP_WIDTH = 800
+val APP_HEIGHT = 600
+
+class AppState:
+    counter: i64
+
+    static fn new() -> AppState:
+        AppState(counter: 0)
+
+    me increment():
+        self.counter = self.counter + 1
+
+fn build_ui(state: AppState) -> gui.Window:
+    val window = gui.Window(title: APP_TITLE, width: APP_WIDTH, height: APP_HEIGHT)
+
+    val root = gui.Box(direction: gui.Direction.Vertical, padding: 16)
+
+    # Header
+    val header = gui.Label(text: APP_TITLE, font_size: 24)
+    root.add(header)
+
+    # Content area
+    val content = gui.Box(direction: gui.Direction.Horizontal, spacing: 8)
+
+    val counter_label = gui.Label(text: "Count: {state.counter}")
+
+    val increment_btn = gui.Button(text: "Increment")
+    increment_btn.on_click(\event:
+        state.increment()
+        counter_label.set_text("Count: {state.counter}")
+    )
+
+    val reset_btn = gui.Button(text: "Reset")
+    reset_btn.on_click(\event:
+        state.counter = 0
+        counter_label.set_text("Count: {state.counter}")
+    )
+
+    content.add(counter_label)
+    content.add(increment_btn)
+    content.add(reset_btn)
+    root.add(content)
+
+    # Status bar
+    val status = gui.Label(text: "Ready", font_size: 12)
+    root.add(status)
+
+    window.add(root)
+    window
+
+fn main():
+    val app = gui.App(id: APP_ID)
+    var state = AppState.new()
+    val window = build_ui(state)
+    app.run(window)

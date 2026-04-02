@@ -1,0 +1,192 @@
+## LLVM cross-compilation build script for SimpleOS targets.
+##
+## Usage:
+##   bin/simple run src/os/port/llvm/build.spl -- --target x86_64-simpleos
+##   bin/simple run src/os/port/llvm/build.spl -- --target aarch64-simpleos --jobs 8
+##   bin/simple run src/os/port/llvm/build.spl -- --all
+
+use std.fs
+use std.process
+use std.text
+use std.cli
+
+val SUPPORTED_TARGETS = [
+    "x86_64-simpleos",
+    "aarch64-simpleos",
+    "riscv64gc-simpleos",
+    "riscv32imac-simpleos",
+]
+
+val LLVM_REPO = "https://github.com/ormastes/llvm-project.git"
+val LLVM_BRANCH = "simpleos"
+val DEFAULT_INSTALL_PREFIX = "/opt/simpleos-toolchain"
+
+class BuildConfig:
+    target: text
+    source_dir: text
+    build_dir: text
+    install_prefix: text
+    jobs: i64
+    build_compiler_rt: bool
+
+    fn llvm_arch() -> text:
+        if self.target.starts_with("x86_64"):
+            "X86"
+        else if self.target.starts_with("aarch64"):
+            "AArch64"
+        else if self.target.starts_with("riscv"):
+            "RISCV"
+        else:
+            panic("Unknown architecture for target: {self.target}")
+
+fn parse_args(args: List<text>) -> BuildConfig:
+    var target = "x86_64-simpleos"
+    var source_dir = "llvm-project"
+    var build_dir = "build-llvm"
+    var install_prefix = DEFAULT_INSTALL_PREFIX
+    var jobs = 0  # 0 means auto-detect
+    var build_all = false
+    var build_compiler_rt = true
+
+    var i = 0
+    while i < args.len():
+        val arg = args[i]
+        if arg == "--target":
+            i = i + 1
+            target = args[i]
+        else if arg == "--source-dir":
+            i = i + 1
+            source_dir = args[i]
+        else if arg == "--build-dir":
+            i = i + 1
+            build_dir = args[i]
+        else if arg == "--prefix":
+            i = i + 1
+            install_prefix = args[i]
+        else if arg == "--jobs":
+            i = i + 1
+            jobs = args[i].parse_int()
+        else if arg == "--no-compiler-rt":
+            build_compiler_rt = false
+        else if arg == "--all":
+            build_all = true
+        i = i + 1
+
+    if build_all:
+        # Build for all targets sequentially
+        for t in SUPPORTED_TARGETS:
+            val config = BuildConfig(
+                target: t,
+                source_dir: source_dir,
+                build_dir: "{build_dir}-{t}",
+                install_prefix: install_prefix,
+                jobs: jobs,
+                build_compiler_rt: build_compiler_rt,
+            )
+            build_llvm(config)
+        process.exit(0)
+
+    BuildConfig(
+        target: target,
+        source_dir: source_dir,
+        build_dir: build_dir,
+        install_prefix: install_prefix,
+        jobs: jobs,
+        build_compiler_rt: build_compiler_rt,
+    )
+
+fn check_prerequisites():
+    val required_tools = ["cmake", "ninja", "clang", "python3", "git"]
+    for tool in required_tools:
+        val result = process.run("which", [tool])
+        if result.exit_code != 0:
+            panic("Required tool not found: {tool}. Please install it first.")
+    print "All prerequisites found."
+
+fn clone_or_update_source(config: BuildConfig):
+    if fs.exists(config.source_dir):
+        print "Source directory exists, updating..."
+        process.run_checked("git", ["-C", config.source_dir, "fetch", "origin"])
+        process.run_checked("git", ["-C", config.source_dir, "checkout", LLVM_BRANCH])
+        process.run_checked("git", ["-C", config.source_dir, "pull", "--rebase"])
+    else:
+        print "Cloning LLVM source from {LLVM_REPO}..."
+        process.run_checked("git", ["clone", "--branch", LLVM_BRANCH, "--depth", "1", LLVM_REPO, config.source_dir])
+
+fn build_llvm(config: BuildConfig):
+    print "Building LLVM for target: {config.target}"
+    print "  Source:  {config.source_dir}"
+    print "  Build:   {config.build_dir}"
+    print "  Prefix:  {config.install_prefix}"
+
+    val arch = config.llvm_arch()
+    var cmake_args = [
+        "-S", "{config.source_dir}/llvm",
+        "-B", config.build_dir,
+        "-G", "Ninja",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DLLVM_ENABLE_PROJECTS=clang;lld",
+        "-DLLVM_TARGETS_TO_BUILD={arch}",
+        "-DLLVM_DEFAULT_TARGET_TRIPLE={config.target}",
+        "-DCMAKE_INSTALL_PREFIX={config.install_prefix}",
+    ]
+
+    print "Configuring LLVM..."
+    process.run_checked("cmake", cmake_args)
+
+    var ninja_args = ["-C", config.build_dir]
+    if config.jobs > 0:
+        ninja_args = ninja_args + ["-j", "{config.jobs}"]
+
+    print "Building LLVM (this may take a while)..."
+    process.run_checked("ninja", ninja_args)
+
+    print "Installing LLVM..."
+    process.run_checked("ninja", ["-C", config.build_dir, "install"])
+
+    if config.build_compiler_rt:
+        build_compiler_rt(config)
+
+    print "LLVM build complete for {config.target}."
+
+fn build_compiler_rt(config: BuildConfig):
+    print "Building compiler-rt for {config.target}..."
+    val rt_build_dir = "{config.build_dir}-compiler-rt"
+
+    val cmake_args = [
+        "-S", "{config.source_dir}/compiler-rt",
+        "-B", rt_build_dir,
+        "-G", "Ninja",
+        "-DCMAKE_C_COMPILER={config.install_prefix}/bin/clang",
+        "-DCMAKE_AR={config.install_prefix}/bin/llvm-ar",
+        "-DCMAKE_NM={config.install_prefix}/bin/llvm-nm",
+        "-DCMAKE_RANLIB={config.install_prefix}/bin/llvm-ranlib",
+        "-DCOMPILER_RT_BAREMETAL_BUILD=ON",
+        "-DCOMPILER_RT_BUILD_BUILTINS=ON",
+        "-DCOMPILER_RT_BUILD_SANITIZERS=OFF",
+        "-DCOMPILER_RT_BUILD_XRAY=OFF",
+        "-DCOMPILER_RT_BUILD_LIBFUZZER=OFF",
+        "-DCOMPILER_RT_BUILD_PROFILE=OFF",
+        "-DCMAKE_C_FLAGS=--target={config.target} -ffreestanding -nostdlib",
+        "-DCMAKE_INSTALL_PREFIX={config.install_prefix}",
+    ]
+
+    process.run_checked("cmake", cmake_args)
+
+    var ninja_args = ["-C", rt_build_dir]
+    if config.jobs > 0:
+        ninja_args = ninja_args + ["-j", "{config.jobs}"]
+
+    process.run_checked("ninja", ninja_args)
+    process.run_checked("ninja", ["-C", rt_build_dir, "install"])
+    print "compiler-rt build complete."
+
+fn main():
+    print "=== SimpleOS LLVM Build Script ==="
+    check_prerequisites()
+
+    val args = cli.args()
+    val config = parse_args(args)
+    clone_or_update_source(config)
+    build_llvm(config)
+    print "=== Build finished successfully ==="

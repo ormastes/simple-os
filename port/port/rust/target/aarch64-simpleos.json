@@ -1,0 +1,26 @@
+{
+    "llvm-target": "aarch64-unknown-none",
+    "data-layout": "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32",
+    "arch": "aarch64",
+    "os": "none",
+    "env": "simpleos",
+    "vendor": "unknown",
+    "target-endian": "little",
+    "target-pointer-width": "64",
+    "target-c-int-width": "32",
+    "linker": "rust-lld",
+    "linker-flavor": "ld.lld",
+    "exe-suffix": "",
+    "pre-link-args": {
+        "ld.lld": ["-nostdlib", "--gc-sections"]
+    },
+    "executables": true,
+    "disable-redzone": true,
+    "panic-strategy": "abort",
+    "features": "+strict-align,-neon,-fp-armv8",
+    "relocation-model": "static",
+    "eliminate-frame-pointer": false,
+    "position-independent-executables": false,
+    "has-thread-local": false,
+    "max-atomic-width": 128
+}

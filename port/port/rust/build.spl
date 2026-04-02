@@ -1,0 +1,187 @@
+## Rust cross-compilation build script for SimpleOS targets.
+##
+## Builds core and alloc from the ormastes/rust fork for SimpleOS.
+##
+## Usage:
+##   bin/simple run src/os/port/rust/build.spl -- --target x86_64-simpleos
+##   bin/simple run src/os/port/rust/build.spl -- --all
+##   bin/simple run src/os/port/rust/build.spl -- --target-spec-only
+
+use std.fs
+use std.process
+use std.text
+use std.cli
+
+val SUPPORTED_TARGETS = [
+    "x86_64-simpleos",
+    "aarch64-simpleos",
+    "riscv64gc-simpleos",
+    "riscv32imac-simpleos",
+]
+
+val RUST_REPO = "https://github.com/ormastes/rust.git"
+val RUST_BRANCH = "simpleos"
+val TARGET_SPEC_DIR = "src/os/port/rust/target"
+val DEFAULT_INSTALL_PREFIX = "/opt/simpleos-rust"
+
+class BuildConfig:
+    target: text
+    source_dir: text
+    install_prefix: text
+    jobs: i64
+    target_spec_only: bool
+
+fn parse_args(args: List<text>) -> BuildConfig:
+    var target = "x86_64-simpleos"
+    var source_dir = "rust-simpleos"
+    var install_prefix = DEFAULT_INSTALL_PREFIX
+    var jobs = 0
+    var build_all = false
+    var target_spec_only = false
+
+    var i = 0
+    while i < args.len():
+        val arg = args[i]
+        if arg == "--target":
+            i = i + 1
+            target = args[i]
+        else if arg == "--source-dir":
+            i = i + 1
+            source_dir = args[i]
+        else if arg == "--prefix":
+            i = i + 1
+            install_prefix = args[i]
+        else if arg == "--jobs":
+            i = i + 1
+            jobs = args[i].parse_int()
+        else if arg == "--all":
+            build_all = true
+        else if arg == "--target-spec-only":
+            target_spec_only = true
+        i = i + 1
+
+    if target_spec_only:
+        print_target_spec_info()
+        process.exit(0)
+
+    if build_all:
+        for t in SUPPORTED_TARGETS:
+            val config = BuildConfig(
+                target: t,
+                source_dir: source_dir,
+                install_prefix: install_prefix,
+                jobs: jobs,
+                target_spec_only: false,
+            )
+            build_rust(config)
+        process.exit(0)
+
+    BuildConfig(
+        target: target,
+        source_dir: source_dir,
+        install_prefix: install_prefix,
+        jobs: jobs,
+        target_spec_only: false,
+    )
+
+fn print_target_spec_info():
+    print "Available target specs in {TARGET_SPEC_DIR}/:"
+    for target in SUPPORTED_TARGETS:
+        val spec_path = "{TARGET_SPEC_DIR}/{target}.json"
+        if fs.exists(spec_path):
+            print "  {target} -> {spec_path}"
+        else:
+            print "  {target} -> MISSING ({spec_path})"
+    print ""
+    print "Usage with cargo:"
+    print "  cargo build -Z build-std=core,alloc --target {TARGET_SPEC_DIR}/x86_64-simpleos.json"
+
+fn check_prerequisites():
+    val required_tools = ["python3", "git", "cmake", "ninja"]
+    for tool in required_tools:
+        val result = process.run("which", [tool])
+        if result.exit_code != 0:
+            panic("Required tool not found: {tool}")
+
+    # Check for rustup and rust-src
+    val rustup = process.run("rustup", ["component", "list", "--installed"])
+    if rustup.exit_code != 0:
+        panic("rustup not found. Install Rust via https://rustup.rs/")
+
+    if not rustup.stdout.contains("rust-src"):
+        print "Installing rust-src component..."
+        process.run_checked("rustup", ["component", "add", "rust-src"])
+
+    print "All prerequisites found."
+
+fn clone_or_update_source(config: BuildConfig):
+    if fs.exists(config.source_dir):
+        print "Source directory exists, updating..."
+        process.run_checked("git", ["-C", config.source_dir, "fetch", "origin"])
+        process.run_checked("git", ["-C", config.source_dir, "checkout", RUST_BRANCH])
+        process.run_checked("git", ["-C", config.source_dir, "pull", "--rebase"])
+    else:
+        print "Cloning Rust source from {RUST_REPO}..."
+        process.run_checked("git", ["clone", "--branch", RUST_BRANCH, RUST_REPO, config.source_dir])
+
+fn write_config_toml(config: BuildConfig):
+    val arch = if config.target.starts_with("x86_64"):
+        "X86"
+    else if config.target.starts_with("aarch64"):
+        "AArch64"
+    else:
+        "RISCV"
+
+    val config_content = r"[llvm]
+link-shared = false
+targets = \"{arch}\"
+
+[build]
+target = [\"{config.target}\"]
+docs = false
+extended = false
+
+[install]
+prefix = \"{config.install_prefix}\"
+
+[rust]
+lld = true
+"
+    fs.write("{config.source_dir}/config.toml", config_content)
+    print "Wrote config.toml for {config.target}"
+
+fn build_rust(config: BuildConfig):
+    print "=== Building Rust for {config.target} ==="
+    print "  Source:  {config.source_dir}"
+    print "  Prefix:  {config.install_prefix}"
+
+    write_config_toml(config)
+
+    # Build core and alloc
+    print "Building core and alloc..."
+    var build_args = [
+        "x.py", "build",
+        "library/core", "library/alloc",
+        "--target", config.target,
+    ]
+
+    process.run_checked("python3", build_args)
+
+    # Install
+    print "Installing..."
+    process.run_checked("python3", [
+        "x.py", "install",
+        "--target", config.target,
+    ])
+
+    print "Rust build complete for {config.target}."
+
+fn main():
+    print "=== SimpleOS Rust Toolchain Build ==="
+    check_prerequisites()
+
+    val args = cli.args()
+    val config = parse_args(args)
+    clone_or_update_source(config)
+    build_rust(config)
+    print "=== Build finished successfully ==="

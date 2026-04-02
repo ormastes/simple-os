@@ -1,0 +1,50 @@
+## SimpleOS Hello App
+##
+## A minimal SimpleOS application demonstrating basic GUI usage.
+## This serves as the simplest possible starting point for new apps.
+##
+## To run in QEMU:
+##   bin/simple run src/os/qemu_runner.spl -- --app hello_app
+
+use std.os.gui
+
+fn main():
+    val app = gui.App(id: "com.simpleos.hello")
+    val window = gui.Window(title: "Hello SimpleOS", width: 400, height: 300)
+
+    val layout = gui.Box(direction: gui.Direction.Vertical, padding: 24, spacing: 16)
+
+    # Welcome message
+    val title = gui.Label(text: "Hello, SimpleOS!", font_size: 28)
+    layout.add(title)
+
+    val subtitle = gui.Label(text: "Your first SimpleOS application.", font_size: 14)
+    layout.add(subtitle)
+
+    # Interactive button
+    var click_count = 0
+    val counter_label = gui.Label(text: "Clicks: 0")
+
+    val button = gui.Button(text: "Click Me!")
+    button.on_click(\event:
+        click_count = click_count + 1
+        counter_label.set_text("Clicks: {click_count}")
+    )
+
+    layout.add(button)
+    layout.add(counter_label)
+
+    # Color canvas demo
+    val canvas = gui.Canvas(width: 200, height: 100)
+    canvas.on_draw(\ctx:
+        # Draw a gradient bar
+        for x in 0..200:
+            val r = (x * 255) / 200
+            val color = (r << 16) | 0x0040
+            for y in 0..100:
+                ctx.set_pixel(x, y, color)
+    )
+    layout.add(canvas)
+
+    window.add(layout)
+    app.run(window)
