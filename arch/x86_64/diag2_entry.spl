@@ -1,0 +1,10 @@
+# Diagnostic 2 — isolate posix_init crash
+
+extern fn serial_println(msg: text)
+
+use os.posix.fd_table.{fd_table_init}
+
+fn _start():
+    serial_println("[DIAG2] Before fd_table_init")
+    fd_table_init()
+    serial_println("[DIAG2] After fd_table_init - OK")

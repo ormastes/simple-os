@@ -1,0 +1,48 @@
+# x86_64 Desktop Import Probe
+#
+# Minimal baremetal probe used to determine whether merely importing the
+# desktop stack faults before `spl_start`, or whether the fault is caused by
+# later runtime initialization inside the full desktop E2E entry.
+
+use os.drivers.input.ps2_keyboard.{Ps2Keyboard}
+use os.drivers.input.ps2_mouse.{Ps2Mouse}
+use os.compositor.compositor_engine2d.{CompositorEngine2D}
+use os.compositor.engine2d_display.{create_fb_engine}
+use os.desktop.shell.{DesktopShell}
+use os.services.launcher.launcher.{launcher_get_app_count}
+use os.services.vfs.vfs_init.{vfs_boot_init}
+
+extern fn rt_port_inb(port: u64) -> u64
+extern fn rt_port_outb(port: u64, value: u64)
+
+val SERIAL_DATA: u64 = 0x3F8
+val SERIAL_LSR: u64 = 0x3FD
+val DEBUG_EXIT: u64 = 0xF4
+
+fn serial_wait_ready():
+    var guard: i64 = 100000
+    while guard > 0:
+        if (rt_port_inb(SERIAL_LSR) & 0x20) != 0:
+            return
+        guard = guard - 1
+
+fn serial_put(ch: u64):
+    serial_wait_ready()
+    rt_port_outb(SERIAL_DATA, ch)
+
+fn serial_text(s: text):
+    for ch in s:
+        serial_put(ch as u64)
+
+fn serial_newline():
+    serial_put(13)
+    serial_put(10)
+
+fn spl_start():
+    serial_text("[probe] desktop-import spl_start")
+    serial_newline()
+    # Touch imported names so the compiler keeps them in the graph.
+    if launcher_get_app_count() == 0 and not vfs_boot_init():
+        serial_text("[probe] desktop-import graph-retained")
+        serial_newline()
+    rt_port_outb(DEBUG_EXIT, 0)

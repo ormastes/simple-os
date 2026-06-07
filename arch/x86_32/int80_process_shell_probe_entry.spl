@@ -1,0 +1,184 @@
+# x86_32 int 0x80 process and shell smoke probe.
+#
+# This entry validates the freestanding early Simple syscall ABI used by the
+# live i386 boot lane without importing x86_64 process helpers.
+
+use os.kernel.arch.x86_32.early_syscall.{x86_32_install_early_syscall_runtime}
+
+extern fn rt_x86_32_install_int80_probe()
+extern fn rt_x86_32_trigger_int80(id: u32, arg0: u32, arg1: u32, arg2: u32, arg3: u32, arg4: u32, arg5: u32) -> i32
+extern fn rt_port_outb(port: u16, value: u8)
+
+val DEBUG_EXIT: u16 = 0xF4
+
+fn serial_put(ch: u8):
+    rt_port_outb(0x3F8 as u16, ch)
+
+fn serial_newline():
+    serial_put(13u8)
+    serial_put(10u8)
+
+fn write_marker_prefix():
+    serial_put(91u8)
+    serial_put(120u8)
+    serial_put(56u8)
+    serial_put(54u8)
+    serial_put(95u8)
+    serial_put(51u8)
+    serial_put(50u8)
+    serial_put(32u8)
+
+fn write_process_suffix():
+    serial_put(112u8)
+    serial_put(114u8)
+    serial_put(111u8)
+    serial_put(99u8)
+    serial_put(101u8)
+    serial_put(115u8)
+    serial_put(115u8)
+    serial_put(93u8)
+    serial_put(32u8)
+
+fn write_shell_suffix():
+    serial_put(115u8)
+    serial_put(104u8)
+    serial_put(101u8)
+    serial_put(108u8)
+    serial_put(108u8)
+    serial_put(93u8)
+    serial_put(32u8)
+
+fn write_ok():
+    serial_put(111u8)
+    serial_put(107u8)
+    serial_newline()
+
+fn write_create_marker():
+    write_marker_prefix()
+    write_process_suffix()
+    serial_put(99u8)
+    serial_put(114u8)
+    serial_put(101u8)
+    serial_put(97u8)
+    serial_put(116u8)
+    serial_put(101u8)
+    serial_put(32u8)
+    write_ok()
+
+fn write_brk_marker():
+    write_marker_prefix()
+    write_process_suffix()
+    serial_put(98u8)
+    serial_put(114u8)
+    serial_put(107u8)
+    serial_put(32u8)
+    write_ok()
+
+fn write_reboot_marker():
+    write_marker_prefix()
+    write_process_suffix()
+    serial_put(114u8)
+    serial_put(101u8)
+    serial_put(98u8)
+    serial_put(111u8)
+    serial_put(111u8)
+    serial_put(116u8)
+    serial_put(32u8)
+    write_ok()
+
+fn write_diagnostics_marker():
+    write_marker_prefix()
+    write_process_suffix()
+    serial_put(100u8)
+    serial_put(105u8)
+    serial_put(97u8)
+    serial_put(103u8)
+    serial_put(110u8)
+    serial_put(111u8)
+    serial_put(115u8)
+    serial_put(116u8)
+    serial_put(105u8)
+    serial_put(99u8)
+    serial_put(115u8)
+    serial_put(32u8)
+    write_ok()
+
+fn write_shell_marker():
+    write_marker_prefix()
+    write_shell_suffix()
+    serial_put(115u8)
+    serial_put(109u8)
+    serial_put(111u8)
+    serial_put(107u8)
+    serial_put(101u8)
+    serial_put(32u8)
+    write_ok()
+
+fn write_final_marker():
+    write_marker_prefix()
+    write_process_suffix()
+    serial_put(115u8)
+    serial_put(104u8)
+    serial_put(101u8)
+    serial_put(108u8)
+    serial_put(108u8)
+    serial_put(45u8)
+    serial_put(115u8)
+    serial_put(109u8)
+    serial_put(111u8)
+    serial_put(107u8)
+    serial_put(101u8)
+    serial_put(32u8)
+    write_ok()
+
+fn write_fail_marker():
+    write_marker_prefix()
+    write_process_suffix()
+    serial_put(102u8)
+    serial_put(97u8)
+    serial_put(105u8)
+    serial_put(108u8)
+    serial_newline()
+
+fn spl_start():
+    x86_32_install_early_syscall_runtime()
+    rt_x86_32_install_int80_probe()
+
+    val pid = rt_x86_32_trigger_int80(2u32, 0x1000u32, 0u32, 0u32, 0u32, 0u32, 0u32)
+    if pid <= 0:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1)
+        return
+    write_create_marker()
+
+    val brk_query = rt_x86_32_trigger_int80(15u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32)
+    val brk_set = rt_x86_32_trigger_int80(15u32, 0x30001000u32, 0u32, 0u32, 0u32, 0u32, 0u32)
+    if brk_query <= 0 or brk_set <= 0:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1)
+        return
+    write_brk_marker()
+
+    val reboot = rt_x86_32_trigger_int80(16u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32)
+    if reboot != 0:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1)
+        return
+    write_reboot_marker()
+
+    val task_count = rt_x86_32_trigger_int80(5u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32)
+    val task_info = rt_x86_32_trigger_int80(6u32, pid as u32, 0u32, 0u32, 0u32, 0u32, 0u32)
+    if task_count < 2 or task_info != 0:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1)
+        return
+    write_diagnostics_marker()
+
+    val shell_pid = rt_x86_32_trigger_int80(13u32, 4u32, 0u32, 0u32, 0u32, 0u32, 0u32)
+    if shell_pid <= 0:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1)
+        return
+    write_shell_marker()
+    write_final_marker()
+    rt_port_outb(DEBUG_EXIT, 0)

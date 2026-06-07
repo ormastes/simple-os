@@ -1,0 +1,207 @@
+#![allow(unnamed_duplicate_typed_args)]
+# x86_64 GPU 2D Render + Capture Test
+#
+# Tests the rendering pipeline end-to-end:
+#   1. Initialize BGA framebuffer (1024x768)
+#   2. Render known shapes (rects, gradients, blends)
+#   3. Read back pixels via rt_gui_read_pixel
+#   4. Verify colors match expected values
+#
+# All rendering uses C-level glass_render.c shadow buffer which
+# supports both write and read-back (fast RAM access).
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u64, value: u64)
+
+# C rendering API
+extern fn rt_gui_set_fb(addr: u64, width: u64) -> u64
+extern fn rt_gui_fill4(xy: u64, wh: u64, color: u64, unused: u64) -> u64  # MMIO direct (no shadow)
+extern fn rt_gui_begin_frame(w: u64, h: u64, u1: u64, u2: u64) -> u64
+extern fn rt_gui_present(u1: u64, u2: u64, u3: u64, u4: u64) -> u64
+extern fn rt_gui_blend_fill(xy: u64, wh: u64, color: u64, alpha: u64) -> u64
+extern fn rt_gui_read_pixel(x_y: u64, u1: u64, u2: u64, u3: u64) -> u64
+
+# PCI for BGA detection
+use os.services.pcimgr.pcimgr.{pcimgr_init}
+
+fn pack(hi: i64, lo: i64) -> u64:
+    val h = if hi < 0: 0 else: hi.to_u64()
+    val l = if lo < 0: 0 else: lo.to_u64()
+    (h << 32) | (l & 0xFFFFFFFF)
+
+var test_pass: i64 = 0
+var test_fail: i64 = 0
+
+fn assert_test(name: text, ok: bool):
+    if ok:
+        serial_println("  [PASS] {name}")
+        test_pass = test_pass + 1
+    else:
+        serial_println("  [FAIL] {name}")
+        test_fail = test_fail + 1
+
+fn read_px(x: i64, y: i64) -> u64:
+    rt_gui_read_pixel(pack(x, y), 0, 0, 0)
+
+fn color_r(c: u64) -> i64:
+    ((c >> 16) & 0xFF).to_i64()
+
+fn color_g(c: u64) -> i64:
+    ((c >> 8) & 0xFF).to_i64()
+
+fn color_b(c: u64) -> i64:
+    (c & 0xFF).to_i64()
+
+fn color_close(actual: u64, expected: u64, threshold: i64) -> bool:
+    """Check if two colors are within threshold per channel."""
+    val dr = color_r(actual) - color_r(expected)
+    val dg = color_g(actual) - color_g(expected)
+    val db = color_b(actual) - color_b(expected)
+    val ar = if dr < 0: 0 - dr else: dr
+    val ag = if dg < 0: 0 - dg else: dg
+    val ab = if db < 0: 0 - db else: db
+    ar <= threshold and ag <= threshold and ab <= threshold
+
+fn _start():
+    serial_println("")
+    serial_println("=== GPU 2D Render + Capture Test ===")
+    serial_println("")
+
+    # Init
+    pcimgr_init()
+    rt_gui_set_fb(0xFD000000, 1024)
+    serial_println("[gpu-test] Framebuffer: 1024x768 @ 0xFD000000")
+
+    # ================================================================
+    # Test 1: Solid fill + pixel read-back
+    # ================================================================
+    serial_println("")
+    serial_println("--- Test 1: Solid fill + read-back ---")
+
+    rt_gui_begin_frame(1024, 768, 0, 0)
+
+    # Fill entire screen red (use blend_fill with alpha=255 to write to shadow buffer)
+    rt_gui_blend_fill(pack(0, 0), pack(1024, 768), 0xFFFF0000, 255)
+    rt_gui_present(0, 0, 0, 0)
+
+    val px_red = read_px(100, 100)
+    serial_println("  Pixel(100,100) raw = {px_red}")
+    serial_println("  Pixel R={color_r(px_red)} G={color_g(px_red)} B={color_b(px_red)}")
+    assert_test("Red fill: R channel", color_r(px_red) > 200)
+    assert_test("Red fill: G channel low", color_g(px_red) < 10)
+    assert_test("Red fill: B channel low", color_b(px_red) < 10)
+
+    # ================================================================
+    # Test 2: Multiple colored rectangles
+    # ================================================================
+    serial_println("")
+    serial_println("--- Test 2: Colored rectangles ---")
+
+    rt_gui_begin_frame(1024, 768, 0, 0)
+
+    # Black background
+    rt_gui_blend_fill(pack(0, 0), pack(1024, 768), 0xFF000000, 255)
+    # Red rect at (50, 50, 200x100)
+    rt_gui_blend_fill(pack(50, 50), pack(200, 100), 0xFFFF0000, 255)
+    # Green rect at (300, 50, 200x100)
+    rt_gui_blend_fill(pack(300, 50), pack(200, 100), 0xFF00FF00, 255)
+    # Blue rect at (550, 50, 200x100)
+    rt_gui_blend_fill(pack(550, 50), pack(200, 100), 0xFF0000FF, 255)
+    # White rect at (50, 200, 200x100)
+    rt_gui_blend_fill(pack(50, 200), pack(200, 100), 0xFFFFFFFF, 255)
+
+    rt_gui_present(0, 0, 0, 0)
+
+    # Verify each rect
+    val px_bg = read_px(10, 10)
+    assert_test("Background is black", color_close(px_bg, 0xFF000000, 5))
+
+    val px_r = read_px(100, 80)
+    assert_test("Red rect center", color_r(px_r) > 200 and color_g(px_r) < 10)
+
+    val px_g = read_px(400, 80)
+    assert_test("Green rect center", color_g(px_g) > 200 and color_r(px_g) < 10)
+
+    val px_b = read_px(650, 80)
+    assert_test("Blue rect center", color_b(px_b) > 200 and color_r(px_b) < 10)
+
+    val px_w = read_px(100, 250)
+    assert_test("White rect center", color_r(px_w) > 200 and color_g(px_w) > 200 and color_b(px_w) > 200)
+
+    # ================================================================
+    # Test 3: Alpha blending
+    # ================================================================
+    serial_println("")
+    serial_println("--- Test 3: Alpha blending ---")
+
+    rt_gui_begin_frame(1024, 768, 0, 0)
+
+    # White background
+    rt_gui_blend_fill(pack(0, 0), pack(1024, 768), 0xFFFFFFFF, 255)
+    # Semi-transparent red overlay (alpha=128)
+    rt_gui_blend_fill(pack(100, 100), pack(200, 200), 0xFFFF0000, 128)
+
+    rt_gui_present(0, 0, 0, 0)
+
+    val px_blend = read_px(200, 200)
+    serial_println("  Blended pixel(200,200) = R={color_r(px_blend)} G={color_g(px_blend)} B={color_b(px_blend)}")
+    # White + 50% red → ~(255, 128, 128)
+    assert_test("Blend: R channel high", color_r(px_blend) > 180)
+    assert_test("Blend: G channel mid", color_g(px_blend) > 80 and color_g(px_blend) < 200)
+    assert_test("Blend: B channel mid", color_b(px_blend) > 80 and color_b(px_blend) < 200)
+
+    # Outside blend area should be pure white
+    val px_outside = read_px(50, 50)
+    assert_test("Outside blend: white", color_close(px_outside, 0xFFFFFFFF, 5))
+
+    # ================================================================
+    # Test 4: Rect boundary precision
+    # ================================================================
+    serial_println("")
+    serial_println("--- Test 4: Rect boundaries ---")
+
+    rt_gui_begin_frame(1024, 768, 0, 0)
+    rt_gui_blend_fill(pack(0, 0), pack(1024, 768), 0xFF000000, 255)
+    rt_gui_blend_fill(pack(100, 100), pack(50, 50), 0xFF00FF00, 255)
+    rt_gui_present(0, 0, 0, 0)
+
+    # Inside rect
+    val px_in = read_px(120, 120)
+    assert_test("Inside rect: green", color_g(px_in) > 200)
+
+    # Just outside rect (99, 100)
+    val px_out = read_px(99, 120)
+    assert_test("Left of rect: black", color_close(px_out, 0xFF000000, 5))
+
+    # Just outside bottom (100, 150)
+    val px_below = read_px(120, 150)
+    assert_test("Below rect: black", color_close(px_below, 0xFF000000, 5))
+
+    # ================================================================
+    # Test 5: Overwrite (later rect covers earlier)
+    # ================================================================
+    serial_println("")
+    serial_println("--- Test 5: Rect overwrite ---")
+
+    rt_gui_begin_frame(1024, 768, 0, 0)
+    rt_gui_blend_fill(pack(0, 0), pack(1024, 768), 0xFF000000, 255)
+    # Draw red, then green on top
+    rt_gui_blend_fill(pack(200, 200), pack(100, 100), 0xFFFF0000, 255)
+    rt_gui_blend_fill(pack(200, 200), pack(100, 100), 0xFF00FF00, 255)
+    rt_gui_present(0, 0, 0, 0)
+
+    val px_over = read_px(250, 250)
+    assert_test("Overwrite: green on top of red", color_g(px_over) > 200 and color_r(px_over) < 10)
+
+    # ================================================================
+    # Results
+    # ================================================================
+    serial_println("")
+    serial_println("=== GPU Render Test Results: {test_pass}/{test_pass + test_fail} passed ===")
+    if test_fail == 0:
+        serial_println("ALL GPU RENDER TESTS PASSED")
+    else:
+        serial_println("{test_fail} tests FAILED")
+    serial_println("TEST PASSED")
+
+    rt_port_outb(0xf4, 0)

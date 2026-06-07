@@ -1,0 +1,490 @@
+#![allow(unnamed_duplicate_typed_args)]
+# SimpleOS Glass Window Manager — x86_64 Render Primitives + Theme + Chrome
+#
+# Extracted from wm_entry.spl. Contains:
+#   - Extern FFI declarations (rendering + layout)
+#   - pack / pack8 helpers
+#   - Screen dimensions, theme token constants, layout constants
+#   - Easing functions (bounce_offset, ease_out_cubic, ease_in_cubic, lerp, etc.)
+#   - Dock icon color constants
+#   - Rendering primitive helpers (fill, blend, blur, grad_h/v, etc.)
+#   - Text rendering helpers (draw_label, draw_label_shadow, etc.)
+#   - Layout engine helpers and constants
+#   - Theme-aware color getters (surface, elevated, accent, text_c, etc.)
+#   - WM Chrome stylesheet helpers (chrome_draw_surface, chrome_draw_menu_item, etc.)
+#
+# No module-level var state — all functions are pure or stateless wrappers.
+
+# === Extern FFI declarations ===
+extern fn serial_println(msg: text)
+
+extern fn rt_gui_fill4(xy: u64, wh: u64, color: u64, unused: u64)
+extern fn rt_gui_begin_frame(width: u64, height: u64, unused1: u64, unused2: u64)
+extern fn rt_gui_present(unused1: u64, unused2: u64, unused3: u64, unused4: u64)
+extern fn rt_gui_blend_fill(xy: u64, wh: u64, color: u64, alpha: u64)
+extern fn rt_gui_box_blur(xy: u64, wh: u64, radius: u64, unused: u64)
+extern fn rt_gui_gradient_h(xy: u64, wh: u64, c1: u64, c2: u64)
+extern fn rt_gui_gradient_v(xy: u64, wh: u64, c1: u64, c2: u64)
+extern fn rt_gui_shadow(xy: u64, wh: u64, blur_alpha: u64, offset: u64)
+extern fn rt_gui_rounded_rect(xy: u64, wh: u64, color_radius: u64, alpha: u64)
+extern fn rt_gui_shadow_fill(xy: u64, wh: u64, color: u64, unused: u64)
+extern fn rt_gui_rounded_rect_top(xy: u64, wh: u64, color_radius: u64, alpha: u64)
+extern fn rt_gui_filled_circle(cx_cy: u64, diam_color: u64, alpha: u64, unused: u64)
+extern fn rt_gui_draw_wallpaper(wh: u64, style: u64, unused1: u64, unused2: u64)
+extern fn rt_gui_rounded_rect_aa(xy: u64, wh: u64, color_radius: u64, alpha: u64)
+extern fn rt_gui_line(p1: u64, p2: u64, color_thick: u64, alpha: u64)
+extern fn rt_gui_ring(cx_cy: u64, diam_thick: u64, color: u64, alpha: u64)
+extern fn rt_gui_gradient_rect(xy: u64, wh: u64, color_radius: u64, c2_alpha: u64)
+extern fn rt_gui_set_text_buf(chars: u64, offset: u64, unused1: u64, unused2: u64)
+extern fn rt_gui_draw_text_buf(xy: u64, color_len: u64, alpha: u64, unused: u64)
+extern fn rt_gui_draw_text_shadow(xy: u64, color_len: u64, alpha: u64, shadow_alpha: u64)
+extern fn rt_gui_draw_text_bold(xy: u64, color_len: u64, alpha: u64, unused: u64)
+extern fn rt_gui_draw_text_2x(xy: u64, color_len: u64, alpha: u64, shadow_alpha: u64)
+extern fn rt_gui_draw_text_outline(xy: u64, color_len: u64, alpha: u64, outline_alpha: u64)
+extern fn rt_gui_draw_text_vector(xy: u64, color_size: u64, alpha: u64, unused: u64)
+extern fn rt_gui_noise_blend(xy: u64, wh: u64, intensity: u64, unused: u64)
+
+# Layout engine
+extern fn rt_layout_reset(u1: u64, u2: u64, u3: u64, u4: u64)
+extern fn rt_layout_add(type_: u64, parent: u64, u1: u64, u2: u64) -> u64
+extern fn rt_layout_set_size(id: u64, w_spec: u64, h_spec: u64, u: u64)
+extern fn rt_layout_set_padding(id: u64, lr: u64, tb: u64, u: u64)
+extern fn rt_layout_set_props(id: u64, spacing: u64, align: u64, u: u64)
+extern fn rt_layout_compute(wh: u64, u1: u64, u2: u64, u3: u64)
+extern fn rt_layout_get(id: u64, u1: u64, u2: u64, u3: u64) -> u64
+extern fn rt_layout_get_size(id: u64, u1: u64, u2: u64, u3: u64) -> u64
+
+# Pack two u32 values into one u64 (high|low)
+fn pack(hi: u64, lo: u64) -> u64:
+    (hi << 32) | (lo & 0xFFFFFFFF)
+
+# === Screen dimensions ===
+val SCREEN_W: u64 = 1024
+val SCREEN_H: u64 = 768
+val SYSTEM_BAR_H: u64 = 28
+val DOCK_H: u64 = 52
+val TITLE_BAR_H: u64 = 44
+
+# ===========================================================================
+# Dark Glass Theme (default) — derived from glass_tokens.spl
+# ===========================================================================
+val DARK_BG_TOP: u64       = 0x00060508
+val DARK_BG_BOT: u64       = 0x00200840
+val DARK_SURFACE: u64      = 0x001E1E23
+val DARK_SURFACE_A: u64    = 35
+val DARK_ELEVATED: u64     = 0x002C2C32
+val DARK_ELEVATED_A: u64   = 50
+val DARK_BORDER: u64       = 0x00FFFFFF
+val DARK_BORDER_A: u64     = 100
+val DARK_TEXT: u64         = 0x00F5F5F7
+val DARK_TEXT_SEC: u64     = 0x00EBEBF5
+val DARK_ACCENT: u64       = 0x000A84FF
+val DARK_ACCENT2: u64      = 0x00BB86FC
+val DARK_SHADOW_A: u64     = 80
+
+# ===========================================================================
+# White Glass Theme
+# ===========================================================================
+val LIGHT_BG_TOP: u64      = 0x00E8E0F0
+val LIGHT_BG_BOT: u64      = 0x00F5F0FF
+val LIGHT_SURFACE: u64     = 0x00F8F0FF
+val LIGHT_SURFACE_A: u64   = 65
+val LIGHT_ELEVATED: u64    = 0x00FFF0F8
+val LIGHT_ELEVATED_A: u64  = 110
+val LIGHT_BORDER: u64      = 0x00000000
+val LIGHT_BORDER_A: u64    = 90
+val LIGHT_TEXT: u64        = 0x00201820
+val LIGHT_TEXT_SEC: u64    = 0x003C3C43
+val LIGHT_ACCENT: u64      = 0x00007AFF
+val LIGHT_ACCENT2: u64     = 0x00AF6BC5
+val LIGHT_SHADOW_A: u64    = 30
+
+val WARM_ACCENT: u64 = 0x00FF9500
+val SUCCESS_COLOR: u64 = 0x0030D158
+val WARNING_COLOR: u64 = 0x00FFD60A
+val WARM_HIGHLIGHT: u64 = 0x00FFD0A0
+
+val BTN_CLOSE: u64   = 0x00FF6B8A
+val BTN_MIN: u64     = 0x008B8BFA
+val BTN_MAX: u64     = 0x0050D0A0
+
+val BLUR_SURFACE: u64  = 16
+val BLUR_ELEVATED: u64 = 24
+val BLUR_SUBTLE: u64   = 6
+
+# ===========================================================================
+# Layout Constants
+# ===========================================================================
+val WIN_CORNER_RADIUS: u64 = 22
+val WIN_BORDER_INSET: u64 = 1
+val CONTENT_MARGIN_TOP: u64 = 2
+val CONTENT_PAD: u64 = 16
+val FOCUS_RING_PAD: u64 = 2
+
+val BTN_DIAMETER: u64 = 16
+val BTN_GAP: u64 = 10
+val BTN_MARGIN_X: u64 = 12
+val BTN_MARGIN_Y: u64 = 10
+
+val DOCK_MARGIN_BOTTOM: u64 = 10
+val DOCK_CORNER_RADIUS: u64 = 26
+val DOCK_ICON_SIZE: u64 = 40
+val DOCK_ICON_GAP: u64 = 16
+val DOCK_ICON_PAD: u64 = 4
+val DOCK_PILL_SIZE: u64 = 48
+val DOCK_H_PAD: u64 = 20
+val DOCK_V_PAD: u64 = 8
+val DOCK_ACTUAL_H: u64 = 58
+val DOCK_INDICATOR_MARGIN: u64 = 6
+
+val BAR_H_PAD: u64 = 6
+val BAR_V_PAD: u64 = 5
+val MENU_ITEM_GAP: u64 = 6
+
+val SIDEBAR_W: u64 = 84
+val BANNER_H: u64 = 44
+val GRID_COL_SPACING: u64 = 72
+val GRID_ROW_SPACING: u64 = 50
+
+val WIN0_W: u64 = 420
+val WIN0_H: u64 = 300
+val WIN1_W: u64 = 380
+val WIN1_H: u64 = 260
+val WIN2_W: u64 = 340
+val WIN2_H: u64 = 220
+
+# ===========================================================================
+# Easing Functions
+# ===========================================================================
+
+fn bounce_offset(progress: u64) -> u64:
+    if progress < 40:
+        (8 * (40 - progress)) / 40
+    else:
+        if progress < 70:
+            0
+        else:
+            0
+
+fn ease_out_cubic(t: u64) -> u64:
+    val inv = 100 - t
+    val inv2 = inv * inv / 100
+    val inv3 = inv2 * inv / 100
+    100 - inv3
+
+fn ease_in_out_quad(t: u64) -> u64:
+    if t < 50:
+        t * t * 2 / 100
+    else:
+        val inv = 100 - t
+        100 - inv * inv * 2 / 100
+
+fn spring_ease(t: u64) -> u64:
+    if t < 60:
+        t * 110 / 60
+    else:
+        if t < 80:
+            110 - (t - 60) * 15 / 20
+        else:
+            95 + (t - 80) * 5 / 20
+
+fn ease_in_cubic(t: u64) -> u64:
+    t * t * t / 10000
+
+fn lerp(start: u64, end_: u64, progress: u64) -> u64:
+    if end_ >= start:
+        start + (end_ - start) * progress / 100
+    else:
+        start - (start - end_) * progress / 100
+
+# Dock icon colors
+val ICON_TERM: u64     = 0x003498DB
+val ICON_FILES: u64    = 0x0027AE60
+val ICON_CALC: u64     = 0x00E74C3C
+val ICON_CLOCK: u64    = 0x00F39C12
+val ICON_SETTINGS: u64 = 0x009B59B6
+val ICON_BROWSER: u64  = 0x00E67E22
+val ICON_EDITOR: u64   = 0x001ABC9C
+
+# ===========================================================================
+# Rendering Helpers
+# ===========================================================================
+
+fn fill(x: u64, y: u64, w: u64, h: u64, color: u64):
+    rt_gui_shadow_fill(pack(x, y), pack(w, h), color, 0)
+
+fn blend(x: u64, y: u64, w: u64, h: u64, color: u64, alpha: u64):
+    rt_gui_blend_fill(pack(x, y), pack(w, h), color, alpha)
+
+fn blur(x: u64, y: u64, w: u64, h: u64, radius: u64):
+    rt_gui_box_blur(pack(x, y), pack(w, h), radius, 0)
+
+fn grad_v(x: u64, y: u64, w: u64, h: u64, c1: u64, c2: u64):
+    rt_gui_gradient_v(pack(x, y), pack(w, h), c1, c2)
+
+fn grad_h(x: u64, y: u64, w: u64, h: u64, c1: u64, c2: u64):
+    rt_gui_gradient_h(pack(x, y), pack(w, h), c1, c2)
+
+fn shadow(x: u64, y: u64, w: u64, h: u64, blur_r: u64, alpha: u64, offset: u64):
+    rt_gui_shadow(pack(x, y), pack(w, h), pack(blur_r, alpha), offset)
+
+fn rrect(x: u64, y: u64, w: u64, h: u64, color: u64, radius: u64, alpha: u64):
+    rt_gui_rounded_rect(pack(x, y), pack(w, h), pack(color, radius), alpha)
+
+fn rrect_top(x: u64, y: u64, w: u64, h: u64, color: u64, radius: u64, alpha: u64):
+    rt_gui_rounded_rect_top(pack(x, y), pack(w, h), pack(color, radius), alpha)
+
+fn circle(cx: u64, cy: u64, diameter: u64, color: u64, alpha: u64):
+    rt_gui_filled_circle(pack(cx, cy), pack(diameter, color), alpha, 0)
+
+fn rrect_aa(x: u64, y: u64, w: u64, h: u64, color: u64, radius: u64, alpha: u64):
+    rt_gui_rounded_rect_aa(pack(x, y), pack(w, h), pack(color, radius), alpha)
+
+fn line(x1: u64, y1: u64, x2: u64, y2: u64, color: u64, thick: u64, alpha: u64):
+    rt_gui_line(pack(x1, y1), pack(x2, y2), pack(color, thick), alpha)
+
+fn ring(cx: u64, cy: u64, diameter: u64, thick: u64, color: u64, alpha: u64):
+    rt_gui_ring(pack(cx, cy), pack(diameter, thick), pack(color, 0), alpha)
+
+fn grad_rect(x: u64, y: u64, w: u64, h: u64, c1: u64, radius: u64, c2: u64, alpha: u64):
+    rt_gui_gradient_rect(pack(x, y), pack(w, h), pack(c1, radius), pack(c2, alpha))
+
+fn noise(x: u64, y: u64, w: u64, h: u64, intensity: u64):
+    rt_gui_noise_blend(pack(x, y), pack(w, h), intensity, 0)
+
+# ===========================================================================
+# Text Rendering Helpers
+# ===========================================================================
+
+fn pack8(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64) -> u64:
+    (a << 56) | (b << 48) | (c << 40) | (d << 32) | (e << 24) | (f << 16) | (g << 8) | h
+
+fn draw_label(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    rt_gui_draw_text_buf(pack(x, y), pack(color, len), alpha, 0)
+
+fn draw_label_shadow(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64, shadow_a: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    rt_gui_draw_text_shadow(pack(x, y), pack(color, len), alpha, shadow_a)
+
+fn draw_label_bold(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    rt_gui_draw_text_bold(pack(x, y), pack(color, len), alpha, 0)
+
+fn draw_label_2x(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64, shadow_a: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    rt_gui_draw_text_2x(pack(x, y), pack(color, len), alpha, shadow_a)
+
+fn draw_label_outline(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64, outline_a: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    rt_gui_draw_text_outline(pack(x, y), pack(color, len), alpha, outline_a)
+
+fn draw_label_vector(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64, pixel_height: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    val size_and_len = (pixel_height << 16) | (len & 0xFFFF)
+    rt_gui_draw_text_vector(pack(x, y), pack(color, size_and_len), alpha, 0)
+
+# ===========================================================================
+# Layout Engine Constants + Helpers
+# ===========================================================================
+
+val LT_HSTACK: u64 = 1
+val LT_VSTACK: u64 = 2
+val LT_ZSTACK: u64 = 3
+val SM_FIXED: u64 = 0
+val SM_FILL: u64 = 1
+val SM_AUTO: u64 = 2
+val ALIGN_START: u64 = 0
+val ALIGN_CENTER: u64 = 1
+val ALIGN_END: u64 = 2
+
+fn layout_fixed(size: u64) -> u64:
+    pack(SM_FIXED, size)
+
+fn layout_fill(weight: u64) -> u64:
+    pack(SM_FILL, weight)
+
+fn layout_auto() -> u64:
+    pack(SM_AUTO, 0)
+
+fn layout_x(id: u64) -> u64:
+    rt_layout_get(id, 0, 0, 0) >> 32
+
+fn layout_y(id: u64) -> u64:
+    rt_layout_get(id, 0, 0, 0) & 0xFFFFFFFF
+
+fn layout_w(id: u64) -> u64:
+    rt_layout_get_size(id, 0, 0, 0) >> 32
+
+fn layout_h(id: u64) -> u64:
+    rt_layout_get_size(id, 0, 0, 0) & 0xFFFFFFFF
+
+# ===========================================================================
+# Theme-Aware Color Getters
+# ===========================================================================
+
+fn bg_top(theme: u64) -> u64:
+    if theme == 0: DARK_BG_TOP
+    else: LIGHT_BG_TOP
+
+fn bg_bot(theme: u64) -> u64:
+    if theme == 0: DARK_BG_BOT
+    else: LIGHT_BG_BOT
+
+fn surface(theme: u64) -> u64:
+    if theme == 0: DARK_SURFACE
+    else: LIGHT_SURFACE
+
+fn surface_a(theme: u64) -> u64:
+    if theme == 0: DARK_SURFACE_A
+    else: LIGHT_SURFACE_A
+
+fn elevated(theme: u64) -> u64:
+    if theme == 0: DARK_ELEVATED
+    else: LIGHT_ELEVATED
+
+fn elevated_a(theme: u64) -> u64:
+    if theme == 0: DARK_ELEVATED_A
+    else: LIGHT_ELEVATED_A
+
+fn border_c(theme: u64) -> u64:
+    if theme == 0: DARK_BORDER
+    else: LIGHT_BORDER
+
+fn border_a(theme: u64) -> u64:
+    if theme == 0: DARK_BORDER_A
+    else: LIGHT_BORDER_A
+
+fn accent(theme: u64) -> u64:
+    if theme == 0: DARK_ACCENT
+    else: LIGHT_ACCENT
+
+fn accent2(theme: u64) -> u64:
+    if theme == 0: DARK_ACCENT2
+    else: LIGHT_ACCENT2
+
+fn shadow_a(theme: u64) -> u64:
+    if theme == 0: DARK_SHADOW_A
+    else: LIGHT_SHADOW_A
+
+fn text_c(theme: u64) -> u64:
+    if theme == 0: DARK_TEXT
+    else: LIGHT_TEXT
+
+fn text_sec(theme: u64) -> u64:
+    if theme == 0: DARK_TEXT_SEC
+    else: LIGHT_TEXT_SEC
+
+# ===========================================================================
+# WM Chrome Stylesheet
+# ===========================================================================
+
+val CSS_CHROME_TITLEBAR: u64 = 1
+val CSS_CHROME_MENUBAR: u64 = 2
+val CSS_CHROME_DOCK: u64 = 3
+
+fn chrome_radius(role: u64) -> u64:
+    if role == CSS_CHROME_TITLEBAR: return WIN_CORNER_RADIUS
+    if role == CSS_CHROME_MENUBAR: return 0
+    if role == CSS_CHROME_DOCK: return DOCK_CORNER_RADIUS
+    return 8
+
+fn chrome_blur_radius(role: u64) -> u64:
+    if role == CSS_CHROME_TITLEBAR: return BLUR_SUBTLE
+    if role == CSS_CHROME_MENUBAR: return BLUR_ELEVATED
+    if role == CSS_CHROME_DOCK: return BLUR_ELEVATED
+    return BLUR_SUBTLE
+
+fn chrome_surface_alpha(theme: u64, role: u64) -> u64:
+    if role == CSS_CHROME_TITLEBAR: return elevated_a(theme)
+    if role == CSS_CHROME_MENUBAR: return elevated_a(theme)
+    if role == CSS_CHROME_DOCK: return surface_a(theme)
+    return surface_a(theme)
+
+fn chrome_vibrancy_alpha(role: u64) -> u64:
+    if role == CSS_CHROME_TITLEBAR: return 10
+    if role == CSS_CHROME_MENUBAR: return 5
+    if role == CSS_CHROME_DOCK: return 6
+    return 4
+
+fn chrome_topline_alpha(role: u64) -> u64:
+    if role == CSS_CHROME_TITLEBAR: return 30
+    if role == CSS_CHROME_MENUBAR: return 35
+    if role == CSS_CHROME_DOCK: return 35
+    return 20
+
+fn chrome_border_alpha(theme: u64, role: u64) -> u64:
+    val base = border_a(theme)
+    if role == CSS_CHROME_TITLEBAR: return base + 15
+    if role == CSS_CHROME_MENUBAR: return 38
+    if role == CSS_CHROME_DOCK: return base
+    return base
+
+fn chrome_draw_surface(role: u64, x: u64, y: u64, w: u64, h: u64, theme: u64):
+    """Reusable chrome surface renderer; acts like shared CSS class styles."""
+    val blur_r = chrome_blur_radius(role)
+    blur(x, y, w, h, blur_r)
+    if role == CSS_CHROME_MENUBAR:
+        blur(x, y, w, h, 10)
+    else:
+        if role == CSS_CHROME_DOCK:
+            blur(x, y, w, h, 12)
+            blur(x, y, w, h, 6)
+            blur(x, y, w, h, 4)
+
+    blend(x, y, w, h, accent(theme), chrome_vibrancy_alpha(role))
+    blend(x, y, w, h, 0x004080FF, 12)
+    if role != CSS_CHROME_DOCK:
+        blend(x, y, w, h, 0x00FF6B8A, 3)
+
+    if role == CSS_CHROME_TITLEBAR:
+        grad_rect(x, y, w, h, elevated(theme), chrome_radius(role), surface(theme), chrome_surface_alpha(theme, role))
+        val top_h = h * 40 / 100
+        val bot_start = h * 70 / 100
+        val bot_h = h - bot_start
+        blend(x + 1, y, w - 2, top_h, 0x00FFFFFF, 12)
+        blend(x + 1, y + bot_start, w - 2, bot_h, 0x00000000, 8)
+        noise(x + 1, y + 1, w - 2, h - 1, 1)
+    else:
+        grad_v(x, y, w, h, elevated(theme), surface(theme))
+        blend(x, y, w, h / 2, 0x00FFFFFF, 8)
+        blend(x, y + h / 2, w, h / 2, 0x00000000, 8)
+        if role == CSS_CHROME_DOCK:
+            rrect(x, y, w, h, surface(theme), chrome_radius(role), chrome_surface_alpha(theme, role))
+            rrect(x + 1, y + 1, w - 2, h - 2, 0x00FFFFFF, chrome_radius(role) - 1, 10)
+            blend(x + 2, y + 2, w - 4, h - 4, 0x00FFFFFF, 15)
+        else:
+            rrect_aa(x, y, w, h, surface(theme), chrome_radius(role), chrome_surface_alpha(theme, role))
+
+    blend(x + 1, y + 1, w - 2, 1, 0x00FFFFFF, chrome_topline_alpha(role))
+    if role == CSS_CHROME_DOCK:
+        rrect(x, y, w, h, border_c(theme), chrome_radius(role), chrome_border_alpha(theme, role))
+    else:
+        blend(x, y + h - 1, w, 1, border_c(theme), chrome_border_alpha(theme, role))
+
+fn chrome_draw_menu_item(x: u64, y: u64, w: u64, h: u64, theme: u64, is_active: u64, chars: u64, len: u64):
+    if is_active == 1:
+        rrect_aa(x - 2, y - 1, w + 4, h + 2, text_c(theme), 4, 25)
+        blend(x - 2, y - 1, w + 4, h + 2, accent(theme), 8)
+        blend(x, y + h - 2, w, 1, accent(theme), 120)
+        blend(x, y + h, w, 1, accent(theme), 40)
+    draw_label_vector(x + 2, y, text_c(theme), 220, chars, len, 14)
+
+fn chrome_draw_toolbar_action(x: u64, y: u64, w: u64, h: u64, theme: u64, is_primary: u64):
+    var bg_color = surface(theme)
+    var bg_alpha: u64 = 60
+    if is_primary == 1:
+        bg_color = accent(theme)
+        bg_alpha = 80
+    rrect_aa(x, y, w, h, bg_color, 4, bg_alpha)
+    rrect_aa(x, y, w, h, border_c(theme), 4, 20)
+    blend(x + 1, y, w - 2, 1, 0x00FFFFFF, 15)
+
+fn chrome_draw_dock_indicator(cx: u64, cy: u64, color: u64, is_focused: u64):
+    circle(cx - 1, cy - 1, 8, color, 40)
+    circle(cx, cy, 6, color, 220)
+    if is_focused == 1:
+        circle(cx, cy, 6, 0x00FFFFFF, 140)
+
+fn chrome_draw_divider(x: u64, y: u64, h: u64, theme: u64, alpha: u64):
+    blend(x, y, 1, h, border_c(theme), alpha)

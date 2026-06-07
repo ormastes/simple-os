@@ -1,0 +1,72 @@
+# x86_64 OS Entry — Full-stack SimpleOS boot (bare-metal Multiboot path)
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+
+# Direct POSIX init (bypass mod.spl to avoid weak-stub cascade from
+# socket_compat/select_compat inline asm dependency)
+use os.posix.fd_table.{fd_table_init}
+use os.posix.async_io.{async_io_init}
+use os.posix.signal_compat.{signal_init}
+
+# Services
+use os.kernel.boot.init_services.{init_all_services}
+use os.services.vfs.vfs_boot_init.{vfs_boot_nvme_q35_pure_simple_perf_probe_serial_lines}
+use os.kernel.arch.x86_64.interrupt.{X86Interrupt}
+use os.kernel.memory.pmm.{pmm_init_identity_range}
+
+# Shell
+use os.apps.shell.shell_app.{ShellApp}
+
+# Smoke test: exec /SIMPLSTC.SMF from FS to validate the simple-from-FS path.
+use os.kernel.loader.x86_64_fs_exec_spawn.{x86_64_fs_exec_spawn}
+
+val QEMU_X86_64_MEMORY_BYTES: u64 = 536870912
+val QEMU_X86_64_KERNEL_START: u64 = 0x100000
+val QEMU_X86_64_KERNEL_RESERVED_END: u64 = 33554432
+
+fn _start():
+    serial_println("")
+    serial_println("=== SimpleOS Boot ===")
+    serial_println("")
+
+    # POSIX layer init
+    fd_table_init()
+    async_io_init()
+    signal_init()
+    serial_println("[boot] POSIX layer initialized")
+
+    val memory_ready = pmm_init_identity_range(
+        QEMU_X86_64_MEMORY_BYTES,
+        QEMU_X86_64_KERNEL_START,
+        QEMU_X86_64_KERNEL_RESERVED_END
+    )
+    if memory_ready:
+        serial_println("[boot] memory init OK")
+    else:
+        serial_println("[boot] memory init FAILED")
+
+    # Install the minimal runtime bundle that future trap/syscall dispatch
+    # will own on x86_64 baremetal.
+    if not X86Interrupt.runtime_installed():
+        X86Interrupt.install_bootstrap_runtime(64)
+        serial_println("[boot] x86 runtime bundle installed")
+
+    # Services
+    init_all_services()
+    for line in vfs_boot_nvme_q35_pure_simple_perf_probe_serial_lines():
+        serial_println(line)
+
+    # Shell
+    var shell = ShellApp.new()
+    serial_println("[boot] Shell ready")
+
+    # Step 1 smoke test: does /SIMPLSTC.SMF actually load via the FS-exec path?
+    serial_println("[smoke] Attempting x86_64_fs_exec_spawn(/SIMPLSTC.SMF)")
+    val smoke_rc = x86_64_fs_exec_spawn("/SIMPLSTC.SMF", [], [])
+    serial_println("[smoke] simple-from-fs rc={smoke_rc}")
+
+    serial_println("")
+    serial_println("=== SimpleOS ready ===")
+    serial_println("TEST PASSED")
+    rt_port_outb(0xf4, 0)

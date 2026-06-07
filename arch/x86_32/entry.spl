@@ -1,0 +1,6 @@
+# x86_32 Entry — SimpleOS boot shim
+
+fn _start():
+    print "[SIMPLE] Simple entry point reached"
+    print "[SIMPLE] Runtime string system working"
+    print "[SIMPLE] x86_32 boot complete"

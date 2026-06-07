@@ -1,36 +1,39 @@
 # SimpleOS Test Runner — Multi-Architecture QEMU Tests
 #
-# Runs boot smoke tests on all 4 architectures.
+# Runs boot smoke tests on all first-class QEMU architectures.
 #
 # Usage:
 #   bin/simple run examples/simple_os/run_tests.spl
 #   bin/simple run examples/simple_os/run_tests.spl -- --arch=riscv64
 
-use os.qemu_runner.{get_target, arch_from_name, arch_display_name, build_os, test_os}
+use os.qemu_runner.{get_all_targets, get_qemu_target, arch_from_name, arch_display_name, build_os, test_os}
 use os.kernel.arch.arch_context.{Architecture}
 
-extern fn rt_args() -> [text]
+extern fn sys_get_args() -> [text]
 extern fn rt_process_run_timeout(cmd: text, args: [text], timeout_ms: i64) -> (text, text, i32)
 
 fn check_qemu_available(qemu_bin: text) -> bool:
     val result = rt_process_run_timeout("which", [qemu_bin], 5000)
     result[2] == 0
 
-fn main():
+fn main() -> i32:
     """Run SimpleOS QEMU tests for all or specified architectures."""
-    val args = rt_args()
+    val args = sys_get_args()
 
     var target_arch: text = "all"
     for arg in args:
+        if arg == "--":
+            continue
         if arg.starts_with("--arch="):
             target_arch = arg.substr(7)
 
-    val arches: [Architecture] = [
-        Architecture.Arm64,
-        Architecture.X86_64,
-        Architecture.Riscv32,
-        Architecture.Riscv64
-    ]
+    var selected_arch: Architecture? = nil
+    if target_arch != "all":
+        selected_arch = arch_from_name(target_arch)
+        if not selected_arch.?:
+            print "Unknown architecture: {target_arch}"
+            print "Available: x86_64, x86_32, i686, arm64, arm32, riscv64, riscv32"
+            return 1
 
     val timeout_ms: u64 = 15000
 
@@ -42,12 +45,16 @@ fn main():
     var failed: u64 = 0
     var skipped: u64 = 0
 
-    for arch in arches:
+    for target in get_all_targets():
+        val arch = target.arch
         val name = arch_display_name(arch)
-        if target_arch != "all" and target_arch != name:
-            continue
+        if target_arch != "all":
+            if val arch_filter = selected_arch:
+                if arch_filter != arch:
+                    continue
+            else:
+                continue
 
-        val target = get_target(arch)
         print "--- {name} ---"
 
         # Check QEMU
@@ -59,7 +66,9 @@ fn main():
 
         # Build
         print "  Building..."
-        val built = build_os(target)
+        val test_target = if target_arch == "all": target else:
+            if val arch_filter = selected_arch: get_qemu_target(arch_filter) else: target
+        val built = build_os(test_target)
         if not built:
             print "  [FAIL] Build failed"
             failed = failed + 1
@@ -68,7 +77,7 @@ fn main():
 
         # Test
         print "  Running QEMU test (timeout: {timeout_ms}ms)..."
-        val ok = test_os(target, timeout_ms)
+        val ok = test_os(test_target, timeout_ms)
         if ok:
             print "  [PASS] {name} boot smoke test"
             passed = passed + 1
@@ -79,5 +88,6 @@ fn main():
 
     print "========================"
     print "Results: {passed} passed, {failed} failed, {skipped} skipped"
-
-main()
+    if failed > 0:
+        return 1
+    0

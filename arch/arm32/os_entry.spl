@@ -1,0 +1,23 @@
+# ARM32 OS Entry — Minimal SimpleOS boot for ARMv7 QEMU virt
+#
+# Proves the arm32 HAL boots: disables interrupts, inits console,
+# prints boot banner, parses boot info, then halts.
+#
+# Serial markers consumed by test/qemu/os/boot/arm32_boot_qemu_spec.spl:
+#   SimpleOS arm32 starting...   — entry reached, HAL console live
+#   [arm32] boot-info:ok          — boot info parsed
+#   [arm32] halt                  — entering halt loop
+
+use os.kernel.arch.hal.{hal_console_init, hal_console_writeln,
+    hal_disable_interrupts, hal_parse_boot_info, hal_halt_loop}
+
+fn spl_start():
+    hal_disable_interrupts()
+    hal_console_init()
+    hal_console_writeln("SimpleOS arm32 starting...")
+
+    val _boot_info = hal_parse_boot_info()
+    hal_console_writeln("[arm32] boot-info:ok")
+
+    hal_console_writeln("[arm32] halt")
+    hal_halt_loop()

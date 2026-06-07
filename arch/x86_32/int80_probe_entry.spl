@@ -1,0 +1,50 @@
+# x86_32 int 0x80 Probe Entry
+#
+# Live QEMU proof that the i386 IDT gate reaches the Simple syscall bridge.
+
+extern fn rt_x86_32_install_int80_probe() -> u32
+extern fn rt_x86_32_trigger_int80(id: u32, arg0: u32, arg1: u32, arg2: u32, arg3: u32, arg4: u32, arg5: u32) -> i32
+extern fn rt_port_outb(port: u32, value: u32)
+
+fn x86_32_dispatch_installed_syscall_abi(id: u32, arg0: u32, arg1: u32, arg2: u32, arg3: u32, arg4: u32, arg5: u32) -> i32:
+    _ = arg5
+    if id == 15u32 and arg0 == 0u32 and arg1 == 0u32 and arg2 == 0u32 and arg3 == 0u32 and arg4 == 0u32:
+        return 1
+    -38
+
+fn serial_put(ch: u32):
+    rt_port_outb(0x3F8, ch)
+
+fn serial_newline():
+    serial_put(13)
+    serial_put(10)
+
+fn write_marker():
+    serial_put(91)
+    serial_put(105)
+    serial_put(110)
+    serial_put(116)
+    serial_put(56)
+    serial_put(48)
+    serial_put(32)
+    serial_put(112)
+    serial_put(114)
+    serial_put(111)
+    serial_put(98)
+    serial_put(101)
+    serial_put(93)
+    serial_put(32)
+    serial_put(98)
+    serial_put(114)
+    serial_put(107)
+    serial_put(32)
+    serial_put(111)
+    serial_put(107)
+    serial_newline()
+
+fn spl_start():
+    rt_x86_32_install_int80_probe()
+    val result = rt_x86_32_trigger_int80(15u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32)
+    if result != -38:
+        write_marker()
+    rt_port_outb(0xF4, 0)

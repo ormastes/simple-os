@@ -1,0 +1,65 @@
+# FR-SOS-017 green carrier SMP live proof entry.
+#
+# Diagnostic QEMU lane: start a two-CPU qemu64 guest, observe the AP 64-bit
+# entry marker, then run the SimpleOS green-carrier queue/dispatch contract
+# against CPU1 inside the guest.
+
+use os.kernel.smp.smp.{
+    smp_ap_startup_sent,
+    smp_init,
+    smp_num_cpus,
+    smp_online_count,
+    smp_register_firmware_apic_ids,
+    smp_take_ipi
+}
+use os.kernel.smp.percpu.{percpu_is_online, percpu_is_present}
+use os.kernel.arch.x86_64.cpu.{x86_ap_trampoline_vector, x86_registered_ap_boot_started_count, x86_send_startup_to_cpu}
+use os.kernel.arch.x86_64.interrupt.{X86Interrupt}
+use os.kernel.scheduler.green_carrier.{
+    green_carrier_fixed_run_task,
+    green_carrier_fixed_preempt_running_task
+}
+
+extern fn serial_println(msg: text)
+
+fn _spin_for_ap_marker():
+    var i: u64 = 0
+    while i < 200000000u64:
+        i = i + 1
+
+fn _pass(value: bool) -> text:
+    if value:
+        "true"
+    else:
+        "false"
+
+fn _run_green_carrier_probe():
+    serial_println("[green-carrier-qemu] probe-step=fixed-run")
+    val result = green_carrier_fixed_run_task(701, 2, 0, 5, 0, 0, 0, 0)
+    val pending = smp_take_ipi(1u32)
+    val probe_ok = result.enqueued and result.ipi_sent and result.dispatched and result.current_task == 701u64 and result.context_switches == 1
+    val preempt = green_carrier_fixed_preempt_running_task(result.current_task as i64, 1, 2, 1, "timer_interrupt")
+    val preempt_ok = preempt.accepted and preempt.ticked and preempt.yielded and preempt.current_task == 0u64 and preempt.queued_task == 701
+
+    serial_println("[green-carrier-qemu] target-cpu={result.target_cpu} enqueued={_pass(result.enqueued)} ipi={_pass(result.ipi_sent)} pending={pending}")
+    serial_println("[green-carrier-qemu] dispatched={_pass(result.dispatched)} task={result.task_id}")
+    serial_println("[green-carrier-qemu] cpu1-task={result.current_task} cpu1-switches={result.context_switches}")
+    serial_println("[green-carrier-qemu] preempt-source={preempt.source} ticked={_pass(preempt.ticked)} yielded={_pass(preempt.yielded)} queued={preempt.queued_task}")
+    serial_println("[green-carrier-qemu] PREEMPT_PASS={_pass(preempt_ok)}")
+    serial_println("[green-carrier-qemu] PASS={_pass(probe_ok)}")
+
+fn _start():
+    serial_println("[green-carrier-qemu] boot")
+    smp_init()
+    val registered = smp_register_firmware_apic_ids([0u32, 1u32])
+    serial_println("[green-carrier-qemu] registered-cpus={registered} count={smp_num_cpus()}")
+    serial_println("[green-carrier-qemu] cpu1-present={_pass(percpu_is_present(1u32))} online-before={_pass(percpu_is_online(1u32))}")
+    X86Interrupt.init()
+    val vec = x86_ap_trampoline_vector()
+    serial_println("[green-carrier-qemu] startup-sent-before={_pass(smp_ap_startup_sent(1u32))} vector={vec}")
+    val manual_sent = x86_send_startup_to_cpu(1u32, vec)
+    serial_println("[green-carrier-qemu] manual-startup={_pass(manual_sent)} startup-count={x86_registered_ap_boot_started_count()}")
+    _spin_for_ap_marker()
+    serial_println("[green-carrier-qemu] online-after={_pass(percpu_is_online(1u32))} online-count={smp_online_count()}")
+    _run_green_carrier_probe()
+    serial_println("[green-carrier-qemu] done")

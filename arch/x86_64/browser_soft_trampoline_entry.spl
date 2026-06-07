@@ -1,0 +1,24 @@
+#![allow(unnamed_duplicate_typed_args)]
+# x86_64 Browser Software Trampoline Entry
+#
+# Keeps spl_start tiny and delegates the heavy browser pipeline to a
+# separate imported module so the entry symbol does not inherit the full
+# browser frame.
+
+extern fn rt_port_outb(port: u64, value: u64)
+
+use simple_os.src.browser_soft_leaf.{run as browser_soft_leaf_probe}
+
+val SERIAL_DATA: u64 = 0x3F8
+val DEBUG_EXIT: u64 = 0xF4
+
+fn spl_start():
+    rt_port_outb(SERIAL_DATA, 84)
+    rt_port_outb(SERIAL_DATA, 97)
+    val visible = browser_soft_leaf_probe()
+    rt_port_outb(SERIAL_DATA, 105)
+    if visible > 0:
+        rt_port_outb(SERIAL_DATA, 80)
+    else:
+        rt_port_outb(SERIAL_DATA, 70)
+    rt_port_outb(DEBUG_EXIT, 0)

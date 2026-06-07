@@ -1,0 +1,63 @@
+# ARM32 filesystem executable acceptance entry.
+
+extern fn serial_println(msg: text)
+extern fn rt_qemu_exit_success()
+extern fn arm_fs_exec_trace(id: u64)
+extern fn arm_fs_exec_print_success_marker()
+extern fn rt_arm_array_len_u32(arr: [u8]) -> u32
+
+use os.services.vfs.arm_fs_exec_vfs.{arm_fs_exec_vfs_boot_init}
+use os.services.vfs.arm_fs_exec_vfs.{arm_fs_exec_read_file_bytes}
+use os.kernel.loader.arm_fs_exec_spawn.{arm_fs_exec_spawn_hello_world_smf, arm_fs_exec_spawn_path}
+
+fn _smoke_spawn_app(app_name: text, app_path: text):
+    val bytes = arm_fs_exec_read_file_bytes(app_path)
+    val byte_len = rt_arm_array_len_u32(bytes)
+    if byte_len <= 4:
+        serial_println("[arm-fs-exec] app-read:fail app={app_name} path={app_path}")
+        return
+    serial_println("[desktop-e2e] vfs-app-read:ok source=generic-vfs path={app_path} bytes={byte_len}")
+    val pid = arm_fs_exec_spawn_path(app_path)
+    if pid > 0:
+        serial_println("[desktop-e2e] process-backed:ok app={app_name} pid={pid}")
+
+fn _smoke_toolchain_manifest(app_name: text, manifest_path: text):
+    val manifest = arm_fs_exec_read_file_bytes(manifest_path)
+    if rt_arm_array_len_u32(manifest) > 0:
+        serial_println("[desktop-e2e] native-toolchain-launch:ok app={app_name} lane=arm32-virtio-fat32-smf mode=native-filesystem-app status=standalone-required tool=/sys/apps/{app_name} manifest={manifest_path}")
+
+fn spl_start():
+    serial_println("")
+    serial_println("=== SimpleOS ARM32 FS exec boot ===")
+
+    arm_fs_exec_trace(201)
+    if not arm_fs_exec_vfs_boot_init():
+        arm_fs_exec_trace(202)
+        serial_println("[arm-fs-exec] vfs:fail")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+    arm_fs_exec_trace(203)
+
+    val pid = arm_fs_exec_spawn_hello_world_smf()
+    if pid <= 0:
+        arm_fs_exec_trace(204)
+        serial_println("[arm-fs-exec] spawn:fail")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+    serial_println("[desktop-e2e] process-backed:ok app=hello_world pid={pid}")
+
+    _smoke_spawn_app("simple_compiler", "/sys/apps/simple_compiler")
+    _smoke_spawn_app("simple_interpreter", "/sys/apps/simple_interpreter")
+    _smoke_spawn_app("simple_loader", "/sys/apps/simple_loader")
+    _smoke_spawn_app("llvm", "/sys/apps/llvm")
+    _smoke_spawn_app("clang", "/sys/apps/clang")
+    _smoke_spawn_app("rust", "/sys/apps/rust")
+    _smoke_toolchain_manifest("llvm", "/SYS/LLVMMAN.TXT")
+    _smoke_toolchain_manifest("clang", "/SYS/CLANGMAN.TXT")
+    _smoke_toolchain_manifest("rust", "/SYS/RUSTMAN.TXT")
+
+    arm_fs_exec_trace(206)
+    arm_fs_exec_print_success_marker()
+    rt_qemu_exit_success()

@@ -1,0 +1,115 @@
+# x86_64 Filesystem Test Entry — Verify FAT32 read operations
+#
+# Tests the C-backed FAT32 driver: file read, file existence, file size.
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+extern fn simpleos_nvme_init() -> i64
+extern fn simpleos_fat32_read_known_app(app_id: u64) -> i64
+extern fn simpleos_fat32_read_known_app_size(app_id: u64) -> i64
+
+var test_passed: i64 = 0
+var test_failed: i64 = 0
+
+fn assert_test(name: text, condition: bool):
+    if condition:
+        serial_println("[PASS] {name}")
+        test_passed = test_passed + 1
+    else:
+        serial_println("[FAIL] {name}")
+        test_failed = test_failed + 1
+
+fn read_fixture_size(app_id: u64) -> i64:
+    val size = simpleos_fat32_read_known_app_size(app_id)
+    if size <= 0:
+        return -1
+    val rc = simpleos_fat32_read_known_app(app_id)
+    if rc != 0:
+        return -1
+    size
+
+fn spl_start():
+    serial_println("")
+    serial_println("=== SimpleOS Filesystem Test ===")
+    serial_println("")
+
+    # Initialize the C-backed NVMe/FAT32 fixture path directly. The full VFS
+    # boot module is covered by desktop/system entries; this scenario keeps the
+    # filesystem contract isolated so it cannot pull unrelated driver graphs
+    # into the freestanding test image.
+    val ok = simpleos_nvme_init() == 0
+    assert_test("C NVMe/FAT32 initialization", ok)
+
+    if not ok:
+        serial_println("[FATAL] Storage init failed")
+        rt_port_outb(0xf4, 0)
+        return
+
+    # Test 1: Read hello.txt
+    serial_println("")
+    serial_println("--- Test: Read /hello.txt ---")
+    val hello_size_read = read_fixture_size(21)
+    serial_println("  Bytes: {hello_size_read}")
+    assert_test("hello.txt is non-empty", hello_size_read > 0)
+
+    # Test 2: Read numbers.txt
+    serial_println("")
+    serial_println("--- Test: Read /numbers.txt ---")
+    val numbers_size_read = read_fixture_size(22)
+    serial_println("  Bytes: {numbers_size_read}")
+    assert_test("numbers.txt is non-empty", numbers_size_read > 0)
+
+    # Test 3: Read hello.spl
+    serial_println("")
+    serial_println("--- Test: Read /hello.spl ---")
+    val spl_size_read = read_fixture_size(23)
+    serial_println("  Bytes: {spl_size_read}")
+    assert_test("hello.spl is non-empty", spl_size_read > 0)
+
+    # Test 4: File size
+    serial_println("")
+    serial_println("--- Test: File sizes ---")
+    val hello_size = hello_size_read
+    serial_println("  HELLO.TXT: {hello_size} bytes")
+    assert_test("hello.txt size > 0", hello_size > 0)
+
+    val numbers_size = numbers_size_read
+    serial_println("  NUMBERS.TXT: {numbers_size} bytes")
+    assert_test("numbers.txt size > 0", numbers_size > 0)
+
+    # Test 5: File existence
+    serial_println("")
+    serial_println("--- Test: File existence ---")
+    val hello_exists = hello_size_read > 0
+    assert_test("HELLO.TXT exists", hello_exists)
+
+    val noexist = read_fixture_size(99) > 0
+    assert_test("NOEXIST.TXT does not exist", not noexist)
+
+    # Test 6: Non-existent file read returns empty
+    serial_println("")
+    serial_println("--- Test: Non-existent file read ---")
+    val missing = read_fixture_size(99)
+    assert_test("Reading missing file returns empty byte array", missing <= 0)
+
+    # Results
+    val all_ok =
+        ok and
+        hello_size_read > 0 and
+        numbers_size_read > 0 and
+        spl_size_read > 0 and
+        hello_size > 0 and
+        numbers_size > 0 and
+        hello_exists and
+        (not noexist) and
+        missing <= 0
+    serial_println("")
+    if all_ok:
+        serial_println("=== Results: 9 passed, 0 failed ===")
+        serial_println("ALL TESTS PASSED")
+        serial_println("TEST PASSED")
+    else:
+        serial_println("=== Results: filesystem assertion failed ===")
+        serial_println("TEST FAILED")
+
+    rt_port_outb(0xf4, 0)

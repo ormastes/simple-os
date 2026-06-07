@@ -1,0 +1,74 @@
+# x86_64 GUI Entry — Engine2D verification (minimal variant)
+#
+# Minimal subset of gui_entry_engine2d.spl: creates Engine2D via
+# BaremetalBackend (proving Engine2D initializes in the baremetal guest),
+# then paints a 3-window verification scene through Engine2D primitives,
+# then loops forever on serial prints.
+#
+# This variant still:
+#   - initializes COM1 + BGA framebuffer
+#   - constructs FramebufferDriver.from_boot_info
+#   - calls create_fb_engine(fb) to construct Engine2D via BaremetalBackend
+#     (Phase 4's regression signal — proves Engine2D init works in the guest)
+#   - paints a 3-window verification scene to the BGA framebuffer through
+#     Engine2D.clear, draw_rect_filled, and present
+#   - avoids importing Compositor / DesktopShell / PS2 drivers
+
+use os.kernel.arch.x86_64.console.{serial_init, serial_writeln}
+use os.drivers.framebuffer.bga_init.{bga_init_framebuffer}
+use os.drivers.framebuffer.fb_driver.{FramebufferDriver}
+use os.compositor.engine2d_baremetal_core.{create_fb_engine_core}
+
+extern fn serial_println(msg: text)
+extern fn rt_gui_set_fb(addr: u64, width: u64)
+
+fn spl_start():
+    """x86_64 GUI entry — Engine2D verification frame.
+
+    Boots serial + BGA framebuffer, constructs an Engine2D via
+    BaremetalBackend, paints a 3-window scene through Engine2D, then idles.
+    """
+    serial_init()
+    serial_writeln("SimpleOS x86_64 Engine2D-min verification")
+    serial_writeln("[BOOT] COM1 serial ready")
+
+    serial_writeln("[BOOT] Initializing BGA framebuffer (1024x768x32)...")
+    val fb_info = bga_init_framebuffer(1024, 768, 32)
+    serial_writeln("[BOOT] BGA framebuffer ready")
+
+    serial_println("[GUI] rt_gui_set_fb ...")
+    rt_gui_set_fb(fb_info.addr.addr, fb_info.width.to_u64())
+
+    serial_println("[GUI] Creating FramebufferDriver ...")
+    var fb = FramebufferDriver.from_boot_info(fb_info)
+    serial_println("[GUI] FramebufferDriver created")
+
+    serial_println("[E2D] create_fb_engine_core(fb) ...")
+    var engine = create_fb_engine_core(0xFD000000, fb_info.width.to_i32(), fb_info.height.to_i32())
+    serial_println("[E2D] Engine2D created")
+
+    serial_println("[E2D] clear ...")
+    engine.clear(0xFF0A2540)
+
+    serial_println("[E2D] draw 3 window rects ...")
+    # Window 1: body + red title bar
+    engine.draw_rect_filled(60, 60, 280, 180, 0xFF1E1E2E)
+    engine.draw_rect_filled(60, 60, 280, 24, 0xFFE74C3C)
+    # Window 2: body + green title bar
+    engine.draw_rect_filled(380, 120, 280, 180, 0xFF1E1E2E)
+    engine.draw_rect_filled(380, 120, 280, 24, 0xFF27AE60)
+    # Window 3: body + blue title bar
+    engine.draw_rect_filled(220, 320, 280, 180, 0xFF1E1E2E)
+    engine.draw_rect_filled(220, 320, 280, 24, 0xFF2980B9)
+    engine.present()
+
+    serial_println("[E2D] Engine2D verification frame painted")
+
+    # Idle loop — keep the guest alive so QMP screendump can capture.
+    serial_println("[GUI] Entering idle loop (no compositor, no shell)")
+    var tick: u64 = 0
+    while true:
+        tick = tick + 1
+        if tick == 100000000:
+            serial_println("[GUI] idle")
+            tick = 0

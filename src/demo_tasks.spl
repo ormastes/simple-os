@@ -1,0 +1,92 @@
+# Demo Tasks — Real kernel task operations
+#
+# Creates real TaskControlBlocks with actual priority levels and
+# enqueues them into real ReadyQueue data structures. The compute
+# task performs actual arithmetic, not canned output.
+
+use os.kernel.scheduler.scheduler.{ReadyQueue, TaskControlBlock, TaskId, TIME_SLICE_TICKS}
+use os.kernel.types.task_types.{TaskState, TaskPriority, TaskContext}
+use os.kernel.types.capability_types.{CapabilitySet}
+
+extern fn serial_println(msg: text)
+
+fn task_a_compute() -> u64:
+    """High-priority compute task — performs real arithmetic.
+
+    Returns the computed sum for verification.
+    """
+    serial_println("[TASK-A] Starting compute task")
+    var sum: u64 = 0
+    for i in 0..100:
+        sum = sum + i
+    serial_println("[TASK-A] Compute complete: sum={sum}")
+    # Verify: sum of 0..99 = 4950
+    if sum == 4950:
+        serial_println("[PASS] task_a_compute")
+    else:
+        serial_println("[FAIL] task_a_compute: expected 4950, got {sum}")
+    sum
+
+fn create_demo_tcbs() -> [TaskControlBlock]:
+    """Create 3 real TaskControlBlocks with proper fields.
+
+    Returns the list so callers can inspect TCB state.
+    """
+    var tcbs: [TaskControlBlock] = []
+
+    tcbs.push(TaskControlBlock(
+        id: TaskId(id: 1),
+        state: TaskState.Ready,
+        priority: TaskPriority.High,
+        context: TaskContext(registers: [0, 0, 0, 0]),
+        address_space: 0,
+        kernel_stack: 0x50000,
+        user_stack: 0x60000,
+        capabilities: CapabilitySet(bits: 0xFF),
+        parent: nil,
+        exit_code: 0,
+        ticks_remaining: TIME_SLICE_TICKS
+    ))
+
+    tcbs.push(TaskControlBlock(
+        id: TaskId(id: 2),
+        state: TaskState.Ready,
+        priority: TaskPriority.Normal,
+        context: TaskContext(registers: [0, 0, 0, 0]),
+        address_space: 0,
+        kernel_stack: 0x70000,
+        user_stack: 0x80000,
+        capabilities: CapabilitySet(bits: 0xFF),
+        parent: nil,
+        exit_code: 0,
+        ticks_remaining: TIME_SLICE_TICKS
+    ))
+
+    tcbs.push(TaskControlBlock(
+        id: TaskId(id: 3),
+        state: TaskState.Ready,
+        priority: TaskPriority.Normal,
+        context: TaskContext(registers: [0, 0, 0, 0]),
+        address_space: 0,
+        kernel_stack: 0x90000,
+        user_stack: 0xA0000,
+        capabilities: CapabilitySet(bits: 0xFF),
+        parent: nil,
+        exit_code: 0,
+        ticks_remaining: TIME_SLICE_TICKS
+    ))
+
+    tcbs
+
+fn enqueue_demo_tasks(tcbs: [TaskControlBlock]) -> ReadyQueue:
+    """Enqueue demo TCBs into a real ReadyQueue.
+
+    Returns the queue for state inspection.
+    """
+    var queue = ReadyQueue.new()
+    for tcb in tcbs:
+        queue.enqueue(tcb.id)
+        serial_println("[SCHED] Enqueued task {tcb.id.id} (priority={tcb.priority})")
+    serial_println("[SCHED] ReadyQueue count: {queue.count}")
+    serial_println("[SCHED] All demo tasks registered")
+    queue

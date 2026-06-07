@@ -1,0 +1,134 @@
+#![allow(unnamed_duplicate_typed_args)]
+
+use os.kernel.arch.x86_64.console.{serial_init, serial_writeln}
+use os.kernel.arch.x86_64.interrupt.{X86Interrupt}
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_early_init}
+use os.kernel.abi.syscall_shim.{shim_init}
+use os.kernel.scheduler.scheduler.{Scheduler}
+use os.kernel.ipc.ipc.{IpcManager}
+use os.kernel.log.klog.{KernelLog}
+use std.js.engine.vm.{ObjectStore}
+use std.js.types.js_types.{JsValue}
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+
+fn _echo_id(id: i64) -> i64:
+    id
+
+fn _format_id(id: i64) -> text:
+    "{id}"
+
+fn _assert_id_boundary(store: ObjectStore, holder_id: i64, label: text, expected_id: i64, created_id: i64) -> Result<bool, text>:
+    if created_id != expected_id:
+        serial_println("[JID] create return mismatch label={label} expected={expected_id} local={created_id}")
+        return Err("create return mismatch")
+
+    val echoed_id = _echo_id(created_id)
+    if echoed_id != expected_id:
+        serial_println("[JID] fn arg mismatch label={label} expected={expected_id} local={created_id} echoed={echoed_id}")
+        return Err("fn arg mismatch")
+
+    val formatted_id = _format_id(created_id)
+    if formatted_id != "{expected_id}":
+        serial_println("[JID] text fmt mismatch label={label} expected={expected_id} local={created_id} text={formatted_id}")
+        return Err("text fmt mismatch")
+
+    store.set_object_property_ref(holder_id, "ref", created_id)
+    val stored_ref = store.get_object_property_ref_text(holder_id, "ref")
+    if stored_ref != "{expected_id}":
+        serial_println("[JID] method arg mismatch label={label} expected={expected_id} local={created_id} stored={stored_ref}")
+        return Err("method arg mismatch")
+
+    Ok(true)
+
+fn _probe() -> Result<bool, text>:
+    var store = ObjectStore.new()
+    val holder_id = store.create_object()
+
+    var i = 0
+    while i < 32:
+        val expected_id = store.next_id
+        val created_id = store.create_object()
+        _assert_id_boundary(store, holder_id, "plain-{i}", expected_id, created_id)?
+        i = i + 1
+
+    var warmup = 0
+    while warmup < 12:
+        val warmup_expected = store.next_id
+        val warmup_id = store.create_object()
+        _assert_id_boundary(store, holder_id, "warmup-{warmup}", warmup_expected, warmup_id)?
+        warmup = warmup + 1
+
+    val browser_obj_id = store.create_object()
+    store.set_property(browser_obj_id, "innerHTML", JsValue.String(v: "boot<script>document.title='Runtime Ready';document.body.innerHTML='runtime fetch ok';</script>"))
+    store.set_property(browser_obj_id, "textContent", JsValue.String(v: "runtime fetch ok"))
+
+    val object_expected = store.next_id
+    val object_id = store.create_object()
+    _assert_id_boundary(store, holder_id, "post-churn-object", object_expected, object_id)?
+
+    val array_expected = store.next_id
+    val array_id = store.create_array_from([JsValue.Number(v: 7.0), JsValue.Number(v: 9.0)])
+    _assert_id_boundary(store, holder_id, "create-array-from", array_expected, array_id)?
+
+    val function_expected = store.next_id
+    val function_id = store.create_object()
+    _assert_id_boundary(store, holder_id, "post-array-function", function_expected, function_id)?
+
+    # Hold several returned ids live across later calls, then validate them again.
+    val held_obj_expected = store.next_id
+    val held_obj_id = store.create_object()
+    val held_array_expected = store.next_id
+    val held_array_id = store.create_object()
+    val held_fn_expected = store.next_id
+    val held_fn_id = store.create_object()
+    val held_sym_expected = store.next_id
+    val held_sym_id = store.create_object()
+
+    store.set_property(held_array_id, "0", JsValue.Number(v: 7.0))
+    store.set_property(held_array_id, "1", JsValue.Number(v: 9.0))
+    store.set_property(held_array_id, "length", JsValue.Number(v: 2.0))
+    store.set_object_property_ref(browser_obj_id, "location", held_obj_id)
+    store.set_array_property_ref(browser_obj_id, "children", held_array_id)
+    store.set_function_property_ref(browser_obj_id, "onclick", held_fn_id)
+    store.set_symbol_property_ref(browser_obj_id, "token", held_sym_id)
+
+    _assert_id_boundary(store, holder_id, "held-object-late", held_obj_expected, held_obj_id)?
+    _assert_id_boundary(store, holder_id, "held-array-late", held_array_expected, held_array_id)?
+    _assert_id_boundary(store, holder_id, "held-fn-late", held_fn_expected, held_fn_id)?
+    _assert_id_boundary(store, holder_id, "held-sym-late", held_sym_expected, held_sym_id)?
+
+    if store.get_object_property_ref_text(browser_obj_id, "location") != "{held_obj_id}":
+        serial_println("[JID] exact object compare mismatch expected-local={held_obj_id} stored={store.get_object_property_ref_text(browser_obj_id, "location")}")
+        return Err("exact object compare mismatch")
+    if store.get_array_property_ref_text(browser_obj_id, "children") != "{held_array_id}":
+        serial_println("[JID] exact array compare mismatch expected-local={held_array_id} stored={store.get_array_property_ref_text(browser_obj_id, "children")}")
+        return Err("exact array compare mismatch")
+    if store.get_function_property_ref_text(browser_obj_id, "onclick") != "{held_fn_id}":
+        serial_println("[JID] exact fn compare mismatch expected-local={held_fn_id} stored={store.get_function_property_ref_text(browser_obj_id, "onclick")}")
+        return Err("exact fn compare mismatch")
+    if store.get_symbol_property_ref_text(browser_obj_id, "token") != "{held_sym_id}":
+        serial_println("[JID] exact sym compare mismatch expected-local={held_sym_id} stored={store.get_symbol_property_ref_text(browser_obj_id, "token")}")
+        return Err("exact sym compare mismatch")
+
+    serial_println("[JID] no mismatch across plain, churn, and array-helper phases")
+
+    Ok(true)
+
+fn _start():
+    serial_init()
+    serial_writeln("SimpleOS x86_64 JS object-id boundary probe")
+
+    arch_x86_64_early_init()
+    shim_init(Scheduler.new(), IpcManager.new(), KernelLog.new(128))
+    if not X86Interrupt.runtime_installed():
+        X86Interrupt.install_bootstrap_runtime(64)
+
+    match _probe():
+        Ok(_):
+            serial_println("[JID] Object id boundary probe completed")
+        Err(e):
+            serial_println("[JID] Object id boundary probe failed: {e}")
+
+    rt_port_outb(0xf4, 0u8)

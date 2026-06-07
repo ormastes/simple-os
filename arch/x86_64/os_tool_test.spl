@@ -1,0 +1,67 @@
+#![allow(unnamed_duplicate_typed_args)]
+# x86_64 OS Tool Test — Boot and exercise shell tools via serial
+
+extern fn serial_println(msg: text)
+
+use os.posix.fd_table.{fd_table_init}
+use os.posix.async_io.{async_io_init}
+use os.posix.signal_compat.{signal_init}
+use os.kernel.boot.init_services.{init_all_services}
+use os.apps.shell.shell_app.{ShellApp}
+
+fn _run_test(shell: ShellApp, name: text, cmd: text):
+    """Run a shell command and report result via serial."""
+    shell.execute(cmd)
+    val code = shell.last_exit_code
+    if code == 0:
+        serial_println("  PASS: {name} (exit={code})")
+    else:
+        serial_println("  RESULT: {name} (exit={code})")
+
+fn _start():
+    serial_println("")
+    serial_println("=== SimpleOS Tool Test ===")
+
+    fd_table_init()
+    async_io_init()
+    signal_init()
+    init_all_services()
+
+    var shell = ShellApp.new()
+    serial_println("[test] Shell created")
+    serial_println("")
+
+    # ===== No-VFS tools (pure logic) =====
+    serial_println("--- Pure tools (no VFS needed) ---")
+
+    _run_test(shell, "true", "true")
+    _run_test(shell, "false", "false")
+    _run_test(shell, "echo", "echo hello SimpleOS")
+    _run_test(shell, "pwd", "pwd")
+    _run_test(shell, "basename", "basename /usr/local/bin/simple")
+    _run_test(shell, "dirname", "dirname /usr/local/bin/simple")
+    _run_test(shell, "expr 6*7", "expr 6 * 7")
+    _run_test(shell, "expr 100+23", "expr 100 + 23")
+    _run_test(shell, "seq 1..5", "seq 5")
+    _run_test(shell, "test -n hello", "test -n hello")
+    _run_test(shell, "test -z empty", "test -z \"\"")
+    _run_test(shell, "test 5 -gt 3", "test 5 -gt 3")
+    _run_test(shell, "test abc=abc", "test abc = abc")
+    _run_test(shell, "test abc!=def", "test abc != def")
+    _run_test(shell, "sleep 0", "sleep 0")
+    _run_test(shell, "which echo", "which echo")
+    _run_test(shell, "which basename", "which basename")
+    _run_test(shell, "which diff", "which diff")
+    _run_test(shell, "date", "date")
+
+    # ===== VFS tools (need mounted filesystem) =====
+    serial_println("")
+    serial_println("--- VFS tools (need storage) ---")
+
+    _run_test(shell, "ls /", "ls")
+    _run_test(shell, "cat missing", "cat /nonexistent")
+    _run_test(shell, "file missing", "file /nonexistent")
+    _run_test(shell, "hexdump missing", "hexdump /nonexistent")
+
+    serial_println("")
+    serial_println("=== ALL TOOL TESTS DONE ===")

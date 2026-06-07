@@ -1,0 +1,23 @@
+# SimpleOS welcome page asset.
+#
+# Exposes a single function that returns the hand-written HTML string
+# rendered by the browser_engine pipeline inside the QEMU guest.
+#
+# Only CSS proven by Phase 2 host fixtures (14_border, 15_background,
+# 16_flex_row) is used: background, border, padding, margin, display:flex,
+# flex, font-size, color.
+
+pub fn welcome_html() -> text:
+    """Return the SimpleOS welcome page HTML."""
+    val html = """<div style="background: #0a2540; padding: 40px; font-family: sans-serif;">
+  <h1 style="color: #ffffff; font-size: 32px; margin-bottom: 20px;">Welcome to SimpleOS</h1>
+  <div style="background: #1e1e2e; border: 1px solid #3498db; padding: 20px; margin-bottom: 20px; color: #ffffff;">
+    Rendered by browser_engine -> Engine2D -> BaremetalBackend -> BGA framebuffer.
+  </div>
+  <div style="display: flex; gap: 16px;">
+    <div style="background: #e74c3c; padding: 16px; color: #ffffff; flex: 1;">Card 1</div>
+    <div style="background: #27ae60; padding: 16px; color: #ffffff; flex: 1;">Card 2</div>
+    <div style="background: #2980b9; padding: 16px; color: #ffffff; flex: 1;">Card 3</div>
+  </div>
+</div>"""
+    return html

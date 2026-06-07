@@ -1,0 +1,40 @@
+# SimpleOS Font Directory
+#
+# Open-source fonts for 10 languages across 6 script groups.
+# All fonts are OFL-1.1 (SIL Open Font License) — free for any use.
+#
+# Run download_fonts.shs to fetch all fonts from GitHub releases.
+#
+# Font Organization:
+#   fonts/
+#     sans/           — Sans-serif (UI default)
+#     serif/          — Serif (document reading)
+#     mono/           — Monospace (code, terminal)
+#
+# Script Coverage:
+#
+# | Script Group       | Languages                          | Sans Font              | Serif Font              | Mono Font       |
+# |--------------------|------------------------------------|------------------------|-------------------------|-----------------|
+# | Latin + Cyrillic   | English, Spanish, French,          | Noto Sans              | Noto Serif              | Fira Code Nerd* |
+# |                    | Portuguese, Russian                |                        |                         |  (default mono) |
+# | CJK (Simplified)   | Chinese (Mandarin)                 | Noto Sans SC           | Noto Serif SC           | (use Sans)      |
+# | Hangul             | Korean                             | Noto Sans KR           | Noto Serif KR           | D2Coding        |
+# | Devanagari         | Hindi                              | Noto Sans Devanagari*  | Noto Serif Devanagari*  | (use Sans)      |
+# | Arabic             | Arabic                             | Noto Sans Arabic*      | Noto Naskh Arabic*      | (use Sans)      |
+# | Bengali            | Bengali                            | Noto Sans Bengali*     | Noto Serif Bengali*     | (use Sans)      |
+#
+# * = Requires HarfBuzz for complex text shaping (future Tier 2)
+#
+# Tier 1 (stb_truetype): Latin, Cyrillic, CJK, Korean — simple glyph lookup
+# Tier 2 (HarfBuzz):     Hindi, Arabic, Bengali — complex shaping + RTL
+#
+# * Fira Code Nerd Font Mono is the SimpleOS default monospace face. It
+#   bundles Nerd Font glyphs (powerline separators, devicons, git/folder/
+#   lock icons) required by the shell Starship-style prompt. The well-known
+#   path `SYSTEM_DEFAULT_MONO_FONT_PATH` lives in
+#   src/lib/common/text_layout/font_renderer.spl.
+#   JetBrains Mono is kept as a fallback (no Nerd glyphs).
+#
+# Approximate sizes:
+#   Sans only (1 weight): ~22 MB full / ~5.7 MB subsetted
+#   All types (1 weight): ~50 MB full / ~12 MB subsetted

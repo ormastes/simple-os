@@ -1,0 +1,238 @@
+# x86_64 Desktop GUI Entry -- Production interactive desktop with VFS
+#
+# Combines gui_entry.spl (BGA framebuffer, PS/2 input, compositor, shell)
+# with desktop_e2e_entry.spl (kernel init, VFS boot, launcher, IPC) for a
+# fully interactive desktop session with filesystem-backed app launching.
+#
+# Boot sequence:
+# 1. COM1 serial init
+# 2. Kernel IDT + memory bootstrap (PMM/VMM)
+# 3. Syscall shim + interrupt runtime install
+# 4. VFS boot init (NVMe FAT32 mount)
+# 5. BGA framebuffer init (1024x768x32)
+# 6. PS/2 keyboard + mouse init
+# 7. Compositor + DesktopShell
+# 8. Interactive event loop (shell.run)
+#
+# Serial markers:
+#   [desktop-gui] spl_start
+#   [desktop-gui] boot
+#   [vfs] mounted fat32 device=nvme0 volume=simpleos
+#   [desktop-gui] desktop-ready
+#
+# QEMU scenario: x64-desktop-gui (gui_mode: true + NVMe + removable + net)
+
+use os.kernel.arch.x86_64.console.{serial_init, serial_writeln}
+use os.kernel.boot.cpu.{port_inb, port_outb}
+use os.drivers.framebuffer.bga_init.{bga_init_framebuffer}
+use os.drivers.framebuffer.fb_driver.{FramebufferDriver}
+use os.kernel.boot.ports.{FramebufferInfo, framebuffer_info_addr, framebuffer_info_phys_addr}
+use os.drivers.input.ps2_keyboard.{Ps2Keyboard}
+use os.drivers.input.ps2_mouse.{Ps2Mouse, MouseState}
+use os.compositor.compositor.{Compositor}
+use os.desktop.shell.{DesktopShell}
+use os.services.launcher.launcher.{launcher_init, launcher_get_app_count}
+use os.services.vfs.vfs_init.{vfs_boot_init, vfs_mount_removable}
+use os.services.pkg.pkg_service.{pkg_service_init}
+use os.kernel.arch.x86_64.interrupt.{X86Interrupt}
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_early_init}
+use os.kernel.memory.pmm.{pmm_init_identity_range, g_pmm}
+use os.kernel.memory.vmm.{vmm_init}
+use os.kernel.abi.syscall_shim.{shim_init}
+use os.userlib.syscall_raw.{syscall}
+use os.kernel.scheduler.scheduler.{Scheduler}
+use os.kernel.ipc.ipc.{IpcManager}
+use os.kernel.log.klog.{KernelLog}
+
+extern fn serial_println(msg: text)
+extern fn rt_gui_set_fb(addr: u64, width: u64)
+
+val FB_W: u32 = 1024
+val FB_H: u32 = 768
+val FB_BPP: u32 = 32
+val FB_PITCH: u32 = FB_W * 4
+val PS2_DATA_PORT: u16 = 0x60
+val PS2_COMMAND_PORT: u16 = 0x64
+val MOUSE_COMMAND_PORT: u16 = 0x64
+val CMD_ENABLE_AUX: u8 = 0xA8
+val CMD_READ_CONFIG: u8 = 0x20
+val CMD_WRITE_CONFIG: u8 = 0x60
+val CMD_WRITE_AUX: u8 = 0xD4
+val MOUSE_CMD_SET_DEFAULTS: u8 = 0xF6
+val MOUSE_CMD_ENABLE_REPORTING: u8 = 0xF4
+val MOUSE_STATUS_PORT: u16 = 0x64
+val MOUSE_STATUS_OUTPUT_FULL: u8 = 0x01
+val MOUSE_STATUS_INPUT_FULL: u8 = 0x02
+val DIRECT_QEMU_TOTAL_MEMORY: u64 = 0x20000000
+val DIRECT_QEMU_KERNEL_START: u64 = 0x100000
+val DIRECT_QEMU_RESERVED_END: u64 = 0x14000000
+val SYS_IPC_CREATE_PORT: u64 = 22
+val WM_PORT_NAME_BOOT: text = "compositor"
+
+var g_vfs_mounted = false
+
+fn _ps2_wait_input_clear():
+    var timeout: i64 = 100000
+    while timeout > 0:
+        val status = port_inb(MOUSE_STATUS_PORT)
+        if (status & MOUSE_STATUS_INPUT_FULL) == 0:
+            return
+        timeout = timeout - 1
+
+fn _ps2_wait_output_full():
+    var timeout: i64 = 100000
+    while timeout > 0:
+        val status = port_inb(MOUSE_STATUS_PORT)
+        if (status & MOUSE_STATUS_OUTPUT_FULL) != 0:
+            return
+        timeout = timeout - 1
+
+fn _ps2_mouse_write(byte_val: u8):
+    _ps2_wait_input_clear()
+    port_outb(MOUSE_COMMAND_PORT, CMD_WRITE_AUX)
+    _ps2_wait_input_clear()
+    port_outb(PS2_DATA_PORT, byte_val)
+
+fn _ps2_mouse_read() -> u8:
+    _ps2_wait_output_full()
+    port_inb(PS2_DATA_PORT)
+
+fn _keyboard_bootstrap_init():
+    port_outb(PS2_COMMAND_PORT, 0xAD)
+    port_outb(PS2_COMMAND_PORT, 0xA7)
+    port_inb(PS2_DATA_PORT)
+    port_outb(PS2_COMMAND_PORT, 0xAE)
+    port_outb(PS2_DATA_PORT, 0xF4)
+
+fn _mouse_bootstrap_init(mouse: Ps2Mouse):
+    port_outb(MOUSE_COMMAND_PORT, CMD_ENABLE_AUX)
+    _ps2_wait_input_clear()
+    port_outb(MOUSE_COMMAND_PORT, CMD_READ_CONFIG)
+    _ps2_wait_output_full()
+    val config = port_inb(PS2_DATA_PORT)
+    val new_config = (config | 0x02) & 0xDF
+    port_outb(MOUSE_COMMAND_PORT, CMD_WRITE_CONFIG)
+    _ps2_wait_input_clear()
+    port_outb(PS2_DATA_PORT, new_config)
+    _ps2_wait_input_clear()
+    _ps2_mouse_write(MOUSE_CMD_SET_DEFAULTS)
+    _ps2_mouse_read()
+    _ps2_mouse_write(MOUSE_CMD_ENABLE_REPORTING)
+    _ps2_mouse_read()
+    mouse.initialized = true
+
+fn _wm_bootstrap_init(shell: DesktopShell) -> bool:
+    if shell.wm.initialized:
+        return true
+    extern fn unsafe_addr_of(ref: any) -> u64
+    val name_ptr = unsafe_addr_of(WM_PORT_NAME_BOOT)
+    val name_len = WM_PORT_NAME_BOOT.len().to_u64()
+    val port = syscall(SYS_IPC_CREATE_PORT, name_ptr, name_len, 0, 0, 0)
+    if port < 0:
+        serial_println("[desktop-gui] wm-service: IPC port create failed ({port})")
+        return false
+    shell.wm.port_id = port.to_u64()
+    shell.wm.initialized = true
+    serial_println("[desktop-gui] wm-service: listening on IPC port {shell.wm.port_id}")
+    true
+
+fn _shell_bootstrap_init(shell: DesktopShell):
+    if _wm_bootstrap_init(shell):
+        serial_println("[desktop-gui] wm-service initialized")
+    else:
+        serial_println("[desktop-gui] wm-service init failed")
+    launcher_init()
+    shell.launcher_initialized = true
+    serial_println("[desktop-gui] launcher initialized")
+    serial_println("[desktop-gui] shell initialized")
+
+fn spl_start():
+    serial_init()
+    serial_println("[desktop-gui] spl_start")
+    serial_println("[desktop-gui] boot")
+
+    arch_x86_64_early_init()
+
+    if pmm_init_identity_range(DIRECT_QEMU_TOTAL_MEMORY, DIRECT_QEMU_KERNEL_START, DIRECT_QEMU_RESERVED_END):
+        vmm_init(g_pmm, 0)
+        serial_println("[desktop-gui] memory-bootstrap:ok")
+    else:
+        serial_println("[desktop-gui] memory-bootstrap:fail")
+
+    shim_init(Scheduler.new_bootstrap(), IpcManager.new(), KernelLog.new(256))
+
+    if not X86Interrupt.runtime_installed():
+        X86Interrupt.install_bootstrap_runtime(64)
+
+    g_vfs_mounted = vfs_boot_init()
+    if g_vfs_mounted:
+        serial_println("[vfs] mounted fat32 device=nvme0 volume=simpleos")
+    else:
+        serial_println("[vfs] mount_failed fat32 reason=no-nvme-or-bad-fs")
+
+    if vfs_mount_removable(1, "/media/sd0"):
+        serial_println("[desktop-gui] removable mounted at /media/sd0")
+    else:
+        serial_println("[desktop-gui] no removable media found")
+
+    pkg_service_init()
+    serial_println("[desktop-gui] pkg service initialized")
+
+    serial_println("[desktop-gui] initializing framebuffer...")
+    val fb_boot = bga_init_framebuffer(FB_W, FB_H, FB_BPP)
+    val fb_info = FramebufferInfo(
+        addr: framebuffer_info_addr(fb_boot),
+        width: FB_W,
+        height: FB_H,
+        pitch: FB_PITCH,
+        bpp: FB_BPP
+    )
+    rt_gui_set_fb(framebuffer_info_phys_addr(fb_info), FB_W.to_u64())
+    var fb = FramebufferDriver.from_boot_info(fb_info)
+    serial_println("[desktop-gui] framebuffer ready")
+
+    var keyboard: Ps2Keyboard = Ps2Keyboard(
+        shift_held: false,
+        ctrl_held: false,
+        alt_held: false,
+        caps_lock: false
+    )
+    _keyboard_bootstrap_init()
+    serial_println("[desktop-gui] keyboard ready")
+
+    val initial_mouse_state = MouseState(
+        x: fb.width.to_i64() / 2,
+        y: fb.height.to_i64() / 2,
+        left_button: false,
+        right_button: false,
+        middle_button: false,
+        dx: 0,
+        dy: 0,
+        screen_width: fb.width.to_i64(),
+        screen_height: fb.height.to_i64()
+    )
+    var mouse: Ps2Mouse = Ps2Mouse(
+        state: initial_mouse_state,
+        prev_left: false,
+        prev_right: false,
+        packet_byte0: 0,
+        packet_byte1: 0,
+        packet_byte2: 0,
+        packet_index: 0,
+        initialized: false
+    )
+    _mouse_bootstrap_init(mouse)
+    serial_println("[desktop-gui] mouse ready")
+
+    var compositor: Compositor = Compositor.new(fb, keyboard, mouse)
+    serial_println("[desktop-gui] compositor ready")
+
+    var shell: DesktopShell = DesktopShell.new(compositor)
+    _shell_bootstrap_init(shell)
+
+    val registered = launcher_get_app_count()
+    serial_println("[desktop-gui] launcher apps={registered}")
+    serial_println("[desktop-gui] desktop-ready")
+
+    shell.run()
+    serial_println("[desktop-gui] shell exited")

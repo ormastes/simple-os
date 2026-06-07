@@ -1,0 +1,259 @@
+#![allow(unnamed_duplicate_typed_args)]
+# hosted_main.spl — SimpleOS Hosted Desktop (200x150)
+#
+# A proper hosted desktop rendering a title bar, Hello World window,
+# RGB color blocks, taskbar with dock icons, mouse cursor tracking,
+# and keyboard event logging.
+#
+# Run with:
+#   SIMPLE_GUI=1 SIMPLE_TIMEOUT_SECONDS=120 bin/simple examples/simple_os/hosted/hosted_main.spl
+
+# ============================================================================
+# FFI Declarations (winit + runtime)
+# ============================================================================
+
+extern fn rt_winit_event_loop_new() -> i64
+extern fn rt_winit_window_new(el: i64, w: i64, h: i64, title: text) -> i64
+extern fn rt_winit_event_loop_poll_events(el: i64, max: i64) -> i64
+extern fn rt_winit_event_get_type(ev: i64) -> i64
+extern fn rt_winit_event_keyboard_input(ev: i64) -> (i64, i64, bool)
+extern fn rt_winit_event_mouse_moved(ev: i64) -> (i64, i64)
+extern fn rt_winit_event_mouse_button(ev: i64) -> (i64, bool)
+extern fn rt_winit_event_free(ev: i64)
+extern fn rt_winit_window_present_rgba(win: i64, w: i64, h: i64, pixels: [i64])
+extern fn rt_winit_window_free(win: i64)
+extern fn rt_winit_event_loop_free(el: i64)
+extern fn rt_thread_sleep(ms: i64)
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+val W: i64 = 320
+val H: i64 = 240
+
+# Event type constants
+val EVT_CLOSE: i64 = 3
+val EVT_KEYBOARD: i64 = 10
+val EVT_MOUSE_MOVED: i64 = 21
+
+# ============================================================================
+# Color Palette (Catppuccin-inspired)
+# ============================================================================
+
+fn make_pixel(r: i64, g: i64, b: i64) -> i64:
+    (255 << 24) | (r << 16) | (g << 8) | b
+
+val COL_BG: i64 = make_pixel(30, 30, 46)
+val COL_TITLEBAR: i64 = make_pixel(24, 24, 37)
+val COL_WIN_TITLE: i64 = make_pixel(0, 122, 204)
+val COL_WIN_CLOSE: i64 = make_pixel(231, 76, 60)
+val COL_WIN_BODY: i64 = make_pixel(255, 255, 255)
+val COL_WIN_STATUS: i64 = make_pixel(224, 224, 224)
+val COL_RED: i64 = make_pixel(255, 68, 68)
+val COL_GREEN: i64 = make_pixel(68, 204, 68)
+val COL_BLUE: i64 = make_pixel(68, 136, 255)
+val COL_DOCK1: i64 = make_pixel(52, 152, 219)
+val COL_DOCK2: i64 = make_pixel(39, 174, 96)
+val COL_DOCK3: i64 = make_pixel(231, 76, 60)
+val COL_DOCK4: i64 = make_pixel(243, 156, 18)
+val COL_DOCK5: i64 = make_pixel(155, 89, 182)
+val COL_CURSOR_BORDER: i64 = make_pixel(0, 0, 0)
+val COL_CURSOR_FILL: i64 = make_pixel(255, 255, 255)
+
+# ============================================================================
+# Pixel Buffer Helpers
+# ============================================================================
+
+fn fill_rect(pixels: [i64], x: i64, y: i64, w: i64, h: i64, color: i64):
+    var row = 0
+    while row < h:
+        val py = y + row
+        if py >= 0 and py < H:
+            var col = 0
+            while col < w:
+                val px = x + col
+                if px >= 0 and px < W:
+                    val idx = py * W + px
+                    pixels[idx] = color
+                col = col + 1
+        row = row + 1
+
+fn put_pixel(pixels: [i64], x: i64, y: i64, color: i64):
+    if x >= 0 and x < W and y >= 0 and y < H:
+        pixels[y * W + x] = color
+
+# ============================================================================
+# Desktop Scene Rendering
+# ============================================================================
+
+fn render_desktop(pixels: [i64]):
+    # --- System Title Bar (top 20px) ---
+    fill_rect(pixels, 0, 0, W, 20, COL_TITLEBAR)
+
+    # --- Hello World Window ---
+    fill_rect(pixels, 20, 28, 260, 18, COL_WIN_TITLE)
+    fill_rect(pixels, 268, 30, 10, 14, COL_WIN_CLOSE)
+    fill_rect(pixels, 20, 46, 260, 140, COL_WIN_BODY)
+
+    # --- RGB Color Blocks ---
+    fill_rect(pixels, 35, 90, 70, 30, COL_RED)
+    fill_rect(pixels, 115, 90, 70, 30, COL_GREEN)
+    fill_rect(pixels, 195, 90, 70, 30, COL_BLUE)
+
+    # --- Status bar at bottom of window ---
+    fill_rect(pixels, 20, 170, 260, 16, COL_WIN_STATUS)
+
+    # --- Taskbar (bottom 24px) ---
+    fill_rect(pixels, 0, H - 24, W, 24, COL_TITLEBAR)
+    # Dock icons (18x18 squares)
+    val icon_y = H - 21
+    fill_rect(pixels, 8, icon_y, 18, 18, COL_DOCK1)
+    fill_rect(pixels, 30, icon_y, 18, 18, COL_DOCK2)
+    fill_rect(pixels, 52, icon_y, 18, 18, COL_DOCK3)
+    fill_rect(pixels, 74, icon_y, 18, 18, COL_DOCK4)
+    fill_rect(pixels, 96, icon_y, 18, 18, COL_DOCK5)
+
+# ============================================================================
+# Mouse Cursor Rendering (triangular pointer)
+# ============================================================================
+
+fn erase_cursor(pixels: [i64], mx: i64, my: i64):
+    # Erase cursor area by filling with background color
+    fill_rect(pixels, mx, my, 12, 12, COL_BG)
+
+fn render_cursor(pixels: [i64], mx: i64, my: i64):
+    var cy = 0
+    while cy < 10:
+        var cx = 0
+        val cw = 10 - cy
+        while cx < cw:
+            if cx == 0 or cy == 0 or cx == cw - 1:
+                put_pixel(pixels, mx + cx, my + cy, COL_CURSOR_BORDER)
+            else:
+                put_pixel(pixels, mx + cx, my + cy, COL_CURSOR_FILL)
+            cx = cx + 1
+        cy = cy + 1
+
+# ============================================================================
+# Keycode to Name (for logging)
+# ============================================================================
+
+fn keycode_name(kc: i64) -> text:
+    if kc == 27: return "Escape"
+    if kc == 13: return "Enter"
+    if kc == 32: return "Space"
+    if kc == 8: return "Backspace"
+    if kc == 9: return "Tab"
+    if kc == 37: return "Left"
+    if kc == 38: return "Up"
+    if kc == 39: return "Right"
+    if kc == 40: return "Down"
+    if kc >= 65 and kc <= 90:
+        return "Key"
+    if kc >= 48 and kc <= 57:
+        return "Digit"
+    return "Unknown"
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main() -> i64:
+    print "SimpleOS Hosted Desktop ({W}x{H})"
+    print "Controls: Move mouse, press keys (logged to console)"
+    print "Close window or press Escape to quit"
+    print ""
+
+    # Create event loop and window
+    val el = rt_winit_event_loop_new()
+    val win = rt_winit_window_new(el, W, H, "SimpleOS Desktop")
+    if win == 0:
+        print "ERROR: Window creation failed (is SIMPLE_GUI=1 set?)"
+        return 1
+    print "Window created: {W}x{H}"
+
+    # Initialize pixel buffer using list comprehension (fast)
+    print "Initializing pixel buffer..."
+    var pixels = [for _i in 0..(W * H): COL_BG]
+    print "Pixel buffer ready ({pixels.len()} pixels)"
+
+    # Render the desktop scene
+    print "Rendering desktop..."
+    render_desktop(pixels)
+    rt_winit_window_present_rgba(win, W, H, pixels)
+    print "First frame presented"
+
+    # Event loop state
+    var running = true
+    var mouse_x: i64 = W / 2
+    var mouse_y: i64 = H / 2
+    var frame: i64 = 0
+    var needs_redraw = true
+    var prev_mx: i64 = mouse_x
+    var prev_my: i64 = mouse_y
+    var key_count: i64 = 0
+
+    print "Entering event loop..."
+
+    while running:
+        # Poll all pending events
+        var ev = rt_winit_event_loop_poll_events(el, 100)
+        while ev != 0:
+            val etype = rt_winit_event_get_type(ev)
+
+            if etype == EVT_CLOSE:
+                print "Window close requested"
+                running = false
+
+            else if etype == EVT_KEYBOARD:
+                val (scancode, keycode, pressed) = rt_winit_event_keyboard_input(ev)
+                key_count = key_count + 1
+                val action = if pressed: "pressed" else: "released"
+                val name = keycode_name(keycode)
+                print "[Key #{key_count}] {name} (code={keycode}, scan={scancode}) {action}"
+
+                # Escape key exits
+                if pressed and (keycode == 27 or keycode == 9):
+                    print "Escape/Tab pressed - exiting"
+                    running = false
+
+            else if etype == EVT_MOUSE_MOVED:
+                val (mx, my) = rt_winit_event_mouse_moved(ev)
+                mouse_x = mx
+                mouse_y = my
+                # Clamp to screen bounds
+                if mouse_x < 0:
+                    mouse_x = 0
+                if mouse_x >= W:
+                    mouse_x = W - 1
+                if mouse_y < 0:
+                    mouse_y = 0
+                if mouse_y >= H:
+                    mouse_y = H - 1
+                needs_redraw = true
+
+            rt_winit_event_free(ev)
+            ev = rt_winit_event_loop_poll_events(el, 100)
+
+        # Only redraw when cursor moved
+        if needs_redraw:
+            # Erase old cursor and draw new one
+            erase_cursor(pixels, prev_mx, prev_my)
+            render_cursor(pixels, mouse_x, mouse_y)
+            rt_winit_window_present_rgba(win, W, H, pixels)
+            prev_mx = mouse_x
+            prev_my = mouse_y
+            needs_redraw = false
+
+        frame = frame + 1
+        rt_thread_sleep(33)
+
+    print ""
+    print "Desktop closed after {frame} frames"
+    print "Total keyboard events: {key_count}"
+    print "Final mouse position: ({mouse_x}, {mouse_y})"
+
+    rt_winit_window_free(win)
+    rt_winit_event_loop_free(el)
+    return 0

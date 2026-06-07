@@ -1,0 +1,122 @@
+# hosted_wm_compare.spl — Dual-Backend Visual Comparison
+#
+# Renders the same desktop scene through both native (winit) and
+# browser engine (software) backends, then compares the pixel output.
+#
+# Generates 3 BMP files:
+#   /tmp/compare_native.bmp   — rendered via winit pixel buffer
+#   /tmp/compare_browser.bmp  — rendered via pure Simple software buffer
+#   /tmp/compare_diff.bmp     — visual diff (green=match, red=different)
+#
+# Run with:
+#   SIMPLE_GUI=1 bin/simple examples/simple_os/hosted/hosted_wm_compare.spl
+
+# ============================================================================
+# FFI Declarations
+# ============================================================================
+
+extern fn rt_winit_event_loop_new() -> i64
+extern fn rt_winit_window_new(el: i64, w: i64, h: i64, title: text) -> i64
+extern fn rt_winit_event_loop_poll_events(el: i64, max: i64) -> i64
+extern fn rt_winit_event_get_type(ev: i64) -> i64
+extern fn rt_winit_event_free(ev: i64)
+extern fn rt_winit_window_free(win: i64)
+extern fn rt_winit_event_loop_free(el: i64)
+extern fn rt_thread_sleep(ms: i64)
+extern fn rt_winit_buffer_create(w: i64, h: i64, fill_color: i64) -> i64
+extern fn rt_winit_buffer_present(win: i64, buf: i64) -> bool
+extern fn rt_winit_buffer_free(buf: i64) -> bool
+
+use os.compositor.hosted_backend.{HostedCompositorBackend}
+use os.compositor.browser_compositor_backend.{BrowserCompositorBackend}
+use os.compositor.dual_backend.{DualBackendRunner}
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+val SCREEN_W: i64 = 96
+val SCREEN_H: i64 = 64
+val BG_COLOR: i64 = 0xFF1A1B26
+val OUTPUT_DIR: text = "/tmp"
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main() -> i64:
+    print "======================================================"
+    print "  SimpleOS Dual-Backend Visual Comparison"
+    print "  Native (winit) vs Browser Engine (software)"
+    print "======================================================"
+    print ""
+
+    # --- Create winit event loop and window ---
+    val el = rt_winit_event_loop_new()
+    val win = rt_winit_window_new(el, SCREEN_W, SCREEN_H, "SimpleOS Dual-Backend Compare")
+    if win == 0:
+        print "ERROR: Window creation failed (is SIMPLE_GUI=1 set?)"
+        return 1
+
+    val buf = rt_winit_buffer_create(SCREEN_W, SCREEN_H, BG_COLOR)
+    if buf == 0:
+        print "ERROR: Buffer creation failed"
+        return 1
+
+    # --- Create both backends ---
+    val w32: i32 = 96
+    val h32: i32 = 64
+    val bg_u32: u32 = 0xFF1A1B26
+
+    print "Creating native backend (winit)..."
+    var native = HostedCompositorBackend.create(win, w32, h32, bg_u32)
+
+    print "Creating browser backend (software)..."
+    var browser = BrowserCompositorBackend.with_color(w32, h32, bg_u32)
+
+    # --- Create dual-backend runner ---
+    var runner = DualBackendRunner.new(native, browser, w32, h32)
+    runner.set_threshold(2)  # Allow ±2 per channel (sub-pixel differences)
+
+    # --- Run comparison ---
+    val result = runner.run_comparison(OUTPUT_DIR)
+
+    # --- Show native render in window for visual inspection ---
+    print ""
+    print "Presenting native render in window..."
+    rt_winit_buffer_present(win, buf)
+
+    # Pump events to show the window
+    var pump = 0
+    while pump < 20:
+        var ev = rt_winit_event_loop_poll_events(el, 100)
+        while ev != 0:
+            rt_winit_event_free(ev)
+            ev = rt_winit_event_loop_poll_events(el, 100)
+        rt_thread_sleep(50)
+        pump = pump + 1
+
+    # --- Summary ---
+    print ""
+    val pct = result.match_percentage / 100
+    if result.different_pixels == 0:
+        print "RESULT: Backends are IDENTICAL"
+    else:
+        if pct >= 95:
+            print "RESULT: Backends are CONSISTENT (>= 95% match)"
+        else:
+            if pct >= 80:
+                print "RESULT: Backends have MODERATE DIFFERENCES"
+            else:
+                print "RESULT: Backends have SIGNIFICANT DIFFERENCES — investigation needed"
+    print ""
+    print "Output files:"
+    print "  {OUTPUT_DIR}/compare_native.bmp"
+    print "  {OUTPUT_DIR}/compare_browser.bmp"
+    print "  {OUTPUT_DIR}/compare_diff.bmp"
+
+    # --- Cleanup ---
+    rt_winit_buffer_free(buf)
+    rt_winit_window_free(win)
+    rt_winit_event_loop_free(el)
+    return 0

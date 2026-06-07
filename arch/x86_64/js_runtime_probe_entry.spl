@@ -1,0 +1,43 @@
+#![allow(unnamed_duplicate_typed_args)]
+
+use os.kernel.arch.x86_64.console.{serial_init, serial_writeln}
+use os.kernel.arch.x86_64.interrupt.{X86Interrupt}
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_early_init}
+use os.kernel.abi.syscall_shim.{shim_init}
+use os.kernel.scheduler.scheduler.{Scheduler}
+use os.kernel.ipc.ipc.{IpcManager}
+use os.kernel.log.klog.{KernelLog}
+use std.js.engine.runtime.{JsRuntime}
+use std.js.engine.js_error.{Logger, LogLevel}
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+
+fn _start():
+    serial_init()
+    serial_writeln("SimpleOS x86_64 JS runtime probe")
+
+    serial_println("[JSR] arch init start")
+    arch_x86_64_early_init()
+    serial_println("[JSR] arch init done")
+    serial_println("[JSR] shim init start")
+    shim_init(Scheduler.new(), IpcManager.new(), KernelLog.new(128))
+    serial_println("[JSR] shim init done")
+    if not X86Interrupt.runtime_installed():
+        serial_println("[JSR] installing interrupt runtime")
+        X86Interrupt.install_bootstrap_runtime(64)
+    serial_println("[JSR] interrupt runtime ready")
+
+    val logger = Logger.new("js-runtime-probe", LogLevel.Error)
+    serial_println("[JSR] logger ready")
+    serial_println("[JSR] runtime create start")
+    var runtime = JsRuntime.new(logger)
+    serial_println("[JSR] runtime create done")
+    serial_println("[JSR] eval start")
+    match runtime.eval("1 + 2"):
+        Ok(_) =>
+            serial_println("[JSR] Runtime probe passed")
+        Err(e) =>
+            serial_println("[JSR] Runtime probe failed: {e.message}")
+
+    rt_port_outb(0xf4, 0u8)

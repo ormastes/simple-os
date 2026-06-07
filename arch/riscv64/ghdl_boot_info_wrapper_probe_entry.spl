@@ -1,0 +1,23 @@
+#![allow(unknown_attribute)]
+
+use examples.simple_os.arch.riscv64.ghdl_boot_info_proof_layout.{proof_store_u64}
+
+@section(".text.entry")
+@naked
+fn _start():
+    asm volatile:
+        "la      sp, _stack_top"
+        "call    simple_os__arch__riscv64__ghdl_boot_info_wrapper_probe_entry__boot_main"
+        "j       simple_os__arch__riscv64__ghdl_boot_info_wrapper_probe_entry___halt"
+
+fn _halt():
+    asm volatile:
+        "ebreak"
+        ".Lghdl_boot_info_wrapper_probe_halt:"
+        "wfi"
+        "j .Lghdl_boot_info_wrapper_probe_halt"
+
+fn boot_main():
+    proof_store_u64(0, 0x42494F50524F4F46)
+    proof_store_u64(1, 1)
+    _halt()

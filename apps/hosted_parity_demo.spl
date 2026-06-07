@@ -1,0 +1,46 @@
+# Hosted-Parity Smoke Test for SimpleOS
+#
+# Exercises the baremetal runtime symbols added for host-compatible
+# application hosting (Phase 1 of the hosted-parity plan):
+#
+#   rt_stdout_write / rt_stderr_write — route Simple text to COM1 / PL011 UART
+#   rt_args_count / rt_args_get / rt_args_all — empty-until-Phase-2 argv stubs
+#   rt_exit — clean halt instead of panic
+#   rt_exit_code — returns 0 (no prior exit to report)
+#
+# These same symbols are defined on hosted (Linux / macOS / FreeBSD / Windows)
+# by the Rust runtime in src/compiler_rust/runtime/src/value/ffi/, so this
+# source runs unchanged on both. The on-baremetal impls live in
+#   examples/simple_os/arch/{x86_64,arm64,riscv64,riscv32}/boot/
+# (rt_extras.c and/or baremetal_stubs.c per arch).
+#
+# Expected serial output on a successful run:
+#   HOSTED_PARITY_OK
+#   [exit] rt_exit(0) -- halting
+
+extern fn rt_stdout_write(data: text) -> i64
+extern fn rt_stderr_write(data: text) -> i64
+extern fn rt_args_count() -> i32
+extern fn rt_args_all() -> [text]
+extern fn rt_exit(code: i32) -> void
+
+fn main():
+    # stdout path — same symbol hosted print uses
+    rt_stdout_write("[parity] rt_stdout_write OK\r\n")
+
+    # stderr path — separate symbol on hosted, same UART on baremetal
+    rt_stderr_write("[parity] rt_stderr_write OK\r\n")
+
+    # argv — empty on baremetal (Phase 1 stubs), real argv after Phase 2
+    val argc = rt_args_count()
+    rt_stdout_write("[parity] rt_args_count = {argc}\r\n")
+
+    val argv = rt_args_all()
+    rt_stdout_write("[parity] rt_args_all len = {argv.len()}\r\n")
+
+    # Single-line success marker scraped by run_tests.spl
+    rt_stdout_write("HOSTED_PARITY_OK\r\n")
+
+    # Clean halt — prints [exit] rt_exit(0) -- halting on baremetal;
+    # POSIX _exit(0) on host.
+    rt_exit(0)

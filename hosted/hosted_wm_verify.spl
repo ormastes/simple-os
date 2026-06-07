@@ -1,0 +1,169 @@
+# hosted_wm_verify.spl — Automated WM Verification via Gemini Vision
+#
+# Renders the desktop using the compositor module, saves a screenshot,
+# sends it to Gemini Vision API, and prints the AI's description.
+#
+# Run with:
+#   SIMPLE_GUI=1 GEMINI_API_KEY=<key> bin/simple examples/simple_os/hosted/hosted_wm_verify.spl
+#
+# Requires: curl, base64 (available on macOS by default)
+
+# ============================================================================
+# FFI Declarations
+# ============================================================================
+
+extern fn rt_winit_event_loop_new() -> i64
+extern fn rt_winit_window_new(el: i64, w: i64, h: i64, title: text) -> i64
+extern fn rt_winit_event_loop_poll_events(el: i64, max: i64) -> i64
+extern fn rt_winit_event_get_type(ev: i64) -> i64
+extern fn rt_winit_event_free(ev: i64)
+extern fn rt_winit_window_free(win: i64)
+extern fn rt_winit_event_loop_free(el: i64)
+extern fn rt_thread_sleep(ms: i64)
+extern fn rt_winit_buffer_create(w: i64, h: i64, fill_color: i64) -> i64
+extern fn rt_winit_buffer_save_bmp(buf: i64, path: text) -> bool
+extern fn rt_winit_buffer_present(win: i64, buf: i64) -> bool
+extern fn rt_winit_buffer_free(buf: i64) -> bool
+
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+extern fn rt_env_get(key: text) -> text
+extern fn rt_file_write_text(path: text, content: text)
+
+use os.compositor.hosted_backend.{HostedCompositorBackend}
+use os.compositor.hosted_input_backend.{HostedInputBackend}
+use os.compositor.compositor.{Compositor}
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+val SCREEN_W: i64 = 1024
+val SCREEN_H: i64 = 768
+val BG_COLOR: i64 = 0xFF1A1B26
+
+# ============================================================================
+# Gemini Vision Verification
+# ============================================================================
+
+fn verify_with_gemini(image_path: text) -> text:
+    val api_key = rt_env_get("GEMINI_API_KEY")
+    if api_key == "":
+        return "ERROR: GEMINI_API_KEY environment variable not set"
+
+    # Convert BMP to PNG
+    val png_path = image_path + ".png"
+    print "  Converting BMP to PNG..."
+    val (sips_out, sips_err, sips_code) = rt_process_run("sips", ["-s", "format", "png", image_path, "--out", png_path])
+    if sips_code != 0:
+        return "ERROR: BMP to PNG conversion failed: {sips_err}"
+
+    print "  Encoding PNG to base64..."
+    val (b64_out, b64_err, b64_code) = rt_process_run("sh", ["-c", "base64 -i " + png_path + " | tr -d '\\n'"])
+    if b64_code != 0:
+        return "ERROR: base64 encoding failed: {b64_err}"
+
+    val b64_clean = b64_out.trim()
+    print "  Base64 size: {b64_clean.len()} chars"
+
+    print "  Building Gemini Vision request..."
+    val prompt = "Describe what you see in this window manager screenshot. List all visible windows, UI elements (title bars, buttons, taskbar, dock icons), and notable colors. Be specific about the layout."
+
+    val RB = "}"
+    val LB = "{"
+    var body_parts: [text] = []
+    body_parts.append(LB + "\"contents\":[" + LB + "\"role\":\"user\",\"parts\":[")
+    body_parts.append(LB + "\"inlineData\":" + LB + "\"mimeType\":\"image/png\",\"data\":\"")
+    body_parts.append(b64_clean)
+    body_parts.append("\"" + RB + RB + ",")
+    body_parts.append(LB + "\"text\":\"")
+    body_parts.append(prompt)
+    body_parts.append("\"" + RB + "]" + RB + "]" + RB)
+    val body = body_parts.join("")
+
+    val body_path = "/tmp/simpleos_gemini_body.json"
+    rt_file_write_text(body_path, body)
+    print "  Request body written ({body.len()} bytes)"
+
+    print "  Sending to Gemini Vision API (gemini-2.5-flash)..."
+    val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + api_key
+    val (out, err, code) = rt_process_run("curl", ["-s", "-X", "POST", "-H", "Content-Type: application/json", "-d", "@" + body_path, url])
+    if code != 0:
+        return "ERROR: curl failed (code={code}): {err}"
+
+    out
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main() -> i64:
+    print "======================================"
+    print "SimpleOS WM — Gemini Vision Verification"
+    print "======================================"
+    print ""
+
+    # Step 1: Create window and compositor
+    print "[1/4] Creating window..."
+    val el = rt_winit_event_loop_new()
+    val win = rt_winit_window_new(el, SCREEN_W, SCREEN_H, "SimpleOS WM Verify")
+    if win == 0:
+        print "ERROR: Window creation failed (is SIMPLE_GUI=1 set?)"
+        return 1
+
+    val buf = rt_winit_buffer_create(SCREEN_W, SCREEN_H, BG_COLOR)
+    val w32: i32 = 1024
+    val h32: i32 = 768
+    val bg_u32: u32 = 0xFF1A1B26
+    var backend = HostedCompositorBackend.create(win, w32, h32, bg_u32)
+    var input = HostedInputBackend.create(el)
+    var compositor = Compositor.with_backends(backend, input, w32, h32)
+
+    # Step 2: Create demo windows and render
+    print "[2/4] Rendering desktop with 3 windows..."
+    compositor.create_window("Terminal", 60, 80, 400, 280)
+    compositor.create_window("Hello World", 320, 140, 360, 240)
+    compositor.create_window("File Manager", 520, 320, 320, 200)
+    compositor.render_all()
+
+    # Pump events so macOS shows the window
+    var pump = 0
+    while pump < 10:
+        var ev = rt_winit_event_loop_poll_events(el, 100)
+        while ev != 0:
+            rt_winit_event_free(ev)
+            ev = rt_winit_event_loop_poll_events(el, 100)
+        rt_thread_sleep(50)
+        pump = pump + 1
+
+    # Step 3: Save screenshot
+    print "[3/4] Saving screenshot..."
+    val bmp_path = "/tmp/simpleos_wm_verify.bmp"
+    val saved = rt_winit_buffer_save_bmp(buf, bmp_path)
+    if saved:
+        print "  Screenshot saved: {bmp_path}"
+    else:
+        print "  ERROR: Failed to save screenshot"
+        rt_winit_buffer_free(buf)
+        rt_winit_window_free(win)
+        rt_winit_event_loop_free(el)
+        return 1
+
+    # Step 4: Send to Gemini Vision
+    print "[4/4] Verifying with Gemini Vision API..."
+    val description = verify_with_gemini(bmp_path)
+
+    print ""
+    print "======================================"
+    print "Gemini Vision Description:"
+    print "======================================"
+    print description
+    print "======================================"
+
+    # Cleanup
+    rt_winit_buffer_free(buf)
+    rt_winit_window_free(win)
+    rt_winit_event_loop_free(el)
+
+    print ""
+    print "Verification complete."
+    return 0

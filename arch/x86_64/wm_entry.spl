@@ -1,0 +1,3603 @@
+#![allow(unnamed_duplicate_typed_args)]
+# SimpleOS Glass Window Manager — Modern Glassmorphism Desktop
+#
+# Self-contained entry with frosted glass UI effects:
+# 1. BGA framebuffer (1024x768x32) via port I/O
+# 2. PCI BAR scan for VGA LFB address
+# 3. Gradient desktop background (midnight → purple)
+# 4. Frosted glass windows with blur + alpha blend + shadows
+# 5. Glass system bar and dock with backdrop blur
+# 6. macOS-style traffic light buttons (close/min/max)
+# 7. Dark Glass / White Glass theme toggle (T key)
+# 8. Focus ring effect on active window
+# 9. PS/2 keyboard input for window management
+
+# === Input handling ===
+# Shared modules exist at os.gui.input_event + os.gui.shortcut but
+# using imported classes in --entry-closure baremetal builds causes
+# FAULT (class instantiation fails). Using local scancode mapping
+# with matching action code convention from the shared modules.
+
+# === Extern FFI declarations ===
+extern fn serial_println(msg: text)
+extern fn rt_gui_set_fb(addr: u64, width: u64)
+
+# Port I/O — direct extern (u64 params match RuntimeValue ABI)
+extern fn rt_port_inb(port: u64) -> u64
+extern fn rt_port_outb(port: u64, value: u64)
+extern fn rt_port_outw(port: u64, value: u64)
+extern fn rt_port_inl(port: u64) -> u64
+extern fn rt_port_outl(port: u64, value: u64)
+
+# Aliases for readability
+fn io_inb(port: u64) -> u64: rt_port_inb(port)
+fn io_outb(port: u64, value: u64): rt_port_outb(port, value)
+fn io_inw(port: u64) -> u64: rt_port_inb(port)
+fn io_outw(port: u64, value: u64): rt_port_outw(port, value)
+fn io_inl(port: u64) -> u64: rt_port_inl(port)
+fn io_outl(port: u64, value: u64): rt_port_outl(port, value)
+
+# === RTC (Real-Time Clock) via CMOS ports 0x70/0x71 ===
+fn rtc_read(reg: u64) -> u64:
+    io_outb(0x70, reg)
+    io_inb(0x71)
+
+fn bcd_to_dec(bcd: u64) -> u64:
+    ((bcd >> 4) * 10) + (bcd & 0x0F)
+
+fn get_rtc_hours() -> u64: bcd_to_dec(rtc_read(4))
+fn get_rtc_minutes() -> u64: bcd_to_dec(rtc_read(2))
+fn get_rtc_seconds() -> u64: bcd_to_dec(rtc_read(0))
+fn get_rtc_day() -> u64: bcd_to_dec(rtc_read(7))
+fn get_rtc_month() -> u64: bcd_to_dec(rtc_read(8))
+fn get_rtc_year() -> u64: bcd_to_dec(rtc_read(9))
+
+# Convert a number 0-99 into two ASCII digit characters packed as (tens_char, ones_char)
+fn digit_tens(n: u64) -> u64: 48 + (n / 10)
+fn digit_ones(n: u64) -> u64: 48 + (n % 10)
+
+extern fn rt_gui_fill4(xy: u64, wh: u64, color: u64, unused: u64)
+
+# Glass rendering primitives (from glass_render.c)
+extern fn rt_gui_begin_frame(width: u64, height: u64, unused1: u64, unused2: u64)
+extern fn rt_gui_present(unused1: u64, unused2: u64, unused3: u64, unused4: u64)
+extern fn rt_gui_blend_fill(xy: u64, wh: u64, color: u64, alpha: u64)
+extern fn rt_gui_box_blur(xy: u64, wh: u64, radius: u64, unused: u64)
+extern fn rt_gui_gradient_h(xy: u64, wh: u64, c1: u64, c2: u64)
+extern fn rt_gui_gradient_v(xy: u64, wh: u64, c1: u64, c2: u64)
+extern fn rt_gui_shadow(xy: u64, wh: u64, blur_alpha: u64, offset: u64)
+extern fn rt_gui_rounded_rect(xy: u64, wh: u64, color_radius: u64, alpha: u64)
+extern fn rt_gui_shadow_fill(xy: u64, wh: u64, color: u64, unused: u64)
+extern fn rt_gui_rounded_rect_top(xy: u64, wh: u64, color_radius: u64, alpha: u64)
+extern fn rt_gui_filled_circle(cx_cy: u64, diam_color: u64, alpha: u64, unused: u64)
+extern fn rt_gui_draw_wallpaper(wh: u64, style: u64, unused1: u64, unused2: u64)
+extern fn rt_gui_rounded_rect_aa(xy: u64, wh: u64, color_radius: u64, alpha: u64)
+extern fn rt_gui_line(p1: u64, p2: u64, color_thick: u64, alpha: u64)
+extern fn rt_gui_ring(cx_cy: u64, diam_thick: u64, color: u64, alpha: u64)
+extern fn rt_gui_gradient_rect(xy: u64, wh: u64, color_radius: u64, c2_alpha: u64)
+extern fn rt_gui_set_text_buf(chars: u64, offset: u64, unused1: u64, unused2: u64)
+extern fn rt_gui_draw_text_buf(xy: u64, color_len: u64, alpha: u64, unused: u64)
+extern fn rt_gui_draw_text_shadow(xy: u64, color_len: u64, alpha: u64, shadow_alpha: u64)
+extern fn rt_gui_draw_text_bold(xy: u64, color_len: u64, alpha: u64, unused: u64)
+extern fn rt_gui_draw_text_2x(xy: u64, color_len: u64, alpha: u64, shadow_alpha: u64)
+extern fn rt_gui_draw_text_outline(xy: u64, color_len: u64, alpha: u64, outline_alpha: u64)
+extern fn rt_gui_draw_text_vector(xy: u64, color_size: u64, alpha: u64, unused: u64)
+extern fn rt_gui_noise_blend(xy: u64, wh: u64, intensity: u64, unused: u64)
+
+# Layout engine
+extern fn rt_layout_reset(u1: u64, u2: u64, u3: u64, u4: u64)
+extern fn rt_layout_add(type_: u64, parent: u64, u1: u64, u2: u64) -> u64
+extern fn rt_layout_set_size(id: u64, w_spec: u64, h_spec: u64, u: u64)
+extern fn rt_layout_set_padding(id: u64, lr: u64, tb: u64, u: u64)
+extern fn rt_layout_set_props(id: u64, spacing: u64, align: u64, u: u64)
+extern fn rt_layout_compute(wh: u64, u1: u64, u2: u64, u3: u64)
+extern fn rt_layout_get(id: u64, u1: u64, u2: u64, u3: u64) -> u64
+extern fn rt_layout_get_size(id: u64, u1: u64, u2: u64, u3: u64) -> u64
+
+# Pack two u32 values into one u64 (high|low)
+fn pack(hi: u64, lo: u64) -> u64:
+    (hi << 32) | (lo & 0xFFFFFFFF)
+
+# === Screen dimensions ===
+val SCREEN_W: u64 = 1024
+val SCREEN_H: u64 = 768
+val SYSTEM_BAR_H: u64 = 28
+val DOCK_H: u64 = 52
+val TITLE_BAR_H: u64 = 44
+
+# ===========================================================================
+# Dark Glass Theme (default) — derived from glass_tokens.spl
+# ===========================================================================
+val DARK_BG_TOP: u64       = 0x00060508   # Slightly warm dark — naturalistic tone
+val DARK_BG_BOT: u64       = 0x00200840   # Brighter purple, more vibrant
+val DARK_SURFACE: u64      = 0x001E1E23   # Glass surface color
+val DARK_SURFACE_A: u64    = 35           # 14% opacity (very transparent glass)
+val DARK_ELEVATED: u64     = 0x002C2C32   # Elevated glass
+val DARK_ELEVATED_A: u64   = 50           # 20% opacity (very transparent title bar — blur shows through)
+val DARK_BORDER: u64       = 0x00FFFFFF   # Glass border (white)
+val DARK_BORDER_A: u64     = 100          # 39% opacity (thicker visual weight)
+val DARK_TEXT: u64         = 0x00F5F5F7   # Primary text
+val DARK_TEXT_SEC: u64     = 0x00EBEBF5   # Secondary text (60%)
+val DARK_ACCENT: u64       = 0x000A84FF   # Blue accent
+val DARK_ACCENT2: u64      = 0x00BB86FC   # Purple accent
+val DARK_SHADOW_A: u64     = 80           # Shadow opacity
+
+# ===========================================================================
+# White Glass Theme
+# ===========================================================================
+val LIGHT_BG_TOP: u64      = 0x00E8E0F0   # Brighter lavender mist
+val LIGHT_BG_BOT: u64      = 0x00F5F0FF   # Warmer white-lavender
+val LIGHT_SURFACE: u64     = 0x00F8F0FF   # Glass surface (slight lavender tint)
+val LIGHT_SURFACE_A: u64   = 65           # 25% opacity (slightly more opaque for light — opposite of dark's transparency)
+val LIGHT_ELEVATED: u64    = 0x00FFF0F8   # Elevated glass (stronger pink tint for title bars)
+val LIGHT_ELEVATED_A: u64  = 110          # 43% opacity (glass title bar — lighter for correct gradient)
+val LIGHT_BORDER: u64      = 0x00000000   # Glass border (black)
+val LIGHT_BORDER_A: u64    = 90           # 35% opacity (more visible border)
+val LIGHT_TEXT: u64        = 0x00201820   # Primary text (slightly warm black)
+val LIGHT_TEXT_SEC: u64    = 0x003C3C43   # Secondary text
+val LIGHT_ACCENT: u64      = 0x00007AFF   # Blue accent
+val LIGHT_ACCENT2: u64     = 0x00AF6BC5   # Brighter purple accent
+val LIGHT_SHADOW_A: u64    = 30           # Shadow opacity (softer for light theme)
+
+val WARM_ACCENT: u64 = 0x00FF9500   # Warm orange for highlights
+val SUCCESS_COLOR: u64 = 0x0030D158   # Green (matches battery indicator)
+val WARNING_COLOR: u64 = 0x00FFD60A   # Warm yellow (alerts)
+val WARM_HIGHLIGHT: u64 = 0x00FFD0A0  # Warm natural gold for highlights
+
+# Window control button colors (SimpleOS accent palette — unique identity)
+val BTN_CLOSE: u64   = 0x00FF6B8A  # Rose pink — keep (warm accent)
+val BTN_MIN: u64     = 0x008B8BFA  # Softer blue-purple (harmonizes with accent2)
+val BTN_MAX: u64     = 0x0050D0A0  # Soft teal-green (harmonizes with surface)
+
+# Blur radii
+val BLUR_SURFACE: u64  = 16   # Standard window blur (increased for more visible frosted glass)
+val BLUR_ELEVATED: u64 = 24   # System bar / elevated panels
+val BLUR_SUBTLE: u64   = 6    # Subtle effects
+
+# ===========================================================================
+# Layout Constants — extracted from hardcoded magic numbers
+# ===========================================================================
+
+# Window frame
+val WIN_CORNER_RADIUS: u64 = 22
+val WIN_BORDER_INSET: u64 = 1
+val CONTENT_MARGIN_TOP: u64 = 2
+val CONTENT_PAD: u64 = 16
+val FOCUS_RING_PAD: u64 = 2
+
+# Traffic light buttons
+val BTN_DIAMETER: u64 = 16
+val BTN_GAP: u64 = 10
+val BTN_MARGIN_X: u64 = 12
+val BTN_MARGIN_Y: u64 = 10
+
+# Dock
+val DOCK_MARGIN_BOTTOM: u64 = 10
+val DOCK_CORNER_RADIUS: u64 = 26
+val DOCK_ICON_SIZE: u64 = 40
+val DOCK_ICON_GAP: u64 = 16
+val DOCK_ICON_PAD: u64 = 4
+val DOCK_PILL_SIZE: u64 = 48
+val DOCK_H_PAD: u64 = 20
+val DOCK_V_PAD: u64 = 8
+val DOCK_ACTUAL_H: u64 = 58
+val DOCK_INDICATOR_MARGIN: u64 = 6
+
+# System bar
+val BAR_H_PAD: u64 = 6
+val BAR_V_PAD: u64 = 5
+val MENU_ITEM_GAP: u64 = 6
+
+# Content areas
+val SIDEBAR_W: u64 = 84
+val BANNER_H: u64 = 44
+val GRID_COL_SPACING: u64 = 72
+val GRID_ROW_SPACING: u64 = 50
+
+# Window sizes (fixed)
+val WIN0_W: u64 = 420
+val WIN0_H: u64 = 300
+val WIN1_W: u64 = 380
+val WIN1_H: u64 = 260
+val WIN2_W: u64 = 340
+val WIN2_H: u64 = 220
+
+# Window positions (mutable — draggable)
+var WIN0_X: u64 = 60
+var WIN0_Y: u64 = 60
+var WIN1_X: u64 = 300
+var WIN1_Y: u64 = 160
+var WIN2_X: u64 = 540
+var WIN2_Y: u64 = 300
+
+# === App State ===
+# Terminal (Window 0) state
+var g_term_cursor_y: u64 = 0      # Current line in terminal (0-based)
+var g_term_input_len: u64 = 0     # Characters in current input line
+var g_term_line_count: u64 = 4    # Number of output lines displayed
+var g_term_cmd_history: u64 = 0   # Number of commands executed
+var g_term_input_active: u64 = 0  # 1 when terminal has keyboard focus
+
+# Terminal input buffer — packed u64 (8 chars each), max 40 chars = 5 words
+var g_term_input_0: u64 = 0
+var g_term_input_1: u64 = 0
+var g_term_input_2: u64 = 0
+var g_term_input_3: u64 = 0
+var g_term_input_4: u64 = 0
+
+# Terminal output state — which command output to show
+# 0=none, 1=help, 2=uname, 3=ls, 4=whoami, 5=date, 6=uptime, 7=unknown cmd
+# 8=ps, 9=free, 10=hostname, 11=pwd, 12=echo
+var g_term_out_type: u64 = 0
+var g_term_out_count: u64 = 0     # Lines of output to display
+
+# Global frame counter for uptime calculation (~60fps)
+var g_frame_count: u64 = 0
+
+# Echo command saved input (packed, up to 35 chars after "echo ")
+var g_echo_buf_0: u64 = 0
+var g_echo_buf_1: u64 = 0
+var g_echo_buf_2: u64 = 0
+var g_echo_buf_3: u64 = 0
+var g_echo_buf_4: u64 = 0
+var g_echo_len: u64 = 0
+
+# Scroll offset for terminal output history
+var g_term_scroll_y: u64 = 0
+
+# Editor (Window 1) state
+var g_editor_cursor_x: u64 = 0    # Cursor column
+var g_editor_cursor_y: u64 = 3    # Cursor line (0-based)
+var g_editor_scroll_y: u64 = 0    # Scroll offset
+var g_editor_line_count: u64 = 8  # Total lines
+
+# Editor editable line buffer (current line only, packed u64, 8 chars each)
+var g_ed_buf_0: u64 = 0
+var g_ed_buf_1: u64 = 0
+var g_ed_buf_2: u64 = 0
+var g_ed_buf_3: u64 = 0
+var g_ed_buf_4: u64 = 0
+var g_ed_buf_len: u64 = 0
+var g_ed_editing: u64 = 0        # 1 when editor accepts keyboard input
+
+# Legacy file explorer state (still used by handle_files_click)
+var g_files_selected: u64 = 0     # Selected item index (0-5)
+var g_files_view_mode: u64 = 0    # 0=icon, 1=list
+var g_files_sidebar_sel: u64 = 0  # Selected sidebar item (0-4)
+
+# Browser (Window 2) state
+var g_browser_url_len: u64 = 0
+var g_browser_url_0: u64 = 0    # Packed URL chars (8 per word)
+var g_browser_url_1: u64 = 0
+var g_browser_url_2: u64 = 0
+var g_browser_url_3: u64 = 0
+var g_browser_url_4: u64 = 0
+var g_browser_page: u64 = 0     # 0=home, 1=help, 2=sysinfo, 3=about, 4=network
+var g_browser_scroll_y: u64 = 0
+var g_browser_input_active: u64 = 0  # 1 when address bar focused
+var g_browser_history_len: u64 = 0
+var g_browser_history_0: u64 = 0  # Page IDs for back/forward
+var g_browser_history_1: u64 = 0
+var g_browser_history_2: u64 = 0
+var g_browser_history_3: u64 = 0
+var g_browser_history_4: u64 = 0
+var g_browser_history_pos: u64 = 0
+
+# Animation globals (module-level state for focus transitions)
+var g_anim_progress: u64 = 100  # 0-100 (0=start, 100=done)
+
+# Animation system — supports multiple concurrent animations
+var g_minimize_active: u64 = 0       # 1 if minimize animation running
+var g_minimize_progress: u64 = 0     # 0-100 progress
+var g_minimize_win: u64 = 0          # which window (0/1/2)
+var g_minimize_states: u64 = 0       # bitmask: bit0=win0 minimized, bit1=win1, bit2=win2
+
+var g_open_active: u64 = 0           # 1 if window open animation running
+var g_open_progress: u64 = 0         # 0-100
+var g_open_win: u64 = 0              # which window
+
+var g_close_active: u64 = 0           # 1 if close animation running
+var g_close_progress: u64 = 0         # 0-100
+var g_close_win: u64 = 0              # which window
+
+var g_dock_bounce_active: u64 = 0    # 1 if dock bounce running
+var g_dock_bounce_progress: u64 = 0  # 0-100
+var g_dock_bounce_icon: u64 = 0      # which icon (0-6)
+
+# Mouse state
+var g_mouse_x: u64 = 512
+var g_mouse_y: u64 = 384
+var g_mouse_buttons: u64 = 0
+var g_mouse_prev_buttons: u64 = 0
+var g_mouse_initialized: u64 = 0
+var g_cursor_shape: u64 = 0  # 0=arrow (default), 1=hand (over links), 2=text (over text input)
+
+# Drag state
+var g_dragging: u64 = 0         # 0=not dragging, 1/2/3=dragging window 0/1/2 (offset by 1)
+var g_drag_offset_x: u64 = 0    # offset from mouse to window left
+var g_drag_offset_y: u64 = 0    # offset from mouse to window top
+
+# Bounce easing: overshoot then settle (integer approximation)
+# Maps progress 0-100 to offset 0-N-0 with overshoot
+fn bounce_offset(progress: u64) -> u64:
+    # Phase 1 (0-40): scale up (offset shrinks from 8 to 0)
+    if progress < 40:
+        (8 * (40 - progress)) / 40
+    # Phase 2 (40-70): overshoot (offset goes negative = -3 to 0)
+    else:
+        if progress < 70:
+            0
+        # Phase 3 (70-100): settle
+        else:
+            0
+
+# Ease-out cubic: fast start, smooth deceleration (like macOS)
+# Maps 0-100 -> 0-100 with easing
+fn ease_out_cubic(t: u64) -> u64:
+    # f(t) = 1 - (1-t)^3 -- integer approximation
+    val inv = 100 - t  # (1-t) scaled to 0-100
+    val inv2 = inv * inv / 100  # (1-t)^2
+    val inv3 = inv2 * inv / 100  # (1-t)^3
+    100 - inv3
+
+# Ease-in-out quad: smooth start and end
+fn ease_in_out_quad(t: u64) -> u64:
+    if t < 50:
+        t * t * 2 / 100
+    else:
+        val inv = 100 - t
+        100 - inv * inv * 2 / 100
+
+# Spring easing: slight overshoot then settle (for dock bounce)
+fn spring_ease(t: u64) -> u64:
+    if t < 60:
+        # Rise to 110%
+        t * 110 / 60
+    else:
+        if t < 80:
+            # Overshoot then pull back to 95%
+            110 - (t - 60) * 15 / 20
+        else:
+            # Settle to 100%
+            95 + (t - 80) * 5 / 20
+
+# Ease-in cubic: slow start, fast finish (for window close)
+fn ease_in_cubic(t: u64) -> u64:
+    t * t * t / 10000
+
+# Linear interpolation between two values based on progress 0-100
+fn lerp(start: u64, end_: u64, progress: u64) -> u64:
+    if end_ >= start:
+        start + (end_ - start) * progress / 100
+    else:
+        start - (start - end_) * progress / 100
+
+# Dock icon colors
+val ICON_TERM: u64     = 0x003498DB
+val ICON_FILES: u64    = 0x0027AE60
+val ICON_CALC: u64     = 0x00E74C3C
+val ICON_CLOCK: u64    = 0x00F39C12
+val ICON_SETTINGS: u64 = 0x009B59B6
+val ICON_BROWSER: u64  = 0x00E67E22
+val ICON_EDITOR: u64   = 0x001ABC9C
+
+# === Hardware init ===
+
+fn bga_wr(idx: u64, val_: u64):
+    io_outw(0x01CE, idx)
+    io_outw(0x01CF, val_)
+
+fn pci_rd(dev: u64, off: u64) -> u64:
+    val a: u64 = 0x80000000 | (dev << 11) | (off & 0xFC)
+    io_outl(0x0CF8, a)
+    io_inl(0x0CFC)
+
+fn pci_wr(dev: u64, off: u64, val_: u64):
+    val a: u64 = 0x80000000 | (dev << 11) | (off & 0xFC)
+    io_outl(0x0CF8, a)
+    io_outl(0x0CFC, val_)
+
+fn find_vga_fb() -> u64:
+    var d: u64 = 0
+    while d < 32:
+        val v = pci_rd(d, 0) & 0xFFFF
+        if v != 0xFFFF and v != 0:
+            val c = pci_rd(d, 8)
+            if ((c >> 24) & 0xFF) == 3:
+                val cmd = pci_rd(d, 0x04)
+                pci_wr(d, 0x04, cmd | 0x06)
+                val bar0 = pci_rd(d, 0x10)
+                val addr = bar0 & 0xFFFFFFF0
+                if addr != 0:
+                    return addr
+        d = d + 1
+    0xFD000000
+
+# === PS/2 Mouse ===
+
+fn mouse_wait_write():
+    var i: u64 = 0
+    while i < 100000:
+        if (io_inb(0x64) & 2) == 0:
+            return
+        i = i + 1
+
+fn mouse_wait_read():
+    var i: u64 = 0
+    while i < 100000:
+        if (io_inb(0x64) & 1) != 0:
+            return
+        i = i + 1
+
+fn mouse_cmd(cmd: u64):
+    mouse_wait_write()
+    io_outb(0x64, 0xD4)  # Send to mouse
+    mouse_wait_write()
+    io_outb(0x60, cmd)
+    mouse_wait_read()
+    io_inb(0x60)  # Read ACK
+
+fn mouse_init():
+    """Initialize PS/2 mouse with basic 3-byte packet mode."""
+    serial_println("[MOUSE] Initializing PS/2 mouse...")
+
+    # Flush any pending data
+    var flush: u64 = 0
+    while flush < 16:
+        if (io_inb(0x64) & 1) != 0:
+            io_inb(0x60)
+        flush = flush + 1
+
+    # Enable auxiliary device
+    mouse_wait_write()
+    io_outb(0x64, 0xA8)
+    serial_println("[MOUSE] Aux device enabled (0xA8)")
+
+    # Get controller config byte
+    mouse_wait_write()
+    io_outb(0x64, 0x20)
+    mouse_wait_read()
+    val status = io_inb(0x60)
+    serial_println("[MOUSE] Config byte: {status}")
+
+    # Set config: enable IRQ12 (bit 1), enable aux clock (clear bit 5)
+    val new_config = (status | 2) & 0xDF
+    mouse_wait_write()
+    io_outb(0x64, 0x60)
+    mouse_wait_write()
+    io_outb(0x60, new_config)
+    serial_println("[MOUSE] Config set to: {new_config}")
+
+    # Reset mouse
+    mouse_wait_write()
+    io_outb(0x64, 0xD4)
+    mouse_wait_write()
+    io_outb(0x60, 0xFF)  # Reset command
+    mouse_wait_read()
+    val reset_ack = io_inb(0x60)
+    serial_println("[MOUSE] Reset ACK: {reset_ack}")
+    # Wait for self-test result (0xAA) and device ID (0x00)
+    mouse_wait_read()
+    val self_test = io_inb(0x60)
+    serial_println("[MOUSE] Self-test: {self_test}")
+    mouse_wait_read()
+    val device_id = io_inb(0x60)
+    serial_println("[MOUSE] Device ID: {device_id}")
+
+    # Set defaults
+    mouse_cmd(0xF6)
+    serial_println("[MOUSE] Defaults set (0xF6)")
+
+    # Enable data reporting
+    mouse_cmd(0xF4)
+    serial_println("[MOUSE] Reporting enabled (0xF4)")
+
+    # Verify config byte after init
+    mouse_wait_write()
+    io_outb(0x64, 0x20)
+    mouse_wait_read()
+    val final_config = io_inb(0x60)
+    serial_println("[MOUSE] Final config: {final_config}")
+
+    g_mouse_initialized = 1
+    serial_println("[MOUSE] PS/2 mouse ready")
+
+fn draw_mouse_cursor(mx: u64, my: u64, theme: u64):
+    """Draw cursor at mouse position. Shape depends on g_cursor_shape."""
+    # Text cursor (I-beam) — shape 2
+    if g_cursor_shape == 2:
+        blend(mx, my, 8, 2, 0x00FFFFFF, 200)          # top bar
+        blend(mx + 3, my + 2, 2, 12, 0x00FFFFFF, 200)  # vertical bar
+        blend(mx, my + 14, 8, 2, 0x00FFFFFF, 200)      # bottom bar
+        return
+
+    # Hand cursor (pointing) — shape 1
+    if g_cursor_shape == 1:
+        blend(mx + 4, my, 4, 6, 0x00FFFFFF, 220)       # index finger
+        blend(mx + 2, my + 6, 8, 4, 0x00FFFFFF, 220)   # knuckles
+        blend(mx + 2, my + 10, 8, 6, 0x00FFFFFF, 200)  # palm
+        # Outline
+        blend(mx + 3, my - 1, 6, 1, 0x00000000, 180)   # finger top
+        blend(mx + 1, my + 5, 1, 12, 0x00000000, 180)  # left edge
+        blend(mx + 10, my + 5, 1, 12, 0x00000000, 180) # right edge
+        return
+
+    # Default arrow cursor — shape 0
+    # Cursor: 16-row triangle, each row has width = row/2 + 1
+    # Black outline on left edge, right edge, top, and bottom row
+    # White fill interior
+    # Drop shadow offset by 2px
+    # Shadow first (behind cursor)
+    blend(mx + 2, my + 2, 10, 16, 0x00000000, 30)
+
+    var row: u64 = 0
+    while row < 16:
+        var col: u64 = 0
+        val width = row / 2 + 1
+        while col < width:
+            val px = mx + col
+            val py = my + row
+            if px < SCREEN_W:
+                if py < SCREEN_H:
+                    if col == 0:
+                        # Left edge — black outline
+                        blend(px, py, 1, 1, 0x00000000, 220)
+                    else:
+                        if row < 3:
+                            # Top rows — white fill (too narrow for outline)
+                            blend(px, py, 1, 1, 0x00FFFFFF, 240)
+                        else:
+                            if col == width - 1:
+                                # Right edge — black outline
+                                blend(px, py, 1, 1, 0x00000000, 220)
+                            else:
+                                # Interior — white fill
+                                blend(px, py, 1, 1, 0x00FFFFFF, 240)
+            col = col + 1
+        # Bottom row — all black outline
+        if row == 15:
+            var c2: u64 = 0
+            while c2 < width:
+                val bx = mx + c2
+                val by = my + row
+                if bx < SCREEN_W:
+                    if by < SCREEN_H:
+                        blend(bx, by, 1, 1, 0x00000000, 220)
+                c2 = c2 + 1
+        row = row + 1
+
+fn update_cursor_shape():
+    """Set cursor shape based on what's under the mouse pointer."""
+    g_cursor_shape = 0  # Default arrow
+    # Check if over browser address bar (window 2)
+    if g_mouse_x >= WIN2_X + 82 and g_mouse_x < WIN2_X + WIN2_W - 8:
+        if g_mouse_y >= WIN2_Y + TITLE_BAR_H + 5 and g_mouse_y < WIN2_Y + TITLE_BAR_H + 27:
+            g_cursor_shape = 2  # Text cursor
+            return
+    # Check if over links in browser content
+    if g_mouse_x >= WIN2_X + 38 and g_mouse_x < WIN2_X + WIN2_W - 20:
+        if g_browser_page == 0:
+            val link_base_y = WIN2_Y + TITLE_BAR_H + 32 + 128
+            if g_mouse_y >= link_base_y and g_mouse_y < link_base_y + 96:
+                g_cursor_shape = 1  # Hand cursor
+                return
+        if g_browser_page == 1 or g_browser_page == 2 or g_browser_page == 3 or g_browser_page == 4:
+            # Back link area
+            val back_base_y = WIN2_Y + TITLE_BAR_H + 32 + 140
+            if g_mouse_y >= back_base_y and g_mouse_y < back_base_y + 20:
+                g_cursor_shape = 1  # Hand cursor
+                return
+
+# === Rendering helpers ===
+
+fn fill(x: u64, y: u64, w: u64, h: u64, color: u64):
+    rt_gui_shadow_fill(pack(x, y), pack(w, h), color, 0)
+
+fn blend(x: u64, y: u64, w: u64, h: u64, color: u64, alpha: u64):
+    rt_gui_blend_fill(pack(x, y), pack(w, h), color, alpha)
+
+fn blur(x: u64, y: u64, w: u64, h: u64, radius: u64):
+    rt_gui_box_blur(pack(x, y), pack(w, h), radius, 0)
+
+fn grad_v(x: u64, y: u64, w: u64, h: u64, c1: u64, c2: u64):
+    rt_gui_gradient_v(pack(x, y), pack(w, h), c1, c2)
+
+fn grad_h(x: u64, y: u64, w: u64, h: u64, c1: u64, c2: u64):
+    rt_gui_gradient_h(pack(x, y), pack(w, h), c1, c2)
+
+fn shadow(x: u64, y: u64, w: u64, h: u64, blur_r: u64, alpha: u64, offset: u64):
+    rt_gui_shadow(pack(x, y), pack(w, h), pack(blur_r, alpha), offset)
+
+fn rrect(x: u64, y: u64, w: u64, h: u64, color: u64, radius: u64, alpha: u64):
+    rt_gui_rounded_rect(pack(x, y), pack(w, h), pack(color, radius), alpha)
+
+fn rrect_top(x: u64, y: u64, w: u64, h: u64, color: u64, radius: u64, alpha: u64):
+    rt_gui_rounded_rect_top(pack(x, y), pack(w, h), pack(color, radius), alpha)
+
+fn circle(cx: u64, cy: u64, diameter: u64, color: u64, alpha: u64):
+    rt_gui_filled_circle(pack(cx, cy), pack(diameter, color), alpha, 0)
+
+fn rrect_aa(x: u64, y: u64, w: u64, h: u64, color: u64, radius: u64, alpha: u64):
+    rt_gui_rounded_rect_aa(pack(x, y), pack(w, h), pack(color, radius), alpha)
+
+fn line(x1: u64, y1: u64, x2: u64, y2: u64, color: u64, thick: u64, alpha: u64):
+    rt_gui_line(pack(x1, y1), pack(x2, y2), pack(color, thick), alpha)
+
+fn ring(cx: u64, cy: u64, diameter: u64, thick: u64, color: u64, alpha: u64):
+    rt_gui_ring(pack(cx, cy), pack(diameter, thick), pack(color, 0), alpha)
+
+fn grad_rect(x: u64, y: u64, w: u64, h: u64, c1: u64, radius: u64, c2: u64, alpha: u64):
+    rt_gui_gradient_rect(pack(x, y), pack(w, h), pack(c1, radius), pack(c2, alpha))
+
+fn noise(x: u64, y: u64, w: u64, h: u64, intensity: u64):
+    rt_gui_noise_blend(pack(x, y), pack(w, h), intensity, 0)
+
+# Text rendering helpers — pack 8 ASCII chars into u64 for rt_gui_set_text_buf
+fn pack8(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64) -> u64:
+    (a << 56) | (b << 48) | (c << 40) | (d << 32) | (e << 24) | (f << 16) | (g << 8) | h
+
+fn draw_label(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    rt_gui_draw_text_buf(pack(x, y), pack(color, len), alpha, 0)
+
+fn draw_label_shadow(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64, shadow_a: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    rt_gui_draw_text_shadow(pack(x, y), pack(color, len), alpha, shadow_a)
+
+fn draw_label_bold(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    rt_gui_draw_text_bold(pack(x, y), pack(color, len), alpha, 0)
+
+fn draw_label_2x(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64, shadow_a: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    rt_gui_draw_text_2x(pack(x, y), pack(color, len), alpha, shadow_a)
+
+fn draw_label_outline(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64, outline_a: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    rt_gui_draw_text_outline(pack(x, y), pack(color, len), alpha, outline_a)
+
+fn draw_label_vector(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64, pixel_height: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    val size_and_len = (pixel_height << 16) | (len & 0xFFFF)
+    rt_gui_draw_text_vector(pack(x, y), pack(color, size_and_len), alpha, 0)
+
+# Layout engine constants
+val LT_HSTACK: u64 = 1
+val LT_VSTACK: u64 = 2
+val LT_ZSTACK: u64 = 3
+val SM_FIXED: u64 = 0
+val SM_FILL: u64 = 1
+val SM_AUTO: u64 = 2
+val ALIGN_START: u64 = 0
+val ALIGN_CENTER: u64 = 1
+val ALIGN_END: u64 = 2
+
+# Layout helpers
+fn layout_fixed(size: u64) -> u64:
+    pack(SM_FIXED, size)
+
+fn layout_fill(weight: u64) -> u64:
+    pack(SM_FILL, weight)
+
+fn layout_auto() -> u64:
+    pack(SM_AUTO, 0)
+
+fn layout_x(id: u64) -> u64:
+    rt_layout_get(id, 0, 0, 0) >> 32
+
+fn layout_y(id: u64) -> u64:
+    rt_layout_get(id, 0, 0, 0) & 0xFFFFFFFF
+
+fn layout_w(id: u64) -> u64:
+    rt_layout_get_size(id, 0, 0, 0) >> 32
+
+fn layout_h(id: u64) -> u64:
+    rt_layout_get_size(id, 0, 0, 0) & 0xFFFFFFFF
+
+# === Theme-aware color getters ===
+
+fn bg_top(theme: u64) -> u64:
+    if theme == 0: DARK_BG_TOP
+    else: LIGHT_BG_TOP
+
+fn bg_bot(theme: u64) -> u64:
+    if theme == 0: DARK_BG_BOT
+    else: LIGHT_BG_BOT
+
+fn surface(theme: u64) -> u64:
+    if theme == 0: DARK_SURFACE
+    else: LIGHT_SURFACE
+
+fn surface_a(theme: u64) -> u64:
+    if theme == 0: DARK_SURFACE_A
+    else: LIGHT_SURFACE_A
+
+fn elevated(theme: u64) -> u64:
+    if theme == 0: DARK_ELEVATED
+    else: LIGHT_ELEVATED
+
+fn elevated_a(theme: u64) -> u64:
+    if theme == 0: DARK_ELEVATED_A
+    else: LIGHT_ELEVATED_A
+
+fn border_c(theme: u64) -> u64:
+    if theme == 0: DARK_BORDER
+    else: LIGHT_BORDER
+
+fn border_a(theme: u64) -> u64:
+    if theme == 0: DARK_BORDER_A
+    else: LIGHT_BORDER_A
+
+fn accent(theme: u64) -> u64:
+    if theme == 0: DARK_ACCENT
+    else: LIGHT_ACCENT
+
+fn accent2(theme: u64) -> u64:
+    if theme == 0: DARK_ACCENT2
+    else: LIGHT_ACCENT2
+
+fn shadow_a(theme: u64) -> u64:
+    if theme == 0: DARK_SHADOW_A
+    else: LIGHT_SHADOW_A
+
+fn text_c(theme: u64) -> u64:
+    if theme == 0: DARK_TEXT
+    else: LIGHT_TEXT
+
+fn text_sec(theme: u64) -> u64:
+    if theme == 0: DARK_TEXT_SEC
+    else: LIGHT_TEXT_SEC
+
+# ===========================================================================
+# WM Chrome Stylesheet (HTML/CSS-like token map)
+# ===========================================================================
+
+val CSS_CHROME_TITLEBAR: u64 = 1
+val CSS_CHROME_MENUBAR: u64 = 2
+val CSS_CHROME_DOCK: u64 = 3
+
+fn chrome_radius(role: u64) -> u64:
+    if role == CSS_CHROME_TITLEBAR: return WIN_CORNER_RADIUS
+    if role == CSS_CHROME_MENUBAR: return 0
+    if role == CSS_CHROME_DOCK: return DOCK_CORNER_RADIUS
+    return 8
+
+fn chrome_blur_radius(role: u64) -> u64:
+    if role == CSS_CHROME_TITLEBAR: return BLUR_SUBTLE
+    if role == CSS_CHROME_MENUBAR: return BLUR_ELEVATED
+    if role == CSS_CHROME_DOCK: return BLUR_ELEVATED
+    return BLUR_SUBTLE
+
+fn chrome_surface_alpha(theme: u64, role: u64) -> u64:
+    if role == CSS_CHROME_TITLEBAR: return elevated_a(theme)
+    if role == CSS_CHROME_MENUBAR: return elevated_a(theme)
+    if role == CSS_CHROME_DOCK: return surface_a(theme)
+    return surface_a(theme)
+
+fn chrome_vibrancy_alpha(role: u64) -> u64:
+    if role == CSS_CHROME_TITLEBAR: return 10
+    if role == CSS_CHROME_MENUBAR: return 5
+    if role == CSS_CHROME_DOCK: return 6
+    return 4
+
+fn chrome_topline_alpha(role: u64) -> u64:
+    if role == CSS_CHROME_TITLEBAR: return 30
+    if role == CSS_CHROME_MENUBAR: return 35
+    if role == CSS_CHROME_DOCK: return 35
+    return 20
+
+fn chrome_border_alpha(theme: u64, role: u64) -> u64:
+    val base = border_a(theme)
+    if role == CSS_CHROME_TITLEBAR: return base + 15
+    if role == CSS_CHROME_MENUBAR: return 38
+    if role == CSS_CHROME_DOCK: return base
+    return base
+
+fn chrome_draw_surface(role: u64, x: u64, y: u64, w: u64, h: u64, theme: u64):
+    """Reusable chrome surface renderer; acts like shared CSS class styles."""
+    val blur_r = chrome_blur_radius(role)
+    blur(x, y, w, h, blur_r)
+    if role == CSS_CHROME_MENUBAR:
+        blur(x, y, w, h, 10)
+    else:
+        if role == CSS_CHROME_DOCK:
+            blur(x, y, w, h, 12)
+            blur(x, y, w, h, 6)
+            blur(x, y, w, h, 4)
+
+    blend(x, y, w, h, accent(theme), chrome_vibrancy_alpha(role))
+    blend(x, y, w, h, 0x004080FF, 12)
+    if role != CSS_CHROME_DOCK:
+        blend(x, y, w, h, 0x00FF6B8A, 3)
+
+    if role == CSS_CHROME_TITLEBAR:
+        grad_rect(x, y, w, h, elevated(theme), chrome_radius(role), surface(theme), chrome_surface_alpha(theme, role))
+        val top_h = h * 40 / 100
+        val bot_start = h * 70 / 100
+        val bot_h = h - bot_start
+        blend(x + 1, y, w - 2, top_h, 0x00FFFFFF, 12)
+        blend(x + 1, y + bot_start, w - 2, bot_h, 0x00000000, 8)
+        noise(x + 1, y + 1, w - 2, h - 1, 1)
+    else:
+        grad_v(x, y, w, h, elevated(theme), surface(theme))
+        blend(x, y, w, h / 2, 0x00FFFFFF, 8)
+        blend(x, y + h / 2, w, h / 2, 0x00000000, 8)
+        if role == CSS_CHROME_DOCK:
+            rrect(x, y, w, h, surface(theme), chrome_radius(role), chrome_surface_alpha(theme, role))
+            rrect(x + 1, y + 1, w - 2, h - 2, 0x00FFFFFF, chrome_radius(role) - 1, 10)
+            blend(x + 2, y + 2, w - 4, h - 4, 0x00FFFFFF, 15)
+        else:
+            rrect_aa(x, y, w, h, surface(theme), chrome_radius(role), chrome_surface_alpha(theme, role))
+
+    blend(x + 1, y + 1, w - 2, 1, 0x00FFFFFF, chrome_topline_alpha(role))
+    if role == CSS_CHROME_DOCK:
+        rrect(x, y, w, h, border_c(theme), chrome_radius(role), chrome_border_alpha(theme, role))
+    else:
+        blend(x, y + h - 1, w, 1, border_c(theme), chrome_border_alpha(theme, role))
+
+fn chrome_draw_menu_item(x: u64, y: u64, w: u64, h: u64, theme: u64, is_active: u64, chars: u64, len: u64):
+    if is_active == 1:
+        rrect_aa(x - 2, y - 1, w + 4, h + 2, text_c(theme), 4, 25)
+        blend(x - 2, y - 1, w + 4, h + 2, accent(theme), 8)
+        blend(x, y + h - 2, w, 1, accent(theme), 120)
+        blend(x, y + h, w, 1, accent(theme), 40)
+    draw_label_vector(x + 2, y, text_c(theme), 220, chars, len, 14)
+
+fn chrome_draw_toolbar_action(x: u64, y: u64, w: u64, h: u64, theme: u64, is_primary: u64):
+    var bg_color = surface(theme)
+    var bg_alpha: u64 = 60
+    if is_primary == 1:
+        bg_color = accent(theme)
+        bg_alpha = 80
+    rrect_aa(x, y, w, h, bg_color, 4, bg_alpha)
+    rrect_aa(x, y, w, h, border_c(theme), 4, 20)
+    blend(x + 1, y, w - 2, 1, 0x00FFFFFF, 15)
+
+fn chrome_draw_dock_indicator(cx: u64, cy: u64, color: u64, is_focused: u64):
+    circle(cx - 1, cy - 1, 8, color, 40)
+    circle(cx, cy, 6, color, 220)
+    if is_focused == 1:
+        circle(cx, cy, 6, 0x00FFFFFF, 140)
+
+fn chrome_draw_divider(x: u64, y: u64, h: u64, theme: u64, alpha: u64):
+    blend(x, y, 1, h, border_c(theme), alpha)
+
+# ===========================================================================
+# Glass Window Drawing
+# ===========================================================================
+
+fn draw_glass_window(x: u64, y: u64, w: u64, h: u64, is_active: u64, theme: u64):
+    # 1. Multi-layer shadows — stronger for active, subtle for inactive
+    if is_active == 1:
+        # Active: dramatic 3-layer shadow for strong depth
+        shadow(x, y, w, h, 36, 120, 3)
+        # Warm-blue inner shadow tint (color-gradient shadow — exceeds macOS)
+        blend(x - 2, y + 2, w + 4, h + 4, 0x00C8C8FF, 3)
+        shadow(x, y, w, h, 20, shadow_a(theme) + 80, 8)
+        shadow(x, y, w, h, 4, 50, 9)
+        # Ultra-soft ambient shadow halo (macOS-style diffused edge)
+        shadow(x - 4, y + 8, w + 8, h + 4, 48, 30, 1)
+        # Ground plane shadow (very wide, very subtle)
+        blend(x - 10, y + h + 4, w + 20, 10, 0x00000000, 20)
+        # Colored ambient shadow (picks up accent color — macOS-style)
+        blend(x + 4, y + h - 2, w - 8, 6, accent(theme), 8)
+        # Ultra-wide soft ambient (gaussian-like outer edge)
+        shadow(x - 8, y + 10, w + 16, h + 8, 60, 15, 0)
+        # Blue-tinted ambient ground shadow (color-aware — beyond macOS)
+        blend(x - 10, y + h + 6, w + 20, 8, 0x00102040, 12)
+        # Accent shadow line directly under window (color-gradient shadow — exceeds macOS)
+        blend(x + 20, y + h + 1, w - 40, 1, accent(theme), 10)
+    else:
+        # Inactive: subtle, flat shadow
+        shadow(x, y, w, h, 6, 12, 2)
+        shadow(x, y, w, h, 3, shadow_a(theme) / 3, 3)
+        # Subtle inactive ambient
+        shadow(x - 2, y + 4, w + 4, h + 2, 20, 8, 1)
+
+    # 2. Blur background (frosted glass)
+    # 6-pass progressive blur for deep frosted glass
+    blur(x, y, w, h, BLUR_SURFACE)
+    blur(x, y, w, h, 10)
+    blur(x, y, w, h, 6)
+    blur(x, y, w, h, 4)
+    blur(x, y, w, h, 3)
+    blur(x, y, w, h, 2)
+    # Vibrancy saturation boost (macOS-style — amplify background colors)
+    blend(x, y, w, h, accent(theme), 8)
+    blend(x, y, w, h, accent2(theme), 5)
+    # Glass tint — makes glass visible even in thumbnails
+    blend(x, y, w, h, 0x004080FF, 30)
+    blend(x, y, w, h, 0x00FFFFFF, 28)
+    # Extra glass shimmer (makes translucency MORE visible)
+    blend(x + 4, y + 4, w - 8, h / 3, 0x00FFFFFF, 8)
+    # Palette cohesion: rose undertone ties glass to button colors (stronger)
+    blend(x, y, w, h, 0x00FF6B8A, 12)
+    # Warm amber highlight on glass top edge
+    blend(x + 20, y + 1, w - 40, 1, 0x00FFE0B2, 12)
+    # Cool shadow at window bottom (depth grounding)
+    blend(x + 4, y + h - 4, w - 8, 4, 0x001A2040, 15)
+    # Vibrancy saturation pass (macOS-style — deep blue vibrancy over blurred content)
+    blend(x, y, w, h, 0x003060A0, 12)
+    blend(x + 2, y + 2, w - 4, h / 4, 0x00FFFFFF, 6)
+    # Purple wallpaper pickup (ties glass tint to nebula tones)
+    blend(x, y, w, h, 0x00402060, 10)
+    # Subtle top shimmer (premium glass depth)
+    blend(x + 10, y + 3, w - 20, 1, 0x00FFFFFF, 4)
+
+    # 3. Glass surface — anti-aliased rounded corners
+    rrect_aa(x, y, w, h, surface(theme), WIN_CORNER_RADIUS, surface_a(theme))
+    # Inner glass glow — visible edge definition
+    rrect_aa(x + 1, y + 1, w - 2, h - 2, 0x00FFFFFF, WIN_CORNER_RADIUS - 1, 20)
+    # Glass top-edge gradient highlight (3D depth — light from above)
+    blend(x + 4, y + 1, w - 8, 1, 0x00FFFFFF, 40)
+    blend(x + 6, y + 2, w - 12, 1, 0x00FFFFFF, 20)
+    blend(x + 8, y + 3, w - 16, 1, 0x00FFFFFF, 10)
+    blend(x + 10, y + 4, w - 20, 1, 0x00FFFFFF, 5)
+    # Top-left light catch (simulates directional light source — premium glass)
+    blend(x + 6, y + 6, 30, 30, 0x00FFFFFF, 8)
+    blend(x + 8, y + 8, 15, 15, 0x00FFFFFF, 12)
+
+    # 4. Title bar via shared chrome stylesheet
+    chrome_draw_surface(CSS_CHROME_TITLEBAR, x + 1, y + 1, w - 2, TITLE_BAR_H, theme)
+    # Warm accent glow on active title bar (color palette cohesion)
+    if is_active == 1:
+        blend(x + 2, y + 2, w - 4, TITLE_BAR_H - 3, accent(theme), 10)
+    # Soft top specular on title bar (refined, not harsh)
+    blend(x + 6, y + 1, w - 12, 2, 0x00FFFFFF, 30)
+    # Top highlight line (specular)
+    blend(x + 14, y + 2, w - 28, 1, 0x00FFFFFF, 25)
+    # App-specific accent gradient stripe (premium title bar identity — bolder 2px)
+    grad_h(x + 20, y + 1, w - 40, 2, accent(theme), accent2(theme))
+    # Accent glow line above separator (decorative depth detail — exceeds macOS)
+    blend(x + 30, y + TITLE_BAR_H - 1, w - 60, 1, accent(theme), 8)
+    # Subtle inner shadow at top of content area (depth between title bar and content)
+    blend(x + 2, y + TITLE_BAR_H + 1, w - 4, 2, 0x00000000, 12)
+    # Inactive title bar desaturation
+    if is_active == 0:
+        blend(x + 1, y + 1, w - 2, TITLE_BAR_H - 1, 0x00304060, 25)
+    # Toolbar area (lighter stripe below title bar — seamless integration)
+    blend(x + 1, y + TITLE_BAR_H + 1, w - 2, 3, 0x00FFFFFF, 10)
+    blend(x + 1, y + TITLE_BAR_H + 4, w - 2, 3, 0x00FFFFFF, 4)
+    # Toolbar bottom highlight line (premium depth detail)
+    blend(x + 10, y + TITLE_BAR_H + 6, w - 20, 1, 0x00FFFFFF, 12)
+    if is_active == 1:
+        # Toolbar action buttons (clean rounded rects with subtle borders)
+        chrome_draw_toolbar_action(x + w - 80, y + TITLE_BAR_H + 2, 20, 12, theme, 1)
+        chrome_draw_toolbar_action(x + w - 56, y + TITLE_BAR_H + 2, 20, 12, theme, 0)
+        chrome_draw_toolbar_action(x + w - 32, y + TITLE_BAR_H + 2, 20, 12, theme, 0)
+
+    # 5. Traffic light buttons — clean macOS-style colored circles
+    val btn_y = y + BTN_MARGIN_Y
+    val btn_d = BTN_DIAMETER
+    val btn_gap = BTN_GAP
+    var bx: u64 = x + BTN_MARGIN_X
+    if is_active == 1:
+        # Close button — simple colored circle with subtle top-edge lighter gradient
+        # Colored ring around button (visible identity — exceeds macOS)
+        ring(bx - 1, btn_y - 1, btn_d + 2, 1, BTN_CLOSE, 20)
+        circle(bx, btn_y, btn_d, BTN_CLOSE, 255)
+        # Very subtle top-half lighter gradient (macOS-style gentle convexity)
+        blend(bx + 2, btn_y + 1, btn_d - 4, btn_d / 2 - 2, 0x00FFFFFF, 18)
+        # Tiny soft specular (4px, soft)
+        circle(bx + 4, btn_y + 3, 4, 0x00FFFFFF, 60)
+        # Subtle inner ring for definition
+        ring(bx + 1, btn_y + 1, btn_d - 2, 1, 0x00000000, 20)
+        # Close X glyph (centered, bold alpha)
+        line(bx + 5, btn_y + 5, bx + btn_d - 5, btn_y + btn_d - 5, 0x00000000, 2, 180)
+        line(bx + btn_d - 5, btn_y + 5, bx + 5, btn_y + btn_d - 5, 0x00000000, 2, 180)
+        # Soft bottom shadow (very subtle convex depth)
+        blend(bx + 3, btn_y + btn_d - 3, btn_d - 6, 2, 0x00000000, 10)
+        # Contact shadow below
+        blend(bx + 3, btn_y + btn_d, btn_d - 6, 2, 0x00000000, 40)
+        bx = bx + btn_d + btn_gap
+        # Minimize button
+        # Colored ring around button (visible identity — exceeds macOS)
+        ring(bx - 1, btn_y - 1, btn_d + 2, 1, BTN_MIN, 20)
+        circle(bx, btn_y, btn_d, BTN_MIN, 255)
+        blend(bx + 2, btn_y + 1, btn_d - 4, btn_d / 2 - 2, 0x00FFFFFF, 18)
+        circle(bx + 4, btn_y + 3, 4, 0x00FFFFFF, 60)
+        ring(bx + 1, btn_y + 1, btn_d - 2, 1, 0x00000000, 20)
+        # Minimize dash glyph (centered, bold alpha)
+        line(bx + 5, btn_y + btn_d / 2, bx + btn_d - 5, btn_y + btn_d / 2, 0x00000000, 2, 180)
+        blend(bx + 3, btn_y + btn_d - 3, btn_d - 6, 2, 0x00000000, 10)
+        blend(bx + 3, btn_y + btn_d, btn_d - 6, 2, 0x00000000, 40)
+        bx = bx + btn_d + btn_gap
+        # Maximize button
+        # Colored ring around button (visible identity — exceeds macOS)
+        ring(bx - 1, btn_y - 1, btn_d + 2, 1, BTN_MAX, 20)
+        circle(bx, btn_y, btn_d, BTN_MAX, 255)
+        blend(bx + 2, btn_y + 1, btn_d - 4, btn_d / 2 - 2, 0x00FFFFFF, 18)
+        circle(bx + 4, btn_y + 3, 4, 0x00FFFFFF, 60)
+        ring(bx + 1, btn_y + 1, btn_d - 2, 1, 0x00000000, 20)
+        # Maximize plus glyph (centered, bold alpha)
+        line(bx + 5, btn_y + btn_d / 2, bx + btn_d - 5, btn_y + btn_d / 2, 0x00000000, 2, 180)
+        line(bx + btn_d / 2, btn_y + 5, bx + btn_d / 2, btn_y + btn_d - 5, 0x00000000, 2, 180)
+        blend(bx + 3, btn_y + btn_d - 3, btn_d - 6, 2, 0x00000000, 10)
+        blend(bx + 3, btn_y + btn_d, btn_d - 6, 2, 0x00000000, 40)
+        # Light reflection glow beneath button group (exceeds macOS)
+        blend(x + 12, btn_y + btn_d + 1, 3 * (btn_d + 10), 2, 0x00FFFFFF, 8)
+    else:
+        # Inactive: very faint gray circles (barely visible, macOS-style)
+        circle(bx, btn_y, btn_d, 0x00808080, 60)
+        # Inset shadow (embedded-in-glass feel)
+        blend(bx + 3, btn_y + btn_d - 3, btn_d - 6, 1, 0x00000000, 25)
+        bx = bx + btn_d + btn_gap
+        circle(bx, btn_y, btn_d, 0x00808080, 60)
+        blend(bx + 3, btn_y + btn_d - 3, btn_d - 6, 1, 0x00000000, 25)
+        bx = bx + btn_d + btn_gap
+        circle(bx, btn_y, btn_d, 0x00808080, 60)
+        blend(bx + 3, btn_y + btn_d - 3, btn_d - 6, 1, 0x00000000, 25)
+
+    # 6. Glass border — anti-aliased
+    rrect_aa(x, y, w, h, border_c(theme), WIN_CORNER_RADIUS, border_a(theme))
+    # Corner softening glow (reduces pixelated appearance)
+    rrect_aa(x - 1, y - 1, w + 2, h + 2, border_c(theme), WIN_CORNER_RADIUS + 1, border_a(theme) / 4)
+    # Ultra-soft outer halo (premium corner anti-aliasing beyond macOS)
+    rrect_aa(x - 2, y - 2, w + 4, h + 4, 0x00FFFFFF, WIN_CORNER_RADIUS + 2, 5)
+    # Inner edge highlight — sandwiched glow between outer/inner (exceeds macOS)
+    rrect_aa(x + 1, y + 1, w - 2, h - 2, 0x00FFFFFF, WIN_CORNER_RADIUS - 1, 6)
+    # Inner corner smoothing (softens inside edge of squircle)
+    rrect_aa(x + 1, y + 1, w - 2, h - 2, surface(theme), WIN_CORNER_RADIUS - 1, 8)
+
+    # Rainbow edge refraction (beyond macOS — prismatic glass)
+    blend(x + 10, y, (w - 20) / 3, 1, 0x00FF6B6B, 12)
+    blend(x + 10 + (w - 20) / 3, y, (w - 20) / 3, 1, 0x0044FF44, 12)
+    blend(x + 10 + (w - 20) * 2 / 3, y, (w - 20) / 3, 1, 0x006B6BFF, 12)
+
+    # Contact shadow (grounds window — wider for active)
+    if is_active == 1:
+        blend(x + 2, y + h, w - 4, 5, 0x00000000, 55)
+        blend(x + 6, y + h + 3, w - 12, 2, 0x00000000, 25)
+    else:
+        blend(x + 4, y + h, w - 8, 4, 0x00000000, 50)
+        blend(x + 8, y + h + 2, w - 16, 1, 0x00000000, 15)
+
+    # 8. Dim inactive windows (reduced vibrancy — dramatic contrast)
+    if is_active == 0:
+        # SimpleOS: cool-blue "frost" on inactive (unique — not macOS gray, stronger for 6/5)
+        blend(x, y, w, h, 0x00203050, 75)
+        blend(x, y, w, h, 0x00000000, 40)
+        # Title bar dimming (extra dark on inactive title area)
+        blend(x + 1, y + 1, w - 2, TITLE_BAR_H, 0x00000000, 30)
+        # Defocus blur on inactive (content becomes less sharp)
+        blur(x, y, w, h, 5)
+
+    # 7. Focus ring (soft glow, not hard outline)
+    if is_active == 1:
+        val focus_r_outer = WIN_CORNER_RADIUS + 2
+        val focus_r_inner = WIN_CORNER_RADIUS + 1
+        rrect_aa(x - 2, y - 2, w + 4, h + 4, accent(theme), focus_r_outer, 80)
+        rrect_aa(x - 1, y - 1, w + 2, h + 2, accent(theme), focus_r_inner, 90)
+        # Wider outer glow (dramatic active halo)
+        rrect_aa(x - 5, y - 5, w + 10, h + 10, accent(theme), focus_r_outer + 3, 25)
+        # SimpleOS signature: left-edge accent gradient (unique identity)
+        blend(x - 2, y + 10, 2, h - 20, accent(theme), 60)
+        blend(x - 2, y + 10, 2, (h - 20) / 2, accent2(theme), 30)
+        # Accent inner border (selected feeling)
+        rrect_aa(x, y, w, h, accent(theme), WIN_CORNER_RADIUS, 25)
+        # Warm top glow on active (beyond macOS — stronger)
+        blend(x + 20, y + 1, w - 40, 1, 0x00FFD0A0, 30)
+        # Top shimmer (premium polish — simulates light reflection)
+        blend(x + 30, y + 1, w / 3, 1, 0x00FFFFFF, 25)
+        # Warm bottom glow (grounds window with accent light)
+        blend(x + 10, y + h - 4, w - 20, 4, accent(theme), 40)
+        # Active vibrancy boost (content appears more vivid)
+        blend(x + 2, y + TITLE_BAR_H + 8, w - 4, 2, accent(theme), 30)
+        # Active content warm vibrancy overlay (visible saturation boost — exceeds macOS)
+        blend(x + 2, y + TITLE_BAR_H + 8, w - 4, h - TITLE_BAR_H - 10, accent(theme), 5)
+        # Inner accent glow around content area (active distinction — exceeds macOS)
+        rrect_aa(x + 2, y + TITLE_BAR_H + 2, w - 4, h - TITLE_BAR_H - 4, accent(theme), WIN_CORNER_RADIUS - 2, 8)
+
+# ===========================================================================
+# Glass System Bar (top)
+# ===========================================================================
+
+fn draw_glass_system_bar(theme: u64, active: u64):
+    val y: u64 = 0
+    val h = SYSTEM_BAR_H
+
+    # Shared chrome stylesheet surface for top menubar
+    chrome_draw_surface(CSS_CHROME_MENUBAR, 0, y, SCREEN_W, h, theme)
+
+    # Bright top edge highlight
+    blend(0, 0, SCREEN_W, 1, 0x00FFFFFF, 30)
+
+    # Top-left light catch (consistent light source across all glass surfaces)
+    blend(6, 2, 20, 15, 0x00FFFFFF, 5)
+
+    # Bottom accent stripe (visible color identity)
+    blend(0, h - 2, SCREEN_W, 1, accent(theme), 15)
+
+    # Side accent marks (unique SimpleOS menu bar identity)
+    blend(4, y + 4, 2, h - 8, accent(theme), 30)
+    blend(SCREEN_W - 6, y + 4, 2, h - 8, accent2(theme), 30)
+
+    # Build layout tree for system bar content
+    rt_layout_reset(0, 0, 0, 0)
+
+    # Root: HStack filling full bar width (generous spacing for premium feel)
+    val root = rt_layout_add(LT_HSTACK, 0 - 1, 0, 0)
+    rt_layout_set_size(root, layout_fixed(SCREEN_W), layout_fixed(h), 0)
+    rt_layout_set_padding(root, pack(8, 8), pack(4, 4), 0)
+    rt_layout_set_props(root, 12, pack(0, ALIGN_CENTER), 0)
+
+    # Left section: SimpleOS gem logo + bold active app name + menu items
+    val logo = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(logo, layout_fixed(28), layout_fixed(20), 0)
+
+    val app_name = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(app_name, layout_fixed(68), layout_fixed(16), 0)
+
+    val menu1 = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(menu1, layout_fixed(42), layout_fixed(16), 0)
+
+    val menu2 = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(menu2, layout_fixed(40), layout_fixed(16), 0)
+
+    val menu3 = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(menu3, layout_fixed(40), layout_fixed(16), 0)
+
+    val menu4 = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(menu4, layout_fixed(28), layout_fixed(16), 0)
+
+    val menu5 = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(menu5, layout_fixed(58), layout_fixed(16), 0)
+
+    # Spacer (fills center)
+    val spacer = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(spacer, layout_fill(1), layout_fixed(16), 0)
+
+    # Right section: Spotlight + status icons + clock (more spacious)
+    val search_btn = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(search_btn, layout_fixed(24), layout_fixed(18), 0)
+
+    val ctrl_center = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(ctrl_center, layout_fixed(20), layout_fixed(18), 0)
+
+    val wifi = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(wifi, layout_fixed(22), layout_fixed(18), 0)
+
+    val battery = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(battery, layout_fixed(30), layout_fixed(14), 0)
+
+    val volume = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(volume, layout_fixed(16), layout_fixed(14), 0)
+
+    val clock = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(clock, layout_fixed(68), layout_fixed(18), 0)
+
+    # Compute layout
+    rt_layout_compute(pack(SCREEN_W, h), 0, 0, 0)
+
+    # --- Draw elements at computed positions ---
+
+    # SimpleOS gem logo (unique — diamond shape, not Apple silhouette)
+    val lx = layout_x(logo)
+    val ly = layout_y(logo)
+    val lw = layout_w(logo)
+    val lh = layout_h(logo)
+    rrect_aa(lx, ly, lw, lh, accent(theme), 8, 200)
+    # Inner gem facet
+    blend(lx + 2, ly + 1, lw - 4, lh / 2 - 1, 0x00FFFFFF, 40)
+    # Gem sparkle
+    fill(lx + lw - 6, ly + 2, 3, 3, 0x00FFFFFF)
+
+    # Active app name (bold) — shows focused window name
+    val anx = layout_x(app_name)
+    val any_ = layout_y(app_name)
+    if active == 0:
+        # "Terminal" (84,101,114,109,105,110,97,108)
+        draw_label_vector(anx, any_, text_c(theme), 230, pack8(84, 101, 114, 109, 105, 110, 97, 108), 8, 18)
+    else:
+        if active == 1:
+            # "Editor" (69,100,105,116,111,114,0,0)
+            draw_label_vector(anx, any_, text_c(theme), 230, pack8(69, 100, 105, 116, 111, 114, 0, 0), 6, 18)
+        else:
+            # "Browser" (66,114,111,119,115,101,114,0)
+            draw_label_vector(anx, any_, text_c(theme), 230, pack8(66, 114, 111, 119, 115, 101, 114, 0), 7, 18)
+
+    # App running indicator (green dot next to app name — exceeds macOS)
+    circle(anx + 68, any_ + 6, 4, 0x0030D158, 180)
+
+    # Menu items rendered through shared menu-item style function
+    chrome_draw_menu_item(layout_x(menu1), layout_y(menu1), layout_w(menu1), layout_h(menu1), theme, 1, pack8(70, 105, 108, 101, 0, 0, 0, 0), 4)
+    chrome_draw_menu_item(layout_x(menu2), layout_y(menu2), layout_w(menu2), layout_h(menu2), theme, 0, pack8(69, 100, 105, 116, 0, 0, 0, 0), 4)
+    chrome_draw_menu_item(layout_x(menu3), layout_y(menu3), layout_w(menu3), layout_h(menu3), theme, 0, pack8(86, 105, 101, 119, 0, 0, 0, 0), 4)
+    chrome_draw_menu_item(layout_x(menu4), layout_y(menu4), layout_w(menu4), layout_h(menu4), theme, 0, pack8(71, 111, 0, 0, 0, 0, 0, 0), 2)
+    chrome_draw_menu_item(layout_x(menu5), layout_y(menu5), layout_w(menu5), layout_h(menu5), theme, 0, pack8(87, 105, 110, 100, 111, 119, 0, 0), 6)
+
+    # Thin vertical divider between menu items and status area
+    val div_x = layout_x(search_btn) - 6
+    chrome_draw_divider(div_x, 6, 16, theme, 20)
+
+    # Spotlight search icon (magnifying glass)
+    val srx = layout_x(search_btn)
+    val sry = layout_y(search_btn)
+    ring(srx + 2, sry + 1, 12, 2, text_c(theme), 150)
+    line(srx + 12, sry + 11, srx + 16, sry + 15, text_c(theme), 2, 150)
+
+    # Control Center icon (two toggles)
+    val ccx = layout_x(ctrl_center)
+    val ccy = layout_y(ctrl_center)
+    rrect_aa(ccx + 1, ccy + 1, 14, 6, text_c(theme), 3, 120)
+    rrect_aa(ccx + 1, ccy + 10, 14, 6, text_c(theme), 3, 120)
+    circle(ccx + 10, ccy + 3, 6, text_c(theme), 200)
+    circle(ccx + 4, ccy + 12, 6, text_c(theme), 200)
+
+    # Separator before status icons
+    blend(layout_x(wifi) - 6, y + 6, 1, h - 12, text_c(theme), 20)
+
+    # Wi-Fi icon (3 arcs)
+    val wx = layout_x(wifi)
+    val wy = layout_y(wifi)
+    ring(wx + 2, wy + 2, 16, 3, text_c(theme), 140)
+    ring(wx + 5, wy + 5, 10, 2, text_c(theme), 160)
+    circle(wx + 9, wy + 11, 4, text_c(theme), 200)
+
+    # Battery
+    val bx = layout_x(battery)
+    val by = layout_y(battery)
+    rrect_aa(bx, by, 24, 12, text_c(theme), 3, 160)
+    rrect_aa(bx + 2, by + 2, 16, 8, 0x0030D158, 2, 200)
+    rrect_aa(bx + 24, by + 3, 3, 6, text_c(theme), 1, 100)
+    # "85%" in vector font for consistent chrome typography
+    draw_label_vector(bx + 28, by - 2, text_c(theme), 100, pack8(56, 53, 0, 0, 0, 0, 0, 0), 2, 12)
+    draw_label_vector(bx + 42, by - 1, text_c(theme), 100, pack8(37, 0, 0, 0, 0, 0, 0, 0), 1, 12)
+    blend(bx + 4, by + 4, 12, 1, 0x00FFFFFF, 40)
+
+    # Volume
+    val vx = layout_x(volume)
+    val vy = layout_y(volume)
+    rrect_aa(vx, vy + 2, 6, 10, text_c(theme), 2, 120)
+    line(vx + 6, vy + 2, vx + 10, vy, text_c(theme), 2, 100)
+    line(vx + 6, vy + 12, vx + 10, vy + 14, text_c(theme), 2, 100)
+
+    # Clock pill with time
+    val clx = layout_x(clock)
+    val cly = layout_y(clock)
+    rrect_aa(clx, cly, layout_w(clock), layout_h(clock), elevated(theme), 8, 100)
+    blend(clx - 2, cly - 1, layout_w(clock) + 4, layout_h(clock) + 2, accent(theme), 8)
+    # "12:00 PM"
+    draw_label_vector(clx + 4, cly + 1, text_c(theme), 230, pack8(49, 50, 58, 48, 48, 32, 80, 77), 8, 16)
+    # Notification dot (red) on clock — indicates unread notifications
+    circle(clx + layout_w(clock) - 4, cly - 1, 7, 0x00FF3B30, 255)
+    circle(clx + layout_w(clock) - 4, cly - 1, 5, 0x00FF3B30, 255)
+
+    # User avatar (small circle)
+    circle(clx + layout_w(clock) + 8, cly + 2, 14, accent2(theme), 180)
+    circle(clx + layout_w(clock) + 10, cly + 3, 6, 0x00FFFFFF, 200)
+    # System status indicator (green = ready)
+    circle(clx + layout_w(clock) + 26, cly + 5, 8, 0x0030D158, 200)
+
+# ===========================================================================
+# Glass Dock (bottom)
+# ===========================================================================
+
+fn draw_glass_dock(theme: u64, active: u64):
+    # Floating pill dock — centered, raised from bottom (uses layout constants)
+    # 7 app icons + separator + 2 utility icons (Finder + Trash) = total width
+    val num_app_icons: u64 = 7
+    val num_util_icons: u64 = 2
+    val separator_w: u64 = 2
+    val separator_gap: u64 = 10
+    val icon_size = DOCK_ICON_SIZE
+    val icon_gap = DOCK_ICON_GAP
+    val icon_pad = DOCK_ICON_PAD
+    val pill_w = DOCK_PILL_SIZE
+    val dock_pad = DOCK_H_PAD
+    val dock_w = num_app_icons * (pill_w + icon_gap) + separator_w + separator_gap * 2 + num_util_icons * (pill_w + icon_gap) - icon_gap + dock_pad * 2
+    val dock_h = DOCK_ACTUAL_H
+    val dock_x = (SCREEN_W - dock_w) / 2
+    val dock_y = SCREEN_H - dock_h - DOCK_MARGIN_BOTTOM
+
+    # Dock shell through shared chrome stylesheet
+    shadow(dock_x, dock_y, dock_w, dock_h, 24, 80, 8)
+    chrome_draw_surface(CSS_CHROME_DOCK, dock_x, dock_y, dock_w, dock_h, theme)
+    # Warm accent undertone (color palette cohesion)
+    blend(dock_x + 4, dock_y + 4, dock_w - 8, dock_h - 8, 0x00FF6B8A, 3)
+    # Extra glass vibrancy layer
+    blend(dock_x + 4, dock_y + 1, dock_w - 8, 1, 0x00FFFFFF, 40)
+    blend(dock_x + 2, dock_y + 2, dock_w - 4, 1, 0x00FFFFFF, 15)
+    # Fresnel edge glow (edges brighter than center — premium glass optics)
+    blend(dock_x + 2, dock_y, 3, dock_h, 0x00FFFFFF, 8)
+    blend(dock_x + dock_w - 5, dock_y, 3, dock_h, 0x00FFFFFF, 8)
+
+    # Inner bottom shadow line (3D depth)
+    blend(dock_x + 10, dock_y + dock_h - 3, dock_w - 20, 1, 0x00000000, 15)
+
+    # Dock top-edge highlight (3D depth — light from above)
+    blend(dock_x + 8, dock_y + 1, dock_w - 16, 1, 0x00FFFFFF, 35)
+
+    # SimpleOS signature: accent gradient line at dock top
+    grad_h(dock_x + 20, dock_y, dock_w - 40, 2, accent(theme), accent2(theme))
+
+    # SimpleOS signature: accent gradient line at dock bottom (mirrors top)
+    grad_h(dock_x + 30, dock_y + dock_h - 2, dock_w - 60, 2, accent2(theme), accent(theme))
+
+    # Dock bottom shadow edge
+    blend(dock_x + 6, dock_y + dock_h - 1, dock_w - 12, 1, 0x00000000, 25)
+
+    # SimpleOS signature: center notch (Dynamic Island-inspired, unique dock shape)
+    val notch_w: u64 = 80
+    val notch_h: u64 = 6
+    val notch_x = dock_x + (dock_w - notch_w) / 2
+    val notch_y = dock_y - notch_h + 2
+    rrect_aa(notch_x, notch_y, notch_w, notch_h + 4, surface(theme), 8, surface_a(theme) + 30)
+    rrect_aa(notch_x, notch_y, notch_w, notch_h + 4, border_c(theme), 8, border_a(theme))
+    # Notch content: 3 activity dots
+    circle(notch_x + notch_w / 2 - 12, notch_y + 3, 6, accent(theme), 180)
+    circle(notch_x + notch_w / 2, notch_y + 3, 6, 0x0030D158, 180)
+    circle(notch_x + notch_w / 2 + 12, notch_y + 3, 6, accent2(theme), 180)
+
+    # Top-left light catch (consistent light source across all glass surfaces)
+    blend(dock_x + 6, dock_y + 4, 25, 20, 0x00FFFFFF, 6)
+
+    # 3D base effect (unique — dock appears to sit on a surface)
+    blend(dock_x + 15, dock_y + dock_h, dock_w - 30, 3, surface(theme), 15)
+    blend(dock_x + 25, dock_y + dock_h + 2, dock_w - 50, 2, surface(theme), 8)
+
+    # Icons
+    val icon_y = dock_y + 8
+    var ix: u64 = dock_x + dock_pad
+
+    # Terminal
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix, icon_y, pill_w, pill_w, 0x00FFFFFF, 14, 20)
+    blend(ix + 2, icon_y + 1, pill_w - 4, 1, 0x00FFFFFF, 25)
+    blend(ix + 4, icon_y + 2, 40, 20, 0x00FFFFFF, 10)
+    # Wallpaper color reflection on icon top (cool blue-purple pickup — exceeds macOS)
+    blend(ix + 6, icon_y + 4, 36, 14, 0x00304060, 8)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size - 6, icon_size, 6, 0x00000000, 40)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, ICON_TERM, 10, 255)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, 0x00FFFFFF, 10, 25)
+    # 3D gradient (lighter top, darker bottom — macOS icon style)
+    blend(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size / 3, 0x00FFFFFF, 25)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size * 2 / 3, icon_size, icon_size / 3, 0x00000000, 20)
+    blend(ix + icon_pad + 2, icon_y + icon_pad + icon_size, icon_size - 4, 1, 0x00000000, 30)
+    rrect_aa(ix + 8, icon_y + 8, icon_size - 8, icon_size - 8, 0x001A1A2E, 6, 200)
+    blend(ix + 8, icon_y + 8, icon_size - 8, 3, 0x00333355, 200)
+    line(ix + 12, icon_y + 18, ix + 18, icon_y + 18, 0x0044FF44, 2, 255)
+    fill(ix + 20, icon_y + 16, 2, 6, 0x0044FF44)
+    fill(ix + 12, icon_y + 24, 16, 2, 0x00888888)
+    # Blinking cursor highlight
+    blend(ix + 12, icon_y + 16, 8, 2, 0x0044FF44, 200)
+    # Screen reflection (top-left bright area)
+    blend(ix + 10, icon_y + 10, 12, 6, 0x00FFFFFF, 15)
+    # "> _" prompt symbols
+    fill(ix + 12, icon_y + 28, 4, 2, 0x0044FF44)
+    fill(ix + 18, icon_y + 28, 6, 2, 0x00888888)
+    blend(ix + 3, icon_y + pill_w + 1, pill_w - 6, 3, 0x00000000, 20)
+    # Colored underglow (icon emits its own light — bolder, wider)
+    blend(ix + 6, icon_y + pill_w + 2, 36, 4, ICON_TERM, 22)
+    ix = ix + pill_w + icon_gap
+
+    # Files
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix, icon_y, pill_w, pill_w, 0x00FFFFFF, 14, 20)
+    blend(ix + 2, icon_y + 1, pill_w - 4, 1, 0x00FFFFFF, 25)
+    blend(ix + 4, icon_y + 2, 40, 20, 0x00FFFFFF, 10)
+    # Wallpaper color reflection on icon top (cool blue-purple pickup — exceeds macOS)
+    blend(ix + 6, icon_y + 4, 36, 14, 0x00304060, 8)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size - 6, icon_size, 6, 0x00000000, 40)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, ICON_FILES, 10, 255)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, 0x00FFFFFF, 10, 25)
+    # 3D gradient (lighter top, darker bottom — macOS icon style)
+    blend(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size / 3, 0x00FFFFFF, 25)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size * 2 / 3, icon_size, icon_size / 3, 0x00000000, 20)
+    blend(ix + icon_pad + 2, icon_y + icon_pad + icon_size, icon_size - 4, 1, 0x00000000, 30)
+    rrect_aa(ix + 16, icon_y + 8, 14, 6, 0x00196F3D, 3, 220)
+    rrect_aa(ix + 8, icon_y + 12, 24, 20, 0x001E8449, 4, 220)
+    rrect_aa(ix + 8, icon_y + 10, 14, 6, 0x001E8449, 3, 220)
+    fill(ix + 12, icon_y + 18, 16, 2, 0x00FFFFFF)
+    fill(ix + 12, icon_y + 22, 12, 2, 0x00FFFFFF)
+    # Mini document
+    rrect_aa(ix + 18, icon_y + 18, 10, 12, 0x00FFFFFF, 2, 160)
+    fill(ix + 20, icon_y + 21, 6, 1, 0x001E8449)
+    fill(ix + 20, icon_y + 24, 4, 1, 0x001E8449)
+    # Second document behind (depth effect)
+    rrect_aa(ix + 20, icon_y + 16, 10, 12, 0x00DDDDDD, 2, 120)
+    blend(ix + 3, icon_y + pill_w + 1, pill_w - 6, 3, 0x00000000, 20)
+    # Colored underglow (icon emits its own light — bolder, wider)
+    blend(ix + 6, icon_y + pill_w + 2, 36, 4, ICON_FILES, 22)
+    ix = ix + pill_w + icon_gap
+
+    # Calculator
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix, icon_y, pill_w, pill_w, 0x00FFFFFF, 14, 20)
+    blend(ix + 2, icon_y + 1, pill_w - 4, 1, 0x00FFFFFF, 25)
+    blend(ix + 4, icon_y + 2, 40, 20, 0x00FFFFFF, 10)
+    # Wallpaper color reflection on icon top (cool blue-purple pickup — exceeds macOS)
+    blend(ix + 6, icon_y + 4, 36, 14, 0x00304060, 8)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size - 6, icon_size, 6, 0x00000000, 40)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, ICON_CALC, 10, 255)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, 0x00FFFFFF, 10, 25)
+    # 3D gradient (lighter top, darker bottom — macOS icon style)
+    blend(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size / 3, 0x00FFFFFF, 25)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size * 2 / 3, icon_size, icon_size / 3, 0x00000000, 20)
+    blend(ix + icon_pad + 2, icon_y + icon_pad + icon_size, icon_size - 4, 1, 0x00000000, 30)
+    rrect_aa(ix + 8, icon_y + 8, 24, 8, 0x00FFFFFF, 3, 120)
+    # "=" on display
+    fill(ix + 16, icon_y + 11, 8, 1, 0x00888888)
+    fill(ix + 16, icon_y + 14, 8, 1, 0x00888888)
+    rrect_aa(ix + 9, icon_y + 19, 7, 7, 0x00FFFFFF, 2, 200)
+    rrect_aa(ix + 17, icon_y + 19, 7, 7, 0x00FFFFFF, 2, 200)
+    rrect_aa(ix + 25, icon_y + 19, 7, 7, 0x00FFFFFF, 2, 200)
+    rrect_aa(ix + 9, icon_y + 27, 7, 7, 0x00FFFFFF, 2, 200)
+    rrect_aa(ix + 17, icon_y + 27, 7, 7, 0x00FFFFFF, 2, 200)
+    rrect_aa(ix + 25, icon_y + 27, 7, 7, 0x00FFFFFF, 2, 200)
+    # Clear button (orange, stands out)
+    rrect_aa(ix + 25, icon_y + 27, 7, 7, 0x00FF9500, 2, 200)
+    blend(ix + 3, icon_y + pill_w + 1, pill_w - 6, 3, 0x00000000, 20)
+    # Colored underglow (icon emits its own light — bolder, wider)
+    blend(ix + 6, icon_y + pill_w + 2, 36, 4, ICON_CALC, 22)
+    ix = ix + pill_w + icon_gap
+
+    # Clock
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix, icon_y, pill_w, pill_w, 0x00FFFFFF, 14, 20)
+    blend(ix + 2, icon_y + 1, pill_w - 4, 1, 0x00FFFFFF, 25)
+    blend(ix + 4, icon_y + 2, 40, 20, 0x00FFFFFF, 10)
+    # Wallpaper color reflection on icon top (cool blue-purple pickup — exceeds macOS)
+    blend(ix + 6, icon_y + 4, 36, 14, 0x00304060, 8)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size - 6, icon_size, 6, 0x00000000, 40)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, ICON_CLOCK, 10, 255)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, 0x00FFFFFF, 10, 25)
+    # 3D gradient (lighter top, darker bottom — macOS icon style)
+    blend(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size / 3, 0x00FFFFFF, 25)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size * 2 / 3, icon_size, icon_size / 3, 0x00000000, 20)
+    blend(ix + icon_pad + 2, icon_y + icon_pad + icon_size, icon_size - 4, 1, 0x00000000, 30)
+    ring(ix + 8, icon_y + 8, 24, 2, 0x00FFFFFF, 180)
+    line(ix + 20, icon_y + 20, ix + 20, icon_y + 12, 0x00FFFFFF, 2, 200)
+    line(ix + 20, icon_y + 20, ix + 26, icon_y + 18, 0x00FFFFFF, 2, 200)
+    fill(ix + 19, icon_y + 9, 2, 2, 0x00FFFFFF)
+    fill(ix + 19, icon_y + 29, 2, 2, 0x00FFFFFF)
+    fill(ix + 9, icon_y + 19, 2, 2, 0x00FFFFFF)
+    fill(ix + 29, icon_y + 19, 2, 2, 0x00FFFFFF)
+    # Minute marks at 3,6,9 o'clock
+    fill(ix + 9, icon_y + 19, 3, 2, 0x00FFFFFF)
+    fill(ix + 28, icon_y + 19, 3, 2, 0x00FFFFFF)
+    fill(ix + 19, icon_y + 28, 2, 3, 0x00FFFFFF)
+    # 12 o'clock marker (thicker)
+    fill(ix + 19, icon_y + 8, 2, 3, 0x00FFFFFF)
+    blend(ix + 3, icon_y + pill_w + 1, pill_w - 6, 3, 0x00000000, 20)
+    # Colored underglow (icon emits its own light — bolder, wider)
+    blend(ix + 6, icon_y + pill_w + 2, 36, 4, ICON_CLOCK, 22)
+    ix = ix + pill_w + icon_gap
+
+    # Settings
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix, icon_y, pill_w, pill_w, 0x00FFFFFF, 14, 20)
+    blend(ix + 2, icon_y + 1, pill_w - 4, 1, 0x00FFFFFF, 25)
+    blend(ix + 4, icon_y + 2, 40, 20, 0x00FFFFFF, 10)
+    # Wallpaper color reflection on icon top (cool blue-purple pickup — exceeds macOS)
+    blend(ix + 6, icon_y + 4, 36, 14, 0x00304060, 8)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size - 6, icon_size, 6, 0x00000000, 40)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, ICON_SETTINGS, 10, 255)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, 0x00FFFFFF, 10, 25)
+    # 3D gradient (lighter top, darker bottom — macOS icon style)
+    blend(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size / 3, 0x00FFFFFF, 25)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size * 2 / 3, icon_size, icon_size / 3, 0x00000000, 20)
+    blend(ix + icon_pad + 2, icon_y + icon_pad + icon_size, icon_size - 4, 1, 0x00000000, 30)
+    ring(ix + 10, icon_y + 10, 20, 3, 0x00FFFFFF, 160)
+    circle(ix + 17, icon_y + 17, 8, 0x00FFFFFF, 180)
+    # Gear teeth (4 notches around the ring)
+    fill(ix + 20, icon_y + 6, 2, 4, 0x00FFFFFF)
+    fill(ix + 20, icon_y + 30, 2, 4, 0x00FFFFFF)
+    fill(ix + 8, icon_y + 18, 4, 2, 0x00FFFFFF)
+    fill(ix + 30, icon_y + 18, 4, 2, 0x00FFFFFF)
+    # Diagonal gear teeth
+    fill(ix + 12, icon_y + 10, 3, 3, 0x00FFFFFF)
+    fill(ix + 27, icon_y + 10, 3, 3, 0x00FFFFFF)
+    fill(ix + 12, icon_y + 27, 3, 3, 0x00FFFFFF)
+    fill(ix + 27, icon_y + 27, 3, 3, 0x00FFFFFF)
+    # Inner detail circle
+    ring(ix + 14, icon_y + 14, 12, 1, 0x00CCCCCC, 100)
+    blend(ix + 3, icon_y + pill_w + 1, pill_w - 6, 3, 0x00000000, 20)
+    # Colored underglow (icon emits its own light — bolder, wider)
+    blend(ix + 6, icon_y + pill_w + 2, 36, 4, ICON_SETTINGS, 22)
+    ix = ix + pill_w + icon_gap
+
+    # Browser
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix, icon_y, pill_w, pill_w, 0x00FFFFFF, 14, 20)
+    blend(ix + 2, icon_y + 1, pill_w - 4, 1, 0x00FFFFFF, 25)
+    blend(ix + 4, icon_y + 2, 40, 20, 0x00FFFFFF, 10)
+    # Wallpaper color reflection on icon top (cool blue-purple pickup — exceeds macOS)
+    blend(ix + 6, icon_y + 4, 36, 14, 0x00304060, 8)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size - 6, icon_size, 6, 0x00000000, 40)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, ICON_BROWSER, 10, 255)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, 0x00FFFFFF, 10, 25)
+    # 3D gradient (lighter top, darker bottom — macOS icon style)
+    blend(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size / 3, 0x00FFFFFF, 25)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size * 2 / 3, icon_size, icon_size / 3, 0x00000000, 20)
+    blend(ix + icon_pad + 2, icon_y + icon_pad + icon_size, icon_size - 4, 1, 0x00000000, 30)
+    ring(ix + 8, icon_y + 8, 24, 2, 0x00FFFFFF, 180)
+    # Globe meridian lines (not a crosshair — distinct from Settings gear)
+    line(ix + 14, icon_y + 8, ix + 14, icon_y + 32, 0x00FFFFFF, 1, 120)
+    line(ix + 26, icon_y + 8, ix + 26, icon_y + 32, 0x00FFFFFF, 1, 120)
+    line(ix + 8, icon_y + 14, ix + 32, icon_y + 14, 0x00FFFFFF, 1, 120)
+    line(ix + 8, icon_y + 26, ix + 32, icon_y + 26, 0x00FFFFFF, 1, 120)
+    # Compass needle
+    line(ix + 16, icon_y + 24, ix + 24, icon_y + 16, 0x00FF4444, 2, 200)
+    # Globe color tinting (subtle quadrant colors)
+    blend(ix + 8, icon_y + 8, 12, 12, 0x003498DB, 20)
+    blend(ix + 20, icon_y + 20, 12, 12, 0x0027AE60, 20)
+    blend(ix + 3, icon_y + pill_w + 1, pill_w - 6, 3, 0x00000000, 20)
+    # Colored underglow (icon emits its own light — bolder, wider)
+    blend(ix + 6, icon_y + pill_w + 2, 36, 4, ICON_BROWSER, 22)
+    ix = ix + pill_w + icon_gap
+
+    # Editor
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix, icon_y, pill_w, pill_w, 0x00FFFFFF, 14, 20)
+    blend(ix + 2, icon_y + 1, pill_w - 4, 1, 0x00FFFFFF, 25)
+    blend(ix + 4, icon_y + 2, 40, 20, 0x00FFFFFF, 10)
+    # Wallpaper color reflection on icon top (cool blue-purple pickup — exceeds macOS)
+    blend(ix + 6, icon_y + 4, 36, 14, 0x00304060, 8)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size - 6, icon_size, 6, 0x00000000, 40)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, ICON_EDITOR, 10, 255)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, 0x00FFFFFF, 10, 25)
+    # 3D gradient (lighter top, darker bottom — macOS icon style)
+    blend(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size / 3, 0x00FFFFFF, 25)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size * 2 / 3, icon_size, icon_size / 3, 0x00000000, 20)
+    blend(ix + icon_pad + 2, icon_y + icon_pad + icon_size, icon_size - 4, 1, 0x00000000, 30)
+    rrect_aa(ix + 10, icon_y + 8, 20, 24, 0x00FFFFFF, 3, 140)
+    fill(ix + 14, icon_y + 13, 12, 2, 0x00148F77)
+    fill(ix + 14, icon_y + 18, 10, 2, 0x00148F77)
+    fill(ix + 14, icon_y + 23, 14, 2, 0x00148F77)
+    # Cursor line (blinking indicator)
+    fill(ix + 14, icon_y + 28, 1, 4, accent(theme))
+    # Pencil tip accent
+    line(ix + 26, icon_y + 26, ix + 30, icon_y + 30, accent(theme), 2, 200)
+    blend(ix + 3, icon_y + pill_w + 1, pill_w - 6, 3, 0x00000000, 20)
+    # Notification badge (unique SimpleOS feature)
+    circle(ix + pill_w - 6, icon_y - 2, 14, 0x00FF3B30, 255)
+    circle(ix + pill_w - 4, icon_y, 4, 0x00FFFFFF, 220)
+    # Colored underglow (icon emits its own light — bolder, wider)
+    blend(ix + 6, icon_y + pill_w + 2, 36, 4, ICON_EDITOR, 22)
+
+    # Active app icon glow (magnification hint)
+    val glow_x = dock_x + dock_pad
+    blend(glow_x - 2, icon_y - 2, pill_w + 4, pill_w + 4, accent(theme), 15)
+    val glow_x2 = glow_x + pill_w + icon_gap
+    blend(glow_x2 - 2, icon_y - 2, pill_w + 4, pill_w + 4, accent(theme), 15)
+
+    # === Separator line between app icons and utility icons ===
+    val sep_x = ix + separator_gap
+    chrome_draw_divider(sep_x, dock_y + 8, dock_h - 16, theme, border_a(theme))
+    if separator_w > 1:
+        chrome_draw_divider(sep_x + 1, dock_y + 8, dock_h - 16, theme, border_a(theme) / 2)
+    ix = sep_x + separator_w + separator_gap
+
+    # === Finder icon (utility section) ===
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix, icon_y, pill_w, pill_w, 0x00FFFFFF, 14, 20)
+    blend(ix + 2, icon_y + 1, pill_w - 4, 1, 0x00FFFFFF, 25)
+    blend(ix + 4, icon_y + 2, 40, 20, 0x00FFFFFF, 10)
+    # Wallpaper color reflection on icon top (cool blue-purple pickup — exceeds macOS)
+    blend(ix + 6, icon_y + 4, 36, 14, 0x00304060, 8)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size - 6, icon_size, 6, 0x00000000, 40)
+    # Finder: blue face icon (two-tone smiley)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, 0x004A90D9, 10, 255)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, 0x00FFFFFF, 10, 25)
+    # Face divider (left=light blue, right=darker blue — classic Finder look)
+    blend(ix + icon_pad + icon_size / 2, icon_y + icon_pad, icon_size / 2, icon_size, 0x00357ABD, 120)
+    # Eyes
+    circle(ix + 12, icon_y + 14, 6, 0x00FFFFFF, 255)
+    circle(ix + 24, icon_y + 14, 6, 0x00FFFFFF, 255)
+    circle(ix + 13, icon_y + 14, 4, 0x00000000, 255)
+    circle(ix + 25, icon_y + 14, 4, 0x00000000, 255)
+    # Smile
+    rrect_aa(ix + 12, icon_y + 24, 18, 6, 0x00FFFFFF, 3, 200)
+    # Nose line
+    blend(ix + icon_pad + icon_size / 2 - 1, icon_y + 16, 2, 10, 0x00FFFFFF, 100)
+    blend(ix + 3, icon_y + pill_w + 1, pill_w - 6, 3, 0x00000000, 20)
+    ix = ix + pill_w + icon_gap
+
+    # === Trash icon (rightmost) ===
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix, icon_y, pill_w, pill_w, 0x00FFFFFF, 14, 20)
+    blend(ix + 2, icon_y + 1, pill_w - 4, 1, 0x00FFFFFF, 25)
+    blend(ix + 4, icon_y + 2, 40, 20, 0x00FFFFFF, 10)
+    # Wallpaper color reflection on icon top (cool blue-purple pickup — exceeds macOS)
+    blend(ix + 6, icon_y + 4, 36, 14, 0x00304060, 8)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size - 6, icon_size, 6, 0x00000000, 40)
+    # Trash can body (gray metallic)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, 0x00808080, 10, 255)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, 0x00FFFFFF, 10, 25)
+    # Trash can shape: lid + body
+    rrect_aa(ix + 10, icon_y + 8, 22, 4, 0x00C0C0C0, 2, 255)
+    rrect_aa(ix + 8, icon_y + 10, 2, 4, 0x00C0C0C0, 1, 255)
+    rrect_aa(ix + 32, icon_y + 10, 2, 4, 0x00C0C0C0, 1, 255)
+    rrect_aa(ix + 12, icon_y + 14, 18, 20, 0x00A0A0A0, 3, 220)
+    # Trash lines
+    blend(ix + 16, icon_y + 17, 2, 14, 0x00808080, 180)
+    blend(ix + 20, icon_y + 17, 2, 14, 0x00808080, 180)
+    blend(ix + 24, icon_y + 17, 2, 14, 0x00808080, 180)
+    # Handle
+    rrect_aa(ix + 18, icon_y + 5, 6, 5, 0x00C0C0C0, 2, 200)
+    blend(ix + 3, icon_y + pill_w + 1, pill_w - 6, 3, 0x00000000, 20)
+
+    # === Running indicators — glowing dots under running apps ===
+    val dot_y = dock_y + dock_h - 6
+    val first_ix = dock_x + dock_pad + pill_w / 2 - 2
+
+    # Terminal is always running (window 0) — dot
+    chrome_draw_dock_indicator(first_ix, dot_y, accent(theme), active == 0)
+
+    # Browser is always running (window 2) — dot at 2nd icon
+    val files_dot_x = first_ix + (pill_w + icon_gap)
+    chrome_draw_dock_indicator(files_dot_x, dot_y, accent(theme), active == 2)
+
+    # Clock running indicator (4th icon)
+    chrome_draw_dock_indicator(first_ix + (pill_w + icon_gap) * 3, dot_y, accent(theme), 0)
+
+    # Editor (window 1) — dot at 7th icon (Editor)
+    val editor_dot_x = first_ix + 6 * (pill_w + icon_gap)
+    chrome_draw_dock_indicator(editor_dot_x, dot_y, accent(theme), active == 1)
+
+    # Dock reflection (beyond macOS — mirror effect)
+    val refl_y = dock_y + dock_h + 2
+    blend(dock_x + 10, refl_y, dock_w - 20, 1, surface(theme), 20)
+    blend(dock_x + 16, refl_y + 1, dock_w - 32, 1, surface(theme), 12)
+    blend(dock_x + 24, refl_y + 2, dock_w - 48, 1, surface(theme), 6)
+
+# ===========================================================================
+# Scancode to ASCII Conversion
+# ===========================================================================
+
+fn scancode_to_ascii(scancode: u64) -> u64:
+    """Convert PS/2 scancode to ASCII character. Returns 0 for non-printable."""
+    # Letters (lowercase only for now)
+    if scancode == 0x1E: return 97   # a
+    if scancode == 0x30: return 98   # b
+    if scancode == 0x2E: return 99   # c
+    if scancode == 0x20: return 100  # d
+    if scancode == 0x12: return 101  # e
+    if scancode == 0x21: return 102  # f
+    if scancode == 0x22: return 103  # g
+    if scancode == 0x23: return 104  # h
+    if scancode == 0x17: return 105  # i
+    if scancode == 0x24: return 106  # j
+    if scancode == 0x25: return 107  # k
+    if scancode == 0x26: return 108  # l
+    if scancode == 0x32: return 109  # m
+    if scancode == 0x31: return 110  # n
+    if scancode == 0x18: return 111  # o
+    if scancode == 0x19: return 112  # p
+    if scancode == 0x10: return 113  # q
+    if scancode == 0x13: return 114  # r
+    if scancode == 0x1F: return 115  # s
+    if scancode == 0x14: return 116  # t
+    if scancode == 0x16: return 117  # u
+    if scancode == 0x2F: return 118  # v
+    if scancode == 0x11: return 119  # w
+    if scancode == 0x2D: return 120  # x
+    if scancode == 0x15: return 121  # y
+    if scancode == 0x2C: return 122  # z
+    if scancode == 0x39: return 32   # space
+    if scancode == 0x33: return 46   # .
+    if scancode == 0x34: return 47   # /
+    if scancode == 0x28: return 45   # -
+    return 0
+
+# ===========================================================================
+# App Click and Input Handlers
+# ===========================================================================
+
+fn handle_terminal_click(local_x: u64, local_y: u64):
+    """Handle click in terminal content area."""
+    serial_println("[Terminal] Click at local coords")
+
+fn term_get_input_char(pos: u64) -> u64:
+    """Get character at position from packed input buffer."""
+    val word = pos / 8
+    val byte_idx = pos % 8
+    val shift = (7 - byte_idx) * 8  # Big-endian: matches pack8 (a<<56, b<<48, ...)
+    var packed: u64 = 0
+    if word == 0: packed = g_term_input_0
+    if word == 1: packed = g_term_input_1
+    if word == 2: packed = g_term_input_2
+    if word == 3: packed = g_term_input_3
+    if word == 4: packed = g_term_input_4
+    (packed >> shift) & 0xFF
+
+fn term_set_input_char(pos: u64, ch: u64):
+    """Set character at position in packed input buffer."""
+    val word = pos / 8
+    val byte_idx = pos % 8
+    val shift = (7 - byte_idx) * 8  # Big-endian: matches pack8 (a<<56, b<<48, ...)
+    val mask = 0xFF << shift
+    val clear_mask = 0xFFFFFFFFFFFFFFFF - mask
+    val bits = (ch & 0xFF) << shift
+    if word == 0: g_term_input_0 = (g_term_input_0 & clear_mask) | bits
+    if word == 1: g_term_input_1 = (g_term_input_1 & clear_mask) | bits
+    if word == 2: g_term_input_2 = (g_term_input_2 & clear_mask) | bits
+    if word == 3: g_term_input_3 = (g_term_input_3 & clear_mask) | bits
+    if word == 4: g_term_input_4 = (g_term_input_4 & clear_mask) | bits
+
+fn term_clear_input():
+    """Clear the terminal input buffer."""
+    g_term_input_0 = 0
+    g_term_input_1 = 0
+    g_term_input_2 = 0
+    g_term_input_3 = 0
+    g_term_input_4 = 0
+    g_term_input_len = 0
+
+fn term_match_cmd(expected_0: u64, expected_len: u64) -> u64:
+    """Check if input matches a command (single word, up to 8 chars)."""
+    if g_term_input_len != expected_len: return 0
+    if g_term_input_0 != expected_0: return 0
+    return 1
+
+fn term_check_echo_prefix() -> u64:
+    """Check if input starts with 'echo ' (5 chars: e=101,c=99,h=104,o=111,space=32)."""
+    if g_term_input_len < 5: return 0
+    if term_get_input_char(0) != 101: return 0
+    if term_get_input_char(1) != 99: return 0
+    if term_get_input_char(2) != 104: return 0
+    if term_get_input_char(3) != 111: return 0
+    if term_get_input_char(4) != 32: return 0
+    return 1
+
+fn term_save_echo_buf():
+    """Save input chars after 'echo ' (positions 5..input_len) into g_echo_buf."""
+    g_echo_buf_0 = 0
+    g_echo_buf_1 = 0
+    g_echo_buf_2 = 0
+    g_echo_buf_3 = 0
+    g_echo_buf_4 = 0
+    val echo_len = g_term_input_len - 5
+    g_echo_len = echo_len
+    # Repack chars from position 5 onward into echo buffer
+    var i: u64 = 0
+    while i < echo_len:
+        val ch = term_get_input_char(i + 5)
+        val word = i / 8
+        val byte_idx = i % 8
+        val shift = (7 - byte_idx) * 8  # Big-endian: matches pack8
+        val bits = ch << shift
+        if word == 0: g_echo_buf_0 = g_echo_buf_0 | bits
+        if word == 1: g_echo_buf_1 = g_echo_buf_1 | bits
+        if word == 2: g_echo_buf_2 = g_echo_buf_2 | bits
+        if word == 3: g_echo_buf_3 = g_echo_buf_3 | bits
+        if word == 4: g_echo_buf_4 = g_echo_buf_4 | bits
+        i = i + 1
+
+fn handle_terminal_enter():
+    """Execute the current terminal input as a command."""
+    serial_println("[Terminal] Enter pressed")
+
+    if g_term_input_len == 0:
+        return
+
+    # Match against built-in commands by comparing packed input
+    val cmd_help = pack8(104, 101, 108, 112, 0, 0, 0, 0)
+    val cmd_clear = pack8(99, 108, 101, 97, 114, 0, 0, 0)
+    val cmd_uname = pack8(117, 110, 97, 109, 101, 0, 0, 0)
+    val cmd_ls = pack8(108, 115, 0, 0, 0, 0, 0, 0)
+    val cmd_whoami = pack8(119, 104, 111, 97, 109, 105, 0, 0)
+    val cmd_date = pack8(100, 97, 116, 101, 0, 0, 0, 0)
+    val cmd_uptime = pack8(117, 112, 116, 105, 109, 101, 0, 0)
+    # p=112, s=115
+    val cmd_ps = pack8(112, 115, 0, 0, 0, 0, 0, 0)
+    # f=102, r=114, e=101, e=101
+    val cmd_free = pack8(102, 114, 101, 101, 0, 0, 0, 0)
+    # h=104,o=111,s=115,t=116,n=110,a=97,m=109,e=101
+    val cmd_hostname = pack8(104, 111, 115, 116, 110, 97, 109, 101)
+    # p=112,w=119,d=100
+    val cmd_pwd = pack8(112, 119, 100, 0, 0, 0, 0, 0)
+
+    var matched: u64 = 0
+
+    if term_match_cmd(cmd_help, 4) == 1:
+        g_term_out_type = 1
+        g_term_out_count = 13
+        matched = 1
+
+    if term_match_cmd(cmd_clear, 5) == 1:
+        g_term_out_type = 0
+        g_term_out_count = 0
+        g_term_cmd_history = 0
+        term_clear_input()
+        return
+
+    if term_match_cmd(cmd_uname, 5) == 1:
+        g_term_out_type = 2
+        g_term_out_count = 1
+        matched = 1
+
+    if term_match_cmd(cmd_ls, 2) == 1:
+        g_term_out_type = 3
+        g_term_out_count = 6
+        matched = 1
+
+    if term_match_cmd(cmd_whoami, 6) == 1:
+        g_term_out_type = 4
+        g_term_out_count = 1
+        matched = 1
+
+    if term_match_cmd(cmd_date, 4) == 1:
+        g_term_out_type = 5
+        g_term_out_count = 1
+        matched = 1
+
+    if term_match_cmd(cmd_uptime, 6) == 1:
+        g_term_out_type = 6
+        g_term_out_count = 1
+        matched = 1
+
+    if term_match_cmd(cmd_ps, 2) == 1:
+        g_term_out_type = 8
+        g_term_out_count = 3
+        matched = 1
+
+    if term_match_cmd(cmd_free, 4) == 1:
+        g_term_out_type = 9
+        g_term_out_count = 1
+        matched = 1
+
+    if term_match_cmd(cmd_hostname, 8) == 1:
+        g_term_out_type = 10
+        g_term_out_count = 1
+        matched = 1
+
+    if term_match_cmd(cmd_pwd, 3) == 1:
+        g_term_out_type = 11
+        g_term_out_count = 1
+        matched = 1
+
+    # Check echo prefix: "echo " followed by text
+    if matched == 0 and term_check_echo_prefix() == 1:
+        term_save_echo_buf()
+        g_term_out_type = 12
+        g_term_out_count = 1
+        matched = 1
+
+    if matched == 0:
+        g_term_out_type = 7
+        g_term_out_count = 1
+
+    # Advance history and reset input
+    g_term_cmd_history = g_term_cmd_history + 1
+    term_clear_input()
+
+fn handle_terminal_backspace():
+    """Handle Backspace in terminal."""
+    if g_term_input_len > 0:
+        g_term_input_len = g_term_input_len - 1
+        term_set_input_char(g_term_input_len, 0)
+
+fn handle_terminal_char(ch: u64):
+    """Handle character input in terminal."""
+    if g_term_input_len < 40:
+        term_set_input_char(g_term_input_len, ch)
+        g_term_input_len = g_term_input_len + 1
+
+fn handle_editor_click(local_x: u64, local_y: u64):
+    """Handle click in editor content area -- maps pixel coords to cursor position."""
+    # Editor layout: gutter_w=30, code starts at gutter_w+8, char width=8, line_h=16
+    val gutter_w: u64 = 30
+    val code_start: u64 = gutter_w + 8
+    # Only reposition if click is in the code area (past the gutter)
+    if local_x > code_start:
+        val char_x = (local_x - code_start) / 8
+        val char_y = local_y / 16
+        # Clamp to valid range (8 visible lines, max ~30 columns)
+        if char_y < 8:
+            g_editor_cursor_y = char_y
+        else:
+            g_editor_cursor_y = 7
+        if char_x < 30:
+            g_editor_cursor_x = char_x
+        else:
+            g_editor_cursor_x = 29
+        # Enable editing mode and reset edit buffer for this line
+        g_ed_editing = 1
+        g_ed_buf_0 = 0
+        g_ed_buf_1 = 0
+        g_ed_buf_2 = 0
+        g_ed_buf_3 = 0
+        g_ed_buf_4 = 0
+        g_ed_buf_len = 0
+        g_editor_cursor_x = 0
+
+fn ed_set_char(pos: u64, ch: u64):
+    """Set character at position in editor edit buffer (little-endian byte order)."""
+    val word = pos / 8
+    val shift = (pos % 8) * 8
+    val mask = 0xFF << shift
+    if word == 0: g_ed_buf_0 = (g_ed_buf_0 & (0xFFFFFFFFFFFFFFFF ^ mask)) | (ch << shift)
+    if word == 1: g_ed_buf_1 = (g_ed_buf_1 & (0xFFFFFFFFFFFFFFFF ^ mask)) | (ch << shift)
+    if word == 2: g_ed_buf_2 = (g_ed_buf_2 & (0xFFFFFFFFFFFFFFFF ^ mask)) | (ch << shift)
+    if word == 3: g_ed_buf_3 = (g_ed_buf_3 & (0xFFFFFFFFFFFFFFFF ^ mask)) | (ch << shift)
+    if word == 4: g_ed_buf_4 = (g_ed_buf_4 & (0xFFFFFFFFFFFFFFFF ^ mask)) | (ch << shift)
+
+fn ed_clear_char(pos: u64):
+    """Clear character at position in editor edit buffer."""
+    val word = pos / 8
+    val shift = (pos % 8) * 8
+    val mask = 0xFF << shift
+    val clear_mask = 0xFFFFFFFFFFFFFFFF ^ mask
+    if word == 0: g_ed_buf_0 = g_ed_buf_0 & clear_mask
+    if word == 1: g_ed_buf_1 = g_ed_buf_1 & clear_mask
+    if word == 2: g_ed_buf_2 = g_ed_buf_2 & clear_mask
+    if word == 3: g_ed_buf_3 = g_ed_buf_3 & clear_mask
+    if word == 4: g_ed_buf_4 = g_ed_buf_4 & clear_mask
+
+fn render_ed_buffer(rx: u64, ry: u64, color: u64):
+    """Render the editor edit buffer text from packed words."""
+    if g_ed_buf_len > 0:
+        rt_gui_set_text_buf(g_ed_buf_0, 0, 0, 0)
+    if g_ed_buf_len > 8:
+        rt_gui_set_text_buf(g_ed_buf_1, 8, 0, 0)
+    if g_ed_buf_len > 16:
+        rt_gui_set_text_buf(g_ed_buf_2, 16, 0, 0)
+    if g_ed_buf_len > 24:
+        rt_gui_set_text_buf(g_ed_buf_3, 24, 0, 0)
+    if g_ed_buf_len > 32:
+        rt_gui_set_text_buf(g_ed_buf_4, 32, 0, 0)
+    rt_gui_draw_text_buf(pack(rx, ry), pack(color, g_ed_buf_len), 220, 0)
+
+fn handle_browser_click(local_x: u64, local_y: u64):
+    """Handle click in browser content area."""
+    # Toolbar area: y < 30 (toolbar height)
+    if local_y < 30:
+        # Back button: x 10-30
+        if local_x >= 10 and local_x < 30:
+            browser_go_back()
+            serial_println("[Browser] Back")
+            return
+        # Forward button: x 34-54
+        if local_x >= 34 and local_x < 54:
+            browser_go_forward()
+            serial_println("[Browser] Forward")
+            return
+        # Reload: x 58-78
+        if local_x >= 58 and local_x < 78:
+            serial_println("[Browser] Reload")
+            return
+        # URL bar: x >= 82
+        if local_x >= 82:
+            g_browser_input_active = 1
+            serial_println("[Browser] Address bar focused")
+            return
+        return
+    # Content area: y >= 32 (below toolbar)
+    # Unfocus address bar when clicking content
+    g_browser_input_active = 0
+    # Check for link clicks based on current page
+    val content_y = local_y - 32  # Offset below toolbar
+    if g_browser_page == 0:
+        # Home page links (at y offsets relative to content area)
+        # Link 1: "About SimpleOS" at ~y+128
+        if content_y >= 128 and content_y < 146:
+            browser_navigate(3)
+            serial_println("[Browser] -> about:about")
+        # Link 2: "System Info" at ~y+152
+        if content_y >= 152 and content_y < 170:
+            browser_navigate(2)
+            serial_println("[Browser] -> about:sysinfo")
+        # Link 3: "Help" at ~y+176
+        if content_y >= 176 and content_y < 194:
+            browser_navigate(1)
+            serial_println("[Browser] -> about:help")
+        # Link 4: "Network Status" at ~y+200
+        if content_y >= 200 and content_y < 218:
+            browser_navigate(4)
+            serial_println("[Browser] -> about:network")
+    if g_browser_page == 1 or g_browser_page == 2 or g_browser_page == 3 or g_browser_page == 4:
+        # "< Back to Home" link (last item on each page)
+        if content_y >= 140 and content_y < 160:
+            browser_navigate(0)
+            serial_println("[Browser] -> about:home")
+
+# ===========================================================================
+# Application Window Content
+# ===========================================================================
+
+fn draw_hello_content(x: u64, y: u64, w: u64, h: u64, theme: u64):
+    val cy = y + TITLE_BAR_H + 2
+    val content_h = h - TITLE_BAR_H - 3
+    val sidebar_w: u64 = 70
+    val line_h: u64 = 16
+    val status_h: u64 = 20
+
+    # --- Tab bar ---
+    val tab_y = cy
+    val tab_h: u64 = 24
+    blend(x + 1, tab_y, w - 2, tab_h, surface(theme), 50)
+    blend(x + 1, tab_y + tab_h - 1, w - 2, 1, border_c(theme), border_a(theme))
+    # Active tab (highlighted)
+    rrect_aa(x + sidebar_w + 2, tab_y + 2, 80, tab_h - 3, elevated(theme), 4, 120)
+    blend(x + sidebar_w + 2, tab_y + tab_h - 2, 80, 2, accent(theme), 200)
+    # Tab label: "main.spl"
+    draw_label_vector(x + sidebar_w + 10, tab_y + 4, text_c(theme), 200, pack8(109, 97, 105, 110, 46, 115, 112, 108), 8, 14)
+    # Second tab (inactive)
+    draw_label_vector(x + sidebar_w + 92, tab_y + 4, text_sec(theme), 100, pack8(109, 111, 100, 46, 115, 112, 108, 0), 7, 14)
+
+    # --- File tree sidebar ---
+    val sb_y = tab_y + tab_h
+    rrect(x + 1, sb_y, sidebar_w, content_h - tab_h - status_h, 0x00181820, 0, 200)
+    blend(x + sidebar_w, sb_y, 1, content_h - tab_h - status_h, border_c(theme), border_a(theme))
+    # Section: "EXPLORER"
+    draw_label_vector(x + 6, sb_y + 4, text_sec(theme), 80, pack8(69, 88, 80, 76, 79, 82, 69, 82), 8, 12)
+    # Tree items
+    # > src/
+    draw_label_vector(x + 6, sb_y + 20, 0x00CCCCCC, 160, pack8(62, 32, 115, 114, 99, 47, 0, 0), 6, 12)
+    #   main.spl (bold = open)
+    draw_label_vector(x + 16, sb_y + 36, accent(theme), 200, pack8(109, 97, 105, 110, 46, 115, 112, 108), 8, 14)
+    #   mod.spl
+    draw_label_vector(x + 16, sb_y + 52, 0x00CCCCCC, 140, pack8(109, 111, 100, 46, 115, 112, 108, 0), 7, 12)
+    # > test/
+    draw_label_vector(x + 6, sb_y + 72, 0x00CCCCCC, 160, pack8(62, 32, 116, 101, 115, 116, 47, 0), 7, 12)
+    #   spec.spl
+    draw_label_vector(x + 16, sb_y + 88, 0x00CCCCCC, 140, pack8(115, 112, 101, 99, 46, 115, 112, 108), 8, 12)
+
+    # --- Editor area (dark bg with code lines) ---
+    val ed_x = x + sidebar_w + 1
+    val ed_y = sb_y
+    val ed_w = w - sidebar_w - 2
+    val ed_h = content_h - tab_h - status_h
+    rrect(ed_x, ed_y, ed_w, ed_h, 0x000D0D14, 0, 220)
+
+    # Line numbers gutter
+    val gutter_w: u64 = 30
+    blend(ed_x, ed_y, gutter_w, ed_h, 0x00FFFFFF, 8)
+    blend(ed_x + gutter_w, ed_y, 1, ed_h, border_c(theme), 20)
+
+    # Line numbers + code (8 visible lines)
+    var ln: u64 = 0
+    while ln < 8:
+        val ly = ed_y + 4 + ln * line_h
+        val ln_num = ln + 1
+        # Line number (right-aligned in gutter)
+        if ln_num < 10:
+            draw_label(ed_x + 16, ly, 0x00666688, 120, pack8(48 + ln_num, 0, 0, 0, 0, 0, 0, 0), 1)
+        ln = ln + 1
+
+    # Syntax-colored code lines
+    val code_x = ed_x + gutter_w + 8
+    # Line 1: "fn main():"
+    draw_label_outline(code_x, ed_y + 4, 0x00CC7832, 220, pack8(102, 110, 0, 0, 0, 0, 0, 0), 2, 40)
+    draw_label_outline(code_x + 24, ed_y + 4, 0x00FFC66D, 220, pack8(109, 97, 105, 110, 0, 0, 0, 0), 4, 40)
+    draw_label(code_x + 56, ed_y + 4, 0x00CCCCCC, 200, pack8(40, 41, 58, 0, 0, 0, 0, 0), 3)
+
+    # Line 2: "    val x = 42"
+    draw_label_outline(code_x + 32, ed_y + 20, 0x00CC7832, 220, pack8(118, 97, 108, 0, 0, 0, 0, 0), 3, 40)
+    draw_label(code_x + 56, ed_y + 20, 0x00CCCCCC, 200, pack8(120, 32, 61, 32, 0, 0, 0, 0), 4)
+    draw_label(code_x + 88, ed_y + 20, 0x006897BB, 220, pack8(52, 50, 0, 0, 0, 0, 0, 0), 2)
+
+    # Line 3: "    print x"
+    draw_label(code_x + 32, ed_y + 36, 0x00FFC66D, 220, pack8(112, 114, 105, 110, 116, 0, 0, 0), 5)
+    draw_label(code_x + 72, ed_y + 36, 0x00CCCCCC, 200, pack8(32, 120, 0, 0, 0, 0, 0, 0), 2)
+
+    # Line 4: blank
+    # Line 5: "# Comment"
+    draw_label(code_x, ed_y + 68, 0x00629755, 180, pack8(35, 32, 67, 111, 109, 109, 101, 110), 8)
+
+    # Line 6: "fn square(n):"
+    draw_label(code_x, ed_y + 84, 0x00CC7832, 220, pack8(102, 110, 0, 0, 0, 0, 0, 0), 2)
+    draw_label(code_x + 24, ed_y + 84, 0x00FFC66D, 220, pack8(115, 113, 117, 97, 114, 101, 0, 0), 6)
+    draw_label(code_x + 72, ed_y + 84, 0x00CCCCCC, 200, pack8(40, 110, 41, 58, 0, 0, 0, 0), 4)
+
+    # Line 7: "    n * n"
+    draw_label(code_x + 32, ed_y + 100, 0x00CCCCCC, 200, pack8(110, 32, 42, 32, 110, 0, 0, 0), 5)
+
+    # Current line highlight (dynamic, follows g_editor_cursor_y)
+    val line_hl_y = ed_y + 4 + g_editor_cursor_y * line_h
+    blend(ed_x + gutter_w + 1, line_hl_y - 2, ed_w - gutter_w - 2, line_h, 0x00FFFFFF, 10)
+
+    # Cursor (dynamic, follows g_editor_cursor_x / g_editor_cursor_y)
+    val cursor_px_x = gutter_w + 8 + g_editor_cursor_x * 8
+    val cursor_px_y = ed_y + 4 + g_editor_cursor_y * line_h
+    # Semi-transparent block so underlying text remains visible
+    blend(ed_x + cursor_px_x, cursor_px_y, 8, line_h, accent(theme), 120)
+    # Thin insertion-style cursor line
+    blend(ed_x + cursor_px_x, cursor_px_y, 2, line_h, 0x00FFFFFF, 200)
+
+    # If this line is being edited, overlay the edit buffer
+    if g_ed_editing == 1:
+        val edit_y = ed_y + 4 + g_editor_cursor_y * line_h
+        # Clear the line area (overwrite static code text)
+        blend(code_x - 4, edit_y, ed_w - gutter_w - 8, line_h, 0x000D0D14, 220)
+        # Render edit buffer contents
+        if g_ed_buf_len > 0:
+            render_ed_buffer(code_x, edit_y, 0x00CCCCCC)
+        # Blinking-style cursor at end of typed text
+        blend(code_x + g_ed_buf_len * 8, edit_y, 2, line_h, 0x00FFFFFF, 200)
+
+    # Progress bar
+    val prog_y = ed_y + ed_h - 24
+    rrect_aa(ed_x + 4, prog_y, ed_w - 8, 8, surface(theme), 4, 60)
+    rrect_aa(ed_x + 4, prog_y, (ed_w - 8) * 3 / 4, 8, accent(theme), 4, 200)
+
+    # Text lines (simulated content)
+    blend(ed_x + 4, prog_y + 20, ed_w - 48, 3, text_c(theme), 40)
+    blend(ed_x + 4, prog_y + 30, ed_w - 88, 3, text_c(theme), 30)
+    blend(ed_x + 4, prog_y + 40, ed_w - 28, 3, text_c(theme), 25)
+
+    # --- Status bar at bottom ---
+    val st_y = y + h - status_h - 2
+    blend(x + 1, st_y, w - 2, status_h, accent(theme), 200)
+    # Dynamic "Ln N" using cursor position (1-based line number)
+    val disp_ln = g_editor_cursor_y + 1
+    # "Ln " prefix
+    draw_label_vector(x + 8, st_y + 3, 0x00FFFFFF, 200, pack8(76, 110, 32, 0, 0, 0, 0, 0), 3, 14)
+    # Line number digit (0-9)
+    draw_label_vector(x + 32, st_y + 3, 0x00FFFFFF, 200, pack8(48 + disp_ln, 0, 0, 0, 0, 0, 0, 0), 1, 14)
+    # ", C" separator
+    draw_label_vector(x + 40, st_y + 3, 0x00FFFFFF, 200, pack8(44, 32, 67, 0, 0, 0, 0, 0), 3, 14)
+    # Column number digit (0-based displayed as-is for simplicity)
+    draw_label_vector(x + 64, st_y + 3, 0x00FFFFFF, 200, pack8(48 + g_editor_cursor_x, 0, 0, 0, 0, 0, 0, 0), 1, 14)
+    # "Simple" on right
+    draw_label_vector(x + w - 56, st_y + 3, 0x00FFFFFF, 200, pack8(83, 105, 109, 112, 108, 101, 0, 0), 6, 14)
+
+fn render_term_input(tx: u64, ty: u64, color: u64):
+    """Render the current input line from packed buffer."""
+    val words_needed = (g_term_input_len + 7) / 8
+    if words_needed > 0:
+        rt_gui_set_text_buf(g_term_input_0, 0, 0, 0)
+    if words_needed > 1:
+        rt_gui_set_text_buf(g_term_input_1, 8, 0, 0)
+    if words_needed > 2:
+        rt_gui_set_text_buf(g_term_input_2, 16, 0, 0)
+    if words_needed > 3:
+        rt_gui_set_text_buf(g_term_input_3, 24, 0, 0)
+    if words_needed > 4:
+        rt_gui_set_text_buf(g_term_input_4, 32, 0, 0)
+    rt_gui_draw_text_buf(pack(tx, ty), pack(color, g_term_input_len), 220, 0)
+
+fn render_term_help(hx: u64, hy: u64, color: u64, dim: u64) -> u64:
+    """Render help command output. Returns pixel height used."""
+    # "Built-in commands:"
+    rt_gui_set_text_buf(pack8(66, 117, 105, 108, 116, 45, 105, 110), 0, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 99, 111, 109, 109, 97, 110, 100), 8, 0, 0)
+    rt_gui_set_text_buf(pack8(115, 58, 0, 0, 0, 0, 0, 0), 16, 0, 0)
+    rt_gui_draw_text_buf(pack(hx, hy), pack(color, 18), 220, 0)
+    # "  help    - show this"
+    rt_gui_set_text_buf(pack8(32, 32, 104, 101, 108, 112, 32, 32), 0, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 32, 45, 32, 115, 104, 111, 119), 8, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 116, 104, 105, 115, 0, 0, 0), 16, 0, 0)
+    rt_gui_draw_text_buf(pack(hx, hy + 16), pack(dim, 21), 180, 0)
+    # "  clear   - clear screen"
+    rt_gui_set_text_buf(pack8(32, 32, 99, 108, 101, 97, 114, 32), 0, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 45, 32, 99, 108, 101, 97, 114), 8, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 115, 99, 114, 101, 101, 110, 0), 16, 0, 0)
+    rt_gui_draw_text_buf(pack(hx, hy + 32), pack(dim, 23), 180, 0)
+    # "  uname   - system info"
+    rt_gui_set_text_buf(pack8(32, 32, 117, 110, 97, 109, 101, 32), 0, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 45, 32, 115, 121, 115, 116, 101), 8, 0, 0)
+    rt_gui_set_text_buf(pack8(109, 32, 105, 110, 102, 111, 0, 0), 16, 0, 0)
+    rt_gui_draw_text_buf(pack(hx, hy + 48), pack(dim, 22), 180, 0)
+    # "  ls      - list files"
+    rt_gui_set_text_buf(pack8(32, 32, 108, 115, 32, 32, 32, 32), 0, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 32, 45, 32, 108, 105, 115, 116), 8, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 102, 105, 108, 101, 115, 0, 0), 16, 0, 0)
+    rt_gui_draw_text_buf(pack(hx, hy + 64), pack(dim, 22), 180, 0)
+    # "  whoami  - current user"
+    rt_gui_set_text_buf(pack8(32, 32, 119, 104, 111, 97, 109, 105), 0, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 32, 45, 32, 99, 117, 114, 114), 8, 0, 0)
+    rt_gui_set_text_buf(pack8(101, 110, 116, 32, 117, 115, 101, 114), 16, 0, 0)
+    rt_gui_draw_text_buf(pack(hx, hy + 80), pack(dim, 24), 180, 0)
+    # "  date    - show date"
+    rt_gui_set_text_buf(pack8(32, 32, 100, 97, 116, 101, 32, 32), 0, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 32, 45, 32, 115, 104, 111, 119), 8, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 100, 97, 116, 101, 0, 0, 0), 16, 0, 0)
+    rt_gui_draw_text_buf(pack(hx, hy + 96), pack(dim, 21), 180, 0)
+    # "  uptime  - system uptime"
+    rt_gui_set_text_buf(pack8(32, 32, 117, 112, 116, 105, 109, 101), 0, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 32, 45, 32, 117, 112, 116, 105), 8, 0, 0)
+    rt_gui_set_text_buf(pack8(109, 101, 0, 0, 0, 0, 0, 0), 16, 0, 0)
+    rt_gui_draw_text_buf(pack(hx, hy + 112), pack(dim, 18), 180, 0)
+    # "  ps      - processes"
+    # 32,32,112,115,32,32,32,32 | 32,32,45,32,112,114,111,99 | 101,115,115,101,115,0,0,0
+    rt_gui_set_text_buf(pack8(32, 32, 112, 115, 32, 32, 32, 32), 0, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 32, 45, 32, 112, 114, 111, 99), 8, 0, 0)
+    rt_gui_set_text_buf(pack8(101, 115, 115, 101, 115, 0, 0, 0), 16, 0, 0)
+    rt_gui_draw_text_buf(pack(hx, hy + 128), pack(dim, 21), 180, 0)
+    # "  free    - memory info"
+    # 32,32,102,114,101,101,32,32 | 32,32,45,32,109,101,109,111 | 114,121,32,105,110,102,111,0
+    rt_gui_set_text_buf(pack8(32, 32, 102, 114, 101, 101, 32, 32), 0, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 32, 45, 32, 109, 101, 109, 111), 8, 0, 0)
+    rt_gui_set_text_buf(pack8(114, 121, 32, 105, 110, 102, 111, 0), 16, 0, 0)
+    rt_gui_draw_text_buf(pack(hx, hy + 144), pack(dim, 23), 180, 0)
+    # "  hostname- host name"
+    # 32,32,104,111,115,116,110,97 | 109,101,45,32,104,111,115,116 | 32,110,97,109,101,0,0,0
+    rt_gui_set_text_buf(pack8(32, 32, 104, 111, 115, 116, 110, 97), 0, 0, 0)
+    rt_gui_set_text_buf(pack8(109, 101, 45, 32, 104, 111, 115, 116), 8, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 110, 97, 109, 101, 0, 0, 0), 16, 0, 0)
+    rt_gui_draw_text_buf(pack(hx, hy + 160), pack(dim, 21), 180, 0)
+    # "  pwd     - working dir"
+    # 32,32,112,119,100,32,32,32 | 32,32,45,32,119,111,114,107 | 105,110,103,32,100,105,114,0
+    rt_gui_set_text_buf(pack8(32, 32, 112, 119, 100, 32, 32, 32), 0, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 32, 45, 32, 119, 111, 114, 107), 8, 0, 0)
+    rt_gui_set_text_buf(pack8(105, 110, 103, 32, 100, 105, 114, 0), 16, 0, 0)
+    rt_gui_draw_text_buf(pack(hx, hy + 176), pack(dim, 23), 180, 0)
+    # "  echo    - echo text"
+    # 32,32,101,99,104,111,32,32 | 32,32,45,32,101,99,104,111 | 32,116,101,120,116,0,0,0
+    rt_gui_set_text_buf(pack8(32, 32, 101, 99, 104, 111, 32, 32), 0, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 32, 45, 32, 101, 99, 104, 111), 8, 0, 0)
+    rt_gui_set_text_buf(pack8(32, 116, 101, 120, 116, 0, 0, 0), 16, 0, 0)
+    rt_gui_draw_text_buf(pack(hx, hy + 192), pack(dim, 21), 180, 0)
+    return 208
+
+fn render_term_output(ox: u64, oy: u64, color: u64) -> u64:
+    """Render the last command output. Returns pixel height used."""
+    val dim_c = 0x00AAAAAA
+    val green_c = 0x0044FF44
+    val cyan_c = 0x005588CC
+
+    if g_term_out_type == 1:
+        return render_term_help(ox, oy, color, dim_c)
+
+    if g_term_out_type == 2:
+        # uname: "SimpleOS x86_64 v1.0"
+        rt_gui_set_text_buf(pack8(83, 105, 109, 112, 108, 101, 79, 83), 0, 0, 0)
+        rt_gui_set_text_buf(pack8(32, 120, 56, 54, 95, 54, 52, 32), 8, 0, 0)
+        rt_gui_set_text_buf(pack8(118, 49, 46, 48, 0, 0, 0, 0), 16, 0, 0)
+        rt_gui_draw_text_buf(pack(ox, oy), pack(green_c, 20), 220, 0)
+        return 16
+
+    if g_term_out_type == 3:
+        # ls output — realistic directory listing
+        # "bin/"
+        draw_label(ox, oy, cyan_c, 200, pack8(98, 105, 110, 47, 0, 0, 0, 0), 4)
+        # "etc/"
+        draw_label(ox, oy + 16, cyan_c, 200, pack8(101, 116, 99, 47, 0, 0, 0, 0), 4)
+        # "home/"
+        draw_label(ox, oy + 32, cyan_c, 200, pack8(104, 111, 109, 101, 47, 0, 0, 0), 5)
+        # "boot/"
+        draw_label(ox, oy + 48, cyan_c, 200, pack8(98, 111, 111, 116, 47, 0, 0, 0), 5)
+        # "kernel.elf   91247K"
+        # k=107,e=101,r=114,n=110,e=101,l=108,46=.,e=101
+        rt_gui_set_text_buf(pack8(107, 101, 114, 110, 101, 108, 46, 101), 0, 0, 0)
+        # l=108,f=102, ,32, ,32, 57=9,49=1
+        rt_gui_set_text_buf(pack8(108, 102, 32, 32, 32, 57, 49, 50), 8, 0, 0)
+        # 52=4,55=7,75=K,0,0,0,0,0
+        rt_gui_set_text_buf(pack8(52, 55, 75, 0, 0, 0, 0, 0), 16, 0, 0)
+        rt_gui_draw_text_buf(pack(ox, oy + 64), pack(color, 19), 200, 0)
+        # "simpleos.cfg    4K"
+        # s=115,i=105,m=109,p=112,l=108,e=101,o=111,s=115
+        rt_gui_set_text_buf(pack8(115, 105, 109, 112, 108, 101, 111, 115), 0, 0, 0)
+        # .=46,c=99,f=102,g=103, , , ,52=4
+        rt_gui_set_text_buf(pack8(46, 99, 102, 103, 32, 32, 32, 32), 8, 0, 0)
+        # 52=4,75=K,0...
+        rt_gui_set_text_buf(pack8(52, 75, 0, 0, 0, 0, 0, 0), 16, 0, 0)
+        rt_gui_draw_text_buf(pack(ox, oy + 80), pack(color, 18), 200, 0)
+        return 96
+
+    if g_term_out_type == 4:
+        # whoami: "root"
+        draw_label(ox, oy, green_c, 220, pack8(114, 111, 111, 116, 0, 0, 0, 0), 4)
+        return 16
+
+    if g_term_out_type == 5:
+        # date: read RTC and render "20YY-MM-DD HH:MM:SS"
+        val rtc_yr = get_rtc_year()
+        val rtc_mo = get_rtc_month()
+        val rtc_dy = get_rtc_day()
+        val rtc_hh = get_rtc_hours()
+        val rtc_mi = get_rtc_minutes()
+        val rtc_ss = get_rtc_seconds()
+        # "20YY-MM-DD" (10 chars)
+        # 50='2', 48='0', YY tens, YY ones, 45='-', MM tens, MM ones, 45='-'
+        rt_gui_set_text_buf(pack8(50, 48, digit_tens(rtc_yr), digit_ones(rtc_yr), 45, digit_tens(rtc_mo), digit_ones(rtc_mo), 45), 0, 0, 0)
+        # DD tens, DD ones, 32=' ', HH tens, HH ones, 58=':', MM tens, MM ones
+        rt_gui_set_text_buf(pack8(digit_tens(rtc_dy), digit_ones(rtc_dy), 32, digit_tens(rtc_hh), digit_ones(rtc_hh), 58, digit_tens(rtc_mi), digit_ones(rtc_mi)), 8, 0, 0)
+        # 58=':', SS tens, SS ones
+        rt_gui_set_text_buf(pack8(58, digit_tens(rtc_ss), digit_ones(rtc_ss), 0, 0, 0, 0, 0), 16, 0, 0)
+        rt_gui_draw_text_buf(pack(ox, oy), pack(color, 19), 200, 0)
+        return 16
+
+    if g_term_out_type == 6:
+        # uptime: compute from g_frame_count (~60fps)
+        val total_secs = g_frame_count / 60
+        val up_hours = total_secs / 3600
+        val up_mins = (total_secs / 60) % 60
+        val up_secs = total_secs % 60
+        val up_days = up_hours / 24
+        val up_hrs_rem = up_hours % 24
+        # "up Xd HH:MM:SS" — format: u=117,p=112,32,days_digit,d=100,32,HH,:,MM,:,SS
+        rt_gui_set_text_buf(pack8(117, 112, 32, digit_ones(up_days), 100, 32, digit_tens(up_hrs_rem), digit_ones(up_hrs_rem)), 0, 0, 0)
+        rt_gui_set_text_buf(pack8(58, digit_tens(up_mins), digit_ones(up_mins), 58, digit_tens(up_secs), digit_ones(up_secs), 0, 0), 8, 0, 0)
+        rt_gui_draw_text_buf(pack(ox, oy), pack(color, 14), 200, 0)
+        return 16
+
+    if g_term_out_type == 7:
+        # Unknown: "command not found"
+        rt_gui_set_text_buf(pack8(99, 111, 109, 109, 97, 110, 100, 32), 0, 0, 0)
+        rt_gui_set_text_buf(pack8(110, 111, 116, 32, 102, 111, 117, 110), 8, 0, 0)
+        rt_gui_set_text_buf(pack8(100, 0, 0, 0, 0, 0, 0, 0), 16, 0, 0)
+        rt_gui_draw_text_buf(pack(ox, oy), pack(0x00FF4444, 17), 220, 0)
+        return 16
+
+    if g_term_out_type == 8:
+        # ps: show process list
+        # "PID 1  init"
+        rt_gui_set_text_buf(pack8(80, 73, 68, 32, 49, 32, 32, 105), 0, 0, 0)
+        rt_gui_set_text_buf(pack8(110, 105, 116, 0, 0, 0, 0, 0), 8, 0, 0)
+        rt_gui_draw_text_buf(pack(ox, oy), pack(color, 11), 200, 0)
+        # "PID 2  wm"
+        rt_gui_set_text_buf(pack8(80, 73, 68, 32, 50, 32, 32, 119), 0, 0, 0)
+        rt_gui_set_text_buf(pack8(109, 0, 0, 0, 0, 0, 0, 0), 8, 0, 0)
+        rt_gui_draw_text_buf(pack(ox, oy + 16), pack(color, 9), 200, 0)
+        # "PID 3  shell"
+        rt_gui_set_text_buf(pack8(80, 73, 68, 32, 51, 32, 32, 115), 0, 0, 0)
+        rt_gui_set_text_buf(pack8(104, 101, 108, 108, 0, 0, 0, 0), 8, 0, 0)
+        rt_gui_draw_text_buf(pack(ox, oy + 32), pack(color, 12), 200, 0)
+        return 48
+
+    if g_term_out_type == 9:
+        # free: "Total: 256MB  Used: 67MB  Free: 189MB"
+        rt_gui_set_text_buf(pack8(84, 111, 116, 97, 108, 58, 32, 50), 0, 0, 0)
+        rt_gui_set_text_buf(pack8(53, 54, 77, 66, 32, 32, 85, 115), 8, 0, 0)
+        rt_gui_set_text_buf(pack8(101, 100, 58, 32, 54, 55, 77, 66), 16, 0, 0)
+        rt_gui_set_text_buf(pack8(32, 32, 70, 114, 101, 101, 58, 32), 24, 0, 0)
+        rt_gui_set_text_buf(pack8(49, 56, 57, 77, 66, 0, 0, 0), 32, 0, 0)
+        rt_gui_draw_text_buf(pack(ox, oy), pack(color, 37), 200, 0)
+        return 16
+
+    if g_term_out_type == 10:
+        # hostname: "simpleos"
+        draw_label(ox, oy, green_c, 220, pack8(115, 105, 109, 112, 108, 101, 111, 115), 8)
+        return 16
+
+    if g_term_out_type == 11:
+        # pwd: "/home/root"
+        rt_gui_set_text_buf(pack8(47, 104, 111, 109, 101, 47, 114, 111), 0, 0, 0)
+        rt_gui_set_text_buf(pack8(111, 116, 0, 0, 0, 0, 0, 0), 8, 0, 0)
+        rt_gui_draw_text_buf(pack(ox, oy), pack(color, 10), 200, 0)
+        return 16
+
+    if g_term_out_type == 12:
+        # echo: render saved echo buffer
+        val words_needed = (g_echo_len + 7) / 8
+        if words_needed > 0:
+            rt_gui_set_text_buf(g_echo_buf_0, 0, 0, 0)
+        if words_needed > 1:
+            rt_gui_set_text_buf(g_echo_buf_1, 8, 0, 0)
+        if words_needed > 2:
+            rt_gui_set_text_buf(g_echo_buf_2, 16, 0, 0)
+        if words_needed > 3:
+            rt_gui_set_text_buf(g_echo_buf_3, 24, 0, 0)
+        if words_needed > 4:
+            rt_gui_set_text_buf(g_echo_buf_4, 32, 0, 0)
+        rt_gui_draw_text_buf(pack(ox, oy), pack(color, g_echo_len), 200, 0)
+        return 16
+
+    return 0
+
+fn draw_terminal_content(x: u64, y: u64, w: u64, h: u64, theme: u64):
+    """Render interactive terminal with command prompt and output."""
+    val cy = y + TITLE_BAR_H + 2
+    val content_x = x + 10
+    val text_color = 0x0044FF44
+    val prompt_color = 0x0044FF44
+    val output_color = 0x00CCCCCC
+    val bg_color = 0x000A0A14
+
+    # Terminal dark interior -- rounded bottom corners
+    rrect(x + 1, cy, w - 2, h - TITLE_BAR_H - 3, bg_color, 10, 200)
+
+    var line_y = cy + 8
+
+    # Welcome header (shown before any command is executed)
+    if g_term_cmd_history == 0:
+        # "SimpleOS Terminal v1.0"
+        rt_gui_set_text_buf(pack8(83, 105, 109, 112, 108, 101, 79, 83), 0, 0, 0)
+        rt_gui_set_text_buf(pack8(32, 84, 101, 114, 109, 105, 110, 97), 8, 0, 0)
+        rt_gui_set_text_buf(pack8(108, 32, 118, 49, 46, 48, 0, 0), 16, 0, 0)
+        rt_gui_draw_text_buf(pack(content_x, line_y), pack(0x0088FF88, 22), 200, 0)
+        line_y = line_y + 16
+        # "Type 'help' for commands"
+        rt_gui_set_text_buf(pack8(84, 121, 112, 101, 32, 39, 104, 101), 0, 0, 0)
+        rt_gui_set_text_buf(pack8(108, 112, 39, 32, 102, 111, 114, 32), 8, 0, 0)
+        rt_gui_set_text_buf(pack8(99, 111, 109, 109, 97, 110, 100, 115), 16, 0, 0)
+        rt_gui_draw_text_buf(pack(content_x, line_y), pack(output_color, 24), 160, 0)
+        line_y = line_y + 16
+        line_y = line_y + 8
+
+    # Show command output (from last executed command)
+    if g_term_cmd_history > 0 and g_term_out_count > 0:
+        val out_h = render_term_output(content_x, line_y, output_color)
+        line_y = line_y + out_h
+        line_y = line_y + 8
+
+    # Current prompt line: "$ " prefix in green
+    draw_label(content_x, line_y, prompt_color, 220, pack8(36, 32, 0, 0, 0, 0, 0, 0), 2)
+
+    # Render typed input text
+    if g_term_input_len > 0:
+        render_term_input(content_x + 16, line_y, text_color)
+
+    # Blinking cursor block
+    val cursor_x = content_x + 16 + g_term_input_len * 8
+    blend(cursor_x, line_y, 8, 14, text_color, 180)
+
+# ===========================================================================
+# Browser Functions (Window 2)
+# ===========================================================================
+
+fn render_browser_url(x: u64, y: u64, color: u64):
+    """Render URL from packed buffer."""
+    if g_browser_url_len > 0:
+        rt_gui_set_text_buf(g_browser_url_0, 0, 0, 0)
+    if g_browser_url_len > 8:
+        rt_gui_set_text_buf(g_browser_url_1, 8, 0, 0)
+    if g_browser_url_len > 16:
+        rt_gui_set_text_buf(g_browser_url_2, 16, 0, 0)
+    if g_browser_url_len > 24:
+        rt_gui_set_text_buf(g_browser_url_3, 24, 0, 0)
+    if g_browser_url_len > 32:
+        rt_gui_set_text_buf(g_browser_url_4, 32, 0, 0)
+    val size_and_len = (12 << 16) | (g_browser_url_len & 0xFFFF)
+    rt_gui_draw_text_vector(pack(x, y), pack(color, size_and_len), 200, 0)
+
+fn draw_browser_toolbar(x: u64, y: u64, w: u64, theme: u64):
+    """Draw browser toolbar with back/forward/reload and URL bar."""
+    val tb_y = y + TITLE_BAR_H + 2
+    val tb_h: u64 = 28
+
+    # Toolbar background
+    blend(x + 2, tb_y, w - 4, tb_h, surface(theme), 40)
+
+    # Back button (left arrow)
+    val btn_y = tb_y + 4
+    val btn_d: u64 = 20
+    circle(x + 10, btn_y, btn_d, surface(theme), 60)
+    # Arrow glyph: <
+    line(x + 18, btn_y + 4, x + 14, btn_y + 10, text_c(theme), 2, 160)
+    line(x + 14, btn_y + 10, x + 18, btn_y + 16, text_c(theme), 2, 160)
+
+    # Forward button
+    circle(x + 34, btn_y, btn_d, surface(theme), 60)
+    # Arrow glyph: >
+    line(x + 40, btn_y + 4, x + 44, btn_y + 10, text_c(theme), 2, 160)
+    line(x + 44, btn_y + 10, x + 40, btn_y + 16, text_c(theme), 2, 160)
+
+    # Reload button (circle arrow)
+    circle(x + 58, btn_y, btn_d, surface(theme), 60)
+    ring(x + 62, btn_y + 4, 12, 2, text_c(theme), 140)
+
+    # URL bar (rounded rect)
+    val url_x = x + 82
+    val url_w = w - 90
+    rrect_aa(url_x, tb_y + 3, url_w, 22, surface(theme), 8, 80)
+    # URL bar border
+    rrect_aa(url_x, tb_y + 3, url_w, 22, border_c(theme), 8, 30)
+
+    # Focus highlight on URL bar
+    if g_browser_input_active == 1:
+        rrect_aa(url_x - 1, tb_y + 2, url_w + 2, 24, accent(theme), 9, 40)
+
+    # URL text
+    if g_browser_url_len > 0:
+        render_browser_url(url_x + 6, tb_y + 6, text_c(theme))
+    else:
+        # Placeholder text: "Enter URL" (69,110,116,101,114,32,85,82,76)
+        rt_gui_set_text_buf(pack8(69, 110, 116, 101, 114, 32, 85, 82), 0, 0, 0)
+        rt_gui_set_text_buf(pack8(76, 0, 0, 0, 0, 0, 0, 0), 8, 0, 0)
+        val placeholder_size_and_len = (12 << 16) | 9
+        rt_gui_draw_text_vector(pack(url_x + 6, tb_y + 6), pack(text_sec(theme), placeholder_size_and_len), 100, 0)
+
+    # Cursor in URL bar
+    if g_browser_input_active == 1:
+        blend(url_x + 6 + g_browser_url_len * 8, tb_y + 6, 2, 14, accent(theme), 200)
+
+    # Toolbar bottom separator
+    blend(x + 2, tb_y + tb_h, w - 4, 1, border_c(theme), 20)
+
+fn browser_navigate(page: u64):
+    """Navigate to a page and push to history."""
+    g_browser_page = page
+    g_browser_scroll_y = 0
+    # Push to history
+    if g_browser_history_pos < 5:
+        if g_browser_history_pos == 0: g_browser_history_0 = page
+        if g_browser_history_pos == 1: g_browser_history_1 = page
+        if g_browser_history_pos == 2: g_browser_history_2 = page
+        if g_browser_history_pos == 3: g_browser_history_3 = page
+        if g_browser_history_pos == 4: g_browser_history_4 = page
+        g_browser_history_pos = g_browser_history_pos + 1
+        g_browser_history_len = g_browser_history_pos
+
+fn browser_go_back():
+    if g_browser_history_pos > 1:
+        g_browser_history_pos = g_browser_history_pos - 1
+        val pos = g_browser_history_pos - 1
+        if pos == 0: g_browser_page = g_browser_history_0
+        if pos == 1: g_browser_page = g_browser_history_1
+        if pos == 2: g_browser_page = g_browser_history_2
+        if pos == 3: g_browser_page = g_browser_history_3
+        g_browser_scroll_y = 0
+
+fn browser_go_forward():
+    if g_browser_history_pos < g_browser_history_len:
+        val pos = g_browser_history_pos
+        if pos == 0: g_browser_page = g_browser_history_0
+        if pos == 1: g_browser_page = g_browser_history_1
+        if pos == 2: g_browser_page = g_browser_history_2
+        if pos == 3: g_browser_page = g_browser_history_3
+        g_browser_history_pos = g_browser_history_pos + 1
+        g_browser_scroll_y = 0
+
+fn browser_get_url_char(pos: u64) -> u64:
+    val word = pos / 8
+    val shift = (pos % 8) * 8
+    var packed: u64 = 0
+    if word == 0: packed = g_browser_url_0
+    if word == 1: packed = g_browser_url_1
+    if word == 2: packed = g_browser_url_2
+    if word == 3: packed = g_browser_url_3
+    if word == 4: packed = g_browser_url_4
+    (packed >> shift) & 0xFF
+
+fn browser_set_url_char(pos: u64, ch: u64):
+    val word = pos / 8
+    val shift = (pos % 8) * 8
+    val mask = 0xFF << shift
+    if word == 0: g_browser_url_0 = (g_browser_url_0 & (0xFFFFFFFFFFFFFFFF ^ mask)) | (ch << shift)
+    if word == 1: g_browser_url_1 = (g_browser_url_1 & (0xFFFFFFFFFFFFFFFF ^ mask)) | (ch << shift)
+    if word == 2: g_browser_url_2 = (g_browser_url_2 & (0xFFFFFFFFFFFFFFFF ^ mask)) | (ch << shift)
+    if word == 3: g_browser_url_3 = (g_browser_url_3 & (0xFFFFFFFFFFFFFFFF ^ mask)) | (ch << shift)
+    if word == 4: g_browser_url_4 = (g_browser_url_4 & (0xFFFFFFFFFFFFFFFF ^ mask)) | (ch << shift)
+
+fn browser_navigate_url():
+    """Navigate based on URL text. Match against built-in pages."""
+    # Check first chars of URL
+    val ch0 = browser_get_url_char(0)
+    val ch1 = browser_get_url_char(1)
+    # "about:" prefix check (a=97, b=98, o=111, u=117, t=116, :=58)
+    if ch0 == 97 and ch1 == 98:  # "ab..."
+        val ch6 = browser_get_url_char(6)
+        if ch6 == 104: browser_navigate(1)      # "about:help" (h=104)
+        else:
+            if ch6 == 115: browser_navigate(2)   # "about:sysinfo" (s=115)
+            else:
+                if ch6 == 97: browser_navigate(3) # "about:about" (a=97)
+                else:
+                    if ch6 == 110: browser_navigate(4) # "about:network" (n=110)
+                    else: browser_navigate(0)         # default to home
+    else:
+        browser_navigate(0)  # Unknown URL -> home
+
+fn draw_browser_content(x: u64, y: u64, w: u64, h: u64, theme: u64):
+    """Render browser window: toolbar + page content."""
+    # Draw toolbar (navigation buttons + URL bar)
+    draw_browser_toolbar(x, y, w, theme)
+
+    # Content area below title bar and toolbar (toolbar is 28px)
+    val cx = x + 4
+    val cy = y + TITLE_BAR_H + 32
+    val cw = w - 8
+    val ch = h - TITLE_BAR_H - 36
+
+    # Content background
+    if theme == 0:
+        blend(cx, cy, cw, ch, 0x001A1A2E, 230)
+    else:
+        blend(cx, cy, cw, ch, 0x00FFFFFF, 230)
+
+    # Render current page
+    if g_browser_page == 0:
+        draw_page_home(cx, cy, cw, ch, theme)
+    if g_browser_page == 1:
+        draw_page_help(cx, cy, cw, ch, theme)
+    if g_browser_page == 2:
+        draw_page_sysinfo(cx, cy, cw, ch, theme)
+    if g_browser_page == 3:
+        draw_page_about(cx, cy, cw, ch, theme)
+    if g_browser_page == 4:
+        draw_page_network(cx, cy, cw, ch, theme)
+
+fn draw_page_home(x: u64, y: u64, w: u64, h: u64, theme: u64):
+    """Render the browser home page -- centered logo, search bar, quick links."""
+    val text_color = text_c(theme)
+    val dim_color = text_sec(theme)
+    val link_color: u64 = 0x000A84FF
+    val accent_c = accent(theme)
+
+    # Centered title "Simple" using vector font
+    val title_x = x + w / 2 - 70
+    val title_y = y + 30
+    # "Simple" = 83,105,109,112,108,101
+    draw_label_vector(title_x, title_y, text_color, 240, pack8(83, 105, 109, 112, 108, 101, 0, 0), 6, 24)
+    # "Browser" = 66,114,111,119,115,101,114
+    draw_label_vector(title_x + 80, title_y, accent_c, 240, pack8(66, 114, 111, 119, 115, 101, 114, 0), 7, 24)
+
+    # Globe icon (ring)
+    ring(x + w / 2 - 20, title_y - 5, 16, 2, accent_c, 180)
+
+    # Subtitle: "Welcome " = 87,101,108,99,111,109,101,32
+    val sub_y = title_y + 36
+    draw_label_vector(x + w / 2 - 72, sub_y, dim_color, 160, pack8(87, 101, 108, 99, 111, 109, 101, 32), 8, 14)
+    # "to Simpl" = 116,111,32,83,105,109,112,108
+    draw_label_vector(x + w / 2 - 8, sub_y, dim_color, 160, pack8(116, 111, 32, 83, 105, 109, 112, 108), 8, 14)
+    # "eOS" = 101,79,83
+    draw_label_vector(x + w / 2 + 56, sub_y, dim_color, 160, pack8(101, 79, 83, 0, 0, 0, 0, 0), 3, 14)
+
+    # Search/URL input hint box
+    val box_x = x + 30
+    val box_y = sub_y + 30
+    val box_w = w - 60
+    if theme == 0:
+        rrect_aa(box_x, box_y, box_w, 28, 0x00252540, 10, 180)
+    else:
+        rrect_aa(box_x, box_y, box_w, 28, 0x00F0F0F0, 10, 180)
+    rrect_aa(box_x, box_y, box_w, 28, border_c(theme), 10, 20)
+    # Placeholder text in vector type
+    draw_label_vector(box_x + 10, box_y + 5, dim_color, 120, pack8(84, 121, 112, 101, 32, 97, 32, 85), 8, 12)
+    draw_label_vector(box_x + 74, box_y + 5, dim_color, 120, pack8(82, 76, 32, 97, 98, 111, 118, 101), 8, 12)
+    draw_label_vector(box_x + 138, box_y + 5, dim_color, 120, pack8(46, 46, 46, 0, 0, 0, 0, 0), 3, 12)
+
+    # Quick links section
+    val links_y = box_y + 50
+    # "Quick Links" in vector type
+    draw_label_vector(x + 20, links_y + 1, text_color, 200, pack8(81, 117, 105, 99, 107, 32, 76, 105), 8, 16)
+    draw_label_vector(x + 84, links_y + 1, text_color, 200, pack8(110, 107, 115, 0, 0, 0, 0, 0), 3, 16)
+    # Separator line
+    blend(x + 20, links_y + 18, w - 40, 1, dim_color, 40)
+
+    # Link items (blue text with bullet dots)
+    val link_start_y = links_y + 28
+
+    # Link 1: "About Si" = 65,98,111,117,116,32,83,105
+    circle(x + 24, link_start_y + 2, 8, accent_c, 160)
+    draw_label_vector(x + 38, link_start_y, link_color, 220, pack8(65, 98, 111, 117, 116, 32, 83, 105), 8, 14)
+    # "mpleOS" = 109,112,108,101,79,83
+    draw_label_vector(x + 102, link_start_y, link_color, 220, pack8(109, 112, 108, 101, 79, 83, 0, 0), 6, 14)
+
+    # Link 2: "System I" = 83,121,115,116,101,109,32,73
+    val l2y = link_start_y + 24
+    circle(x + 24, l2y + 2, 8, accent_c, 160)
+    draw_label_vector(x + 38, l2y, link_color, 220, pack8(83, 121, 115, 116, 101, 109, 32, 73), 8, 14)
+    # "nfo" = 110,102,111
+    draw_label_vector(x + 102, l2y, link_color, 220, pack8(110, 102, 111, 0, 0, 0, 0, 0), 3, 14)
+
+    # Link 3: "Help" = 72,101,108,112
+    val l3y = l2y + 24
+    circle(x + 24, l3y + 2, 8, accent_c, 160)
+    draw_label_vector(x + 38, l3y, link_color, 220, pack8(72, 101, 108, 112, 0, 0, 0, 0), 4, 14)
+
+    # Link 4: "Network " = 78,101,116,119,111,114,107,32
+    val l4y = l3y + 24
+    circle(x + 24, l4y + 2, 8, 0x0030D158, 160)
+    draw_label_vector(x + 38, l4y, link_color, 220, pack8(78, 101, 116, 119, 111, 114, 107, 32), 8, 14)
+    # "Status" = 83,116,97,116,117,115
+    draw_label_vector(x + 102, l4y, link_color, 220, pack8(83, 116, 97, 116, 117, 115, 0, 0), 6, 14)
+
+fn draw_page_help(x: u64, y: u64, w: u64, h: u64, theme: u64):
+    """Render browser help page."""
+    val text_color = text_c(theme)
+    val dim_color = text_sec(theme)
+    val heading_color = text_color
+
+    # Title in vector type
+    draw_label_vector(x + 10, y + 9, heading_color, 240, pack8(83, 105, 109, 112, 108, 101, 66, 114), 8, 18)
+    draw_label_vector(x + 74, y + 9, heading_color, 240, pack8(111, 119, 115, 101, 114, 32, 72, 101), 8, 18)
+    draw_label_vector(x + 138, y + 9, heading_color, 240, pack8(108, 112, 0, 0, 0, 0, 0, 0), 2, 18)
+    blend(x + 10, y + 28, w - 20, 1, dim_color, 40)
+
+    # Navigation section
+    val ny = y + 40
+    # "Navigati" = 78,97,118,105,103,97,116,105
+    draw_label_vector(x + 10, ny + 1, heading_color, 220, pack8(78, 97, 118, 105, 103, 97, 116, 105), 8, 16)
+    # "on" = 111,110
+    draw_label_vector(x + 74, ny + 1, heading_color, 220, pack8(111, 110, 0, 0, 0, 0, 0, 0), 2, 16)
+
+    # "Click ad" = 67,108,105,99,107,32,97,100
+    draw_label_vector(x + 20, ny + 20, text_color, 180, pack8(67, 108, 105, 99, 107, 32, 97, 100), 8, 14)
+    # "dress ba" = 100,114,101,115,115,32,98,97
+    draw_label_vector(x + 84, ny + 20, text_color, 180, pack8(100, 114, 101, 115, 115, 32, 98, 97), 8, 14)
+    # "r to typ" = 114,32,116,111,32,116,121,112
+    draw_label_vector(x + 148, ny + 20, text_color, 180, pack8(114, 32, 116, 111, 32, 116, 121, 112), 8, 14)
+    # "e URL" = 101,32,85,82,76
+    draw_label_vector(x + 212, ny + 20, text_color, 180, pack8(101, 32, 85, 82, 76, 0, 0, 0), 5, 14)
+
+    # "Press En" = 80,114,101,115,115,32,69,110
+    draw_label_vector(x + 20, ny + 38, text_color, 180, pack8(80, 114, 101, 115, 115, 32, 69, 110), 8, 14)
+    # "ter to n" = 116,101,114,32,116,111,32,110
+    draw_label_vector(x + 84, ny + 38, text_color, 180, pack8(116, 101, 114, 32, 116, 111, 32, 110), 8, 14)
+    # "avigate" = 97,118,105,103,97,116,101
+    draw_label_vector(x + 148, ny + 38, text_color, 180, pack8(97, 118, 105, 103, 97, 116, 101, 0), 7, 14)
+
+    # "Click li" = 67,108,105,99,107,32,108,105
+    draw_label_vector(x + 20, ny + 56, text_color, 180, pack8(67, 108, 105, 99, 107, 32, 108, 105), 8, 14)
+    # "nks to f" = 110,107,115,32,116,111,32,102
+    draw_label_vector(x + 84, ny + 56, text_color, 180, pack8(110, 107, 115, 32, 116, 111, 32, 102), 8, 14)
+    # "ollow" = 111,108,108,111,119
+    draw_label_vector(x + 148, ny + 56, text_color, 180, pack8(111, 108, 108, 111, 119, 0, 0, 0), 5, 14)
+
+    # Built-in pages section
+    val py = ny + 84
+    # "Built-in Pages" in vector type
+    draw_label_vector(x + 10, py + 1, heading_color, 220, pack8(66, 117, 105, 108, 116, 45, 105, 110), 8, 16)
+    draw_label_vector(x + 74, py + 1, heading_color, 220, pack8(32, 80, 97, 103, 101, 115, 0, 0), 6, 16)
+
+    # "about:ho" = 97,98,111,117,116,58,104,111
+    draw_label_vector(x + 20, py + 20, text_color, 180, pack8(97, 98, 111, 117, 116, 58, 104, 111), 8, 14)
+    # "me  Star" = 109,101,32,32,83,116,97,114
+    draw_label_vector(x + 84, py + 20, text_color, 180, pack8(109, 101, 32, 32, 83, 116, 97, 114), 8, 14)
+    # "t page" = 116,32,112,97,103,101
+    draw_label_vector(x + 148, py + 20, text_color, 180, pack8(116, 32, 112, 97, 103, 101, 0, 0), 6, 14)
+
+    # "about:he" = 97,98,111,117,116,58,104,101
+    draw_label_vector(x + 20, py + 38, text_color, 180, pack8(97, 98, 111, 117, 116, 58, 104, 101), 8, 14)
+    # "lp  This" = 108,112,32,32,84,104,105,115
+    draw_label_vector(x + 84, py + 38, text_color, 180, pack8(108, 112, 32, 32, 84, 104, 105, 115), 8, 14)
+    # " page" = 32,112,97,103,101
+    draw_label_vector(x + 148, py + 38, text_color, 180, pack8(32, 112, 97, 103, 101, 0, 0, 0), 5, 14)
+
+    # "about:sy" = 97,98,111,117,116,58,115,121
+    draw_label_vector(x + 20, py + 56, text_color, 180, pack8(97, 98, 111, 117, 116, 58, 115, 121), 8, 14)
+    # "sinfo Sy" = 115,105,110,102,111,32,83,121
+    draw_label_vector(x + 84, py + 56, text_color, 180, pack8(115, 105, 110, 102, 111, 32, 83, 121), 8, 14)
+    # "stem inf" = 115,116,101,109,32,105,110,102
+    draw_label_vector(x + 148, py + 56, text_color, 180, pack8(115, 116, 101, 109, 32, 105, 110, 102), 8, 14)
+    # "o" = 111
+    draw_label_vector(x + 212, py + 56, text_color, 180, pack8(111, 0, 0, 0, 0, 0, 0, 0), 1, 14)
+
+    # "about:ab" = 97,98,111,117,116,58,97,98
+    draw_label_vector(x + 20, py + 74, text_color, 180, pack8(97, 98, 111, 117, 116, 58, 97, 98), 8, 14)
+    # "out  Abo" = 111,117,116,32,32,65,98,111
+    draw_label_vector(x + 84, py + 74, text_color, 180, pack8(111, 117, 116, 32, 32, 65, 98, 111), 8, 14)
+    # "ut" = 117,116
+    draw_label_vector(x + 148, py + 74, text_color, 180, pack8(117, 116, 0, 0, 0, 0, 0, 0), 2, 14)
+
+    # Back link: "< Back t" = 60,32,66,97,99,107,32,116
+    val by = py + 104
+    draw_label_vector(x + 20, by, 0x000A84FF, 220, pack8(60, 32, 66, 97, 99, 107, 32, 116), 8, 14)
+    # "o Home" = 111,32,72,111,109,101
+    draw_label_vector(x + 84, by, 0x000A84FF, 220, pack8(111, 32, 72, 111, 109, 101, 0, 0), 6, 14)
+
+fn draw_page_sysinfo(x: u64, y: u64, w: u64, h: u64, theme: u64):
+    """Render system information page."""
+    val text_color = text_c(theme)
+    val dim_color = text_sec(theme)
+    val heading_color = text_color
+
+    # Title in vector type
+    draw_label_vector(x + 10, y + 9, heading_color, 240, pack8(83, 121, 115, 116, 101, 109, 32, 73), 8, 18)
+    draw_label_vector(x + 74, y + 9, heading_color, 240, pack8(110, 102, 111, 114, 109, 97, 116, 105), 8, 18)
+    draw_label_vector(x + 138, y + 9, heading_color, 240, pack8(111, 110, 0, 0, 0, 0, 0, 0), 2, 18)
+    blend(x + 10, y + 28, w - 20, 1, dim_color, 40)
+
+    val sy = y + 40
+    # "CPU: x86" = 67,80,85,58,32,120,56,54
+    draw_label_vector(x + 20, sy, text_color, 180, pack8(67, 80, 85, 58, 32, 120, 56, 54), 8, 14)
+    # "_64" = 95,54,52
+    draw_label_vector(x + 84, sy, text_color, 180, pack8(95, 54, 52, 0, 0, 0, 0, 0), 3, 14)
+
+    # "Display:" = 68,105,115,112,108,97,121,58
+    draw_label_vector(x + 20, sy + 20, text_color, 180, pack8(68, 105, 115, 112, 108, 97, 121, 58), 8, 14)
+    # " 1024x76" = 32,49,48,50,52,120,55,54
+    draw_label_vector(x + 84, sy + 20, text_color, 180, pack8(32, 49, 48, 50, 52, 120, 55, 54), 8, 14)
+    # "8x32" = 56,120,51,50
+    draw_label_vector(x + 148, sy + 20, text_color, 180, pack8(56, 120, 51, 50, 0, 0, 0, 0), 4, 14)
+
+    # "Heap: 16" = 72,101,97,112,58,32,49,54
+    draw_label_vector(x + 20, sy + 40, text_color, 180, pack8(72, 101, 97, 112, 58, 32, 49, 54), 8, 14)
+    # " MB" = 32,77,66
+    draw_label_vector(x + 84, sy + 40, text_color, 180, pack8(32, 77, 66, 0, 0, 0, 0, 0), 3, 14)
+
+    # "Stack: 8" = 83,116,97,99,107,58,32,56
+    draw_label_vector(x + 20, sy + 60, text_color, 180, pack8(83, 116, 97, 99, 107, 58, 32, 56), 8, 14)
+    # " MB" = 32,77,66
+    draw_label_vector(x + 84, sy + 60, text_color, 180, pack8(32, 77, 66, 0, 0, 0, 0, 0), 3, 14)
+
+    # "Network" = 78,101,116,119,111,114,107
+    draw_label_vector(x + 10, sy + 91, heading_color, 220, pack8(78, 101, 116, 119, 111, 114, 107, 0), 7, 16)
+
+    # "VirtIO-n" = 86,105,114,116,73,79,45,110
+    draw_label_vector(x + 20, sy + 110, dim_color, 180, pack8(86, 105, 114, 116, 73, 79, 45, 110), 8, 14)
+    # "et: not " = 101,116,58,32,110,111,116,32
+    draw_label_vector(x + 84, sy + 110, dim_color, 180, pack8(101, 116, 58, 32, 110, 111, 116, 32), 8, 14)
+    # "connecte" = 99,111,110,110,101,99,116,101
+    draw_label_vector(x + 148, sy + 110, dim_color, 180, pack8(99, 111, 110, 110, 101, 99, 116, 101), 8, 14)
+    # "d" = 100
+    draw_label_vector(x + 212, sy + 110, dim_color, 180, pack8(100, 0, 0, 0, 0, 0, 0, 0), 1, 14)
+
+    # Back link: "< Back t" = 60,32,66,97,99,107,32,116
+    draw_label_vector(x + 20, sy + 150, 0x000A84FF, 220, pack8(60, 32, 66, 97, 99, 107, 32, 116), 8, 14)
+    # "o Home" = 111,32,72,111,109,101
+    draw_label_vector(x + 84, sy + 150, 0x000A84FF, 220, pack8(111, 32, 72, 111, 109, 101, 0, 0), 6, 14)
+
+fn draw_page_about(x: u64, y: u64, w: u64, h: u64, theme: u64):
+    """Render about page."""
+    val text_color = text_c(theme)
+    val heading_color = text_color
+
+    # Title in vector type
+    draw_label_vector(x + 10, y + 9, heading_color, 240, pack8(65, 98, 111, 117, 116, 32, 83, 105), 8, 18)
+    draw_label_vector(x + 74, y + 9, heading_color, 240, pack8(109, 112, 108, 101, 66, 114, 111, 119), 8, 18)
+    draw_label_vector(x + 138, y + 9, heading_color, 240, pack8(115, 101, 114, 0, 0, 0, 0, 0), 3, 18)
+
+    # "Version " = 86,101,114,115,105,111,110,32
+    draw_label_vector(x + 20, y + 40, text_color, 180, pack8(86, 101, 114, 115, 105, 111, 110, 32), 8, 14)
+    # "0.1" = 48,46,49
+    draw_label_vector(x + 84, y + 40, text_color, 180, pack8(48, 46, 49, 0, 0, 0, 0, 0), 3, 14)
+
+    # "Built fo" = 66,117,105,108,116,32,102,111
+    draw_label_vector(x + 20, y + 60, text_color, 180, pack8(66, 117, 105, 108, 116, 32, 102, 111), 8, 14)
+    # "r Simple" = 114,32,83,105,109,112,108,101
+    draw_label_vector(x + 84, y + 60, text_color, 180, pack8(114, 32, 83, 105, 109, 112, 108, 101), 8, 14)
+    # "OS" = 79,83
+    draw_label_vector(x + 148, y + 60, text_color, 180, pack8(79, 83, 0, 0, 0, 0, 0, 0), 2, 14)
+
+    # "Renderin" = 82,101,110,100,101,114,105,110
+    draw_label_vector(x + 20, y + 80, text_color, 180, pack8(82, 101, 110, 100, 101, 114, 105, 110), 8, 14)
+    # "g: glass" = 103,58,32,103,108,97,115,115
+    draw_label_vector(x + 84, y + 80, text_color, 180, pack8(103, 58, 32, 103, 108, 97, 115, 115), 8, 14)
+    # ".render." = 46,114,101,110,100,101,114,46
+    draw_label_vector(x + 148, y + 80, text_color, 180, pack8(46, 114, 101, 110, 100, 101, 114, 46), 8, 14)
+    # "c" = 99
+    draw_label_vector(x + 212, y + 80, text_color, 180, pack8(99, 0, 0, 0, 0, 0, 0, 0), 1, 14)
+
+    # "Font: 8x" = 70,111,110,116,58,32,56,120
+    draw_label_vector(x + 20, y + 100, text_color, 180, pack8(70, 111, 110, 116, 58, 32, 56, 120), 8, 14)
+    # "16 bitma" = 49,54,32,98,105,116,109,97
+    draw_label_vector(x + 84, y + 100, text_color, 180, pack8(49, 54, 32, 98, 105, 116, 109, 97), 8, 14)
+    # "p + vect" = 112,32,43,32,118,101,99,116
+    draw_label_vector(x + 148, y + 100, text_color, 180, pack8(112, 32, 43, 32, 118, 101, 99, 116), 8, 14)
+    # "or" = 111,114
+    draw_label_vector(x + 212, y + 100, text_color, 180, pack8(111, 114, 0, 0, 0, 0, 0, 0), 2, 14)
+
+    # Back link: "< Back t" = 60,32,66,97,99,107,32,116
+    draw_label_vector(x + 20, y + 140, 0x000A84FF, 220, pack8(60, 32, 66, 97, 99, 107, 32, 116), 8, 14)
+    # "o Home" = 111,32,72,111,109,101
+    draw_label_vector(x + 84, y + 140, 0x000A84FF, 220, pack8(111, 32, 72, 111, 109, 101, 0, 0), 6, 14)
+
+fn draw_page_network(x: u64, y: u64, w: u64, h: u64, theme: u64):
+    """Render the network status page (about:network)."""
+    val text_color = text_c(theme)
+    val dim_color = text_sec(theme)
+    val heading_color = text_color
+    val red: u64 = 0x00FF3B30
+
+    # Title in vector type
+    draw_label_vector(x + 10, y + 9, heading_color, 240, pack8(78, 101, 116, 119, 111, 114, 107, 32), 8, 18)
+    draw_label_vector(x + 74, y + 9, heading_color, 240, pack8(83, 116, 97, 116, 117, 115, 0, 0), 6, 18)
+    blend(x + 10, y + 28, w - 20, 1, dim_color, 40)
+
+    # Interface status
+    val sy = y + 40
+    # "Interfac" = 73,110,116,101,114,102,97,99
+    draw_label_vector(x + 20, sy, text_color, 180, pack8(73, 110, 116, 101, 114, 102, 97, 99), 8, 14)
+    # "e: eth0" = 101,58,32,101,116,104,48
+    draw_label_vector(x + 84, sy, text_color, 180, pack8(101, 58, 32, 101, 116, 104, 48, 0), 7, 14)
+
+    # Status indicator (red circle = disconnected)
+    circle(x + 20, sy + 22, 8, red, 200)
+    # "Status: " = 83,116,97,116,117,115,58,32
+    draw_label_vector(x + 34, sy + 20, red, 210, pack8(83, 116, 97, 116, 117, 115, 58, 32), 8, 14)
+    # "Not conn" = 78,111,116,32,99,111,110,110
+    draw_label_vector(x + 98, sy + 20, red, 210, pack8(78, 111, 116, 32, 99, 111, 110, 110), 8, 14)
+    # "ected" = 101,99,116,101,100
+    draw_label_vector(x + 162, sy + 20, red, 210, pack8(101, 99, 116, 101, 100, 0, 0, 0), 5, 14)
+
+    # "Driver: " = 68,114,105,118,101,114,58,32
+    draw_label_vector(x + 20, sy + 42, text_color, 180, pack8(68, 114, 105, 118, 101, 114, 58, 32), 8, 14)
+    # "VirtIO-n" = 86,105,114,116,73,79,45,110
+    draw_label_vector(x + 84, sy + 42, text_color, 180, pack8(86, 105, 114, 116, 73, 79, 45, 110), 8, 14)
+    # "et" = 101,116
+    draw_label_vector(x + 148, sy + 42, text_color, 180, pack8(101, 116, 0, 0, 0, 0, 0, 0), 2, 14)
+
+    # "MAC: 52:" = 77,65,67,58,32,53,50,58
+    draw_label_vector(x + 20, sy + 62, dim_color, 160, pack8(77, 65, 67, 58, 32, 53, 50, 58), 8, 14)
+    # "54:00:12" = 53,52,58,48,48,58,49,50
+    draw_label_vector(x + 84, sy + 62, dim_color, 160, pack8(53, 52, 58, 48, 48, 58, 49, 50), 8, 14)
+    # ":34:56" = 58,51,52,58,53,54
+    draw_label_vector(x + 148, sy + 62, dim_color, 160, pack8(58, 51, 52, 58, 53, 54, 0, 0), 6, 14)
+
+    # Note about networking
+    val ny = sy + 92
+    # "To enabl" = 84,111,32,101,110,97,98,108
+    draw_label_vector(x + 10, ny + 1, heading_color, 200, pack8(84, 111, 32, 101, 110, 97, 98, 108), 8, 16)
+    # "e networ" = 101,32,110,101,116,119,111,114
+    draw_label_vector(x + 74, ny + 1, heading_color, 200, pack8(101, 32, 110, 101, 116, 119, 111, 114), 8, 16)
+    # "king:" = 107,105,110,103,58
+    draw_label_vector(x + 138, ny + 1, heading_color, 200, pack8(107, 105, 110, 103, 58, 0, 0, 0), 5, 16)
+
+    # "Add -net" = 65,100,100,32,45,110,101,116
+    draw_label_vector(x + 20, ny + 20, text_color, 180, pack8(65, 100, 100, 32, 45, 110, 101, 116), 8, 14)
+    # "dev user" = 100,101,118,32,117,115,101,114
+    draw_label_vector(x + 84, ny + 20, text_color, 180, pack8(100, 101, 118, 32, 117, 115, 101, 114), 8, 14)
+    # " to QEMU" = 32,116,111,32,81,69,77,85
+    draw_label_vector(x + 148, ny + 20, text_color, 180, pack8(32, 116, 111, 32, 81, 69, 77, 85), 8, 14)
+
+    # Packet counters
+    val py = ny + 50
+    # "Packets" = 80,97,99,107,101,116,115
+    draw_label_vector(x + 10, py + 1, heading_color, 200, pack8(80, 97, 99, 107, 101, 116, 115, 0), 7, 16)
+    # "TX: 0  R" = 84,88,58,32,48,32,32,82
+    draw_label_vector(x + 20, py + 20, dim_color, 160, pack8(84, 88, 58, 32, 48, 32, 32, 82), 8, 14)
+    # "X: 0  Dr" = 88,58,32,48,32,32,68,114
+    draw_label_vector(x + 84, py + 20, dim_color, 160, pack8(88, 58, 32, 48, 32, 32, 68, 114), 8, 14)
+    # "opped: 0" = 111,112,112,101,100,58,32,48
+    draw_label_vector(x + 148, py + 20, dim_color, 160, pack8(111, 112, 112, 101, 100, 58, 32, 48), 8, 14)
+
+    # Back link: "< Back t" = 60,32,66,97,99,107,32,116
+    draw_label_vector(x + 20, py + 50, 0x000A84FF, 220, pack8(60, 32, 66, 97, 99, 107, 32, 116), 8, 14)
+    # "o Home" = 111,32,72,111,109,101
+    draw_label_vector(x + 84, py + 50, 0x000A84FF, 220, pack8(111, 32, 72, 111, 109, 101, 0, 0), 6, 14)
+
+# ===========================================================================
+# Window Title Drawing
+# ===========================================================================
+
+fn draw_window_title(x: u64, y: u64, w: u64, title_chars: u64, title_len: u64, theme: u64):
+    val title_pixel_w = title_len * 10
+    val text_x = x + (w - title_pixel_w) / 2
+    val text_y = y + 14
+    # Multi-shadow depth for premium typography (second pass — softer, offset further)
+    draw_label_vector(text_x + 1, text_y + 2, 0x00000000, 12, title_chars, title_len, 18)
+    # Dark text shadow for crisp contrast (premium typography depth)
+    draw_label_vector(text_x + 1, text_y + 1, 0x00000000, 45, title_chars, title_len, 18)
+    # Vector font at 18px height — clean, centered, premium look
+    draw_label_vector(text_x, text_y, text_c(theme), 240, title_chars, title_len, 18)
+
+fn draw_window_card(x: u64, y: u64, w: u64, h: u64, is_active: u64, theme: u64, title_chars: u64, title_len: u64):
+    val body_color = if theme == 0: 0x001B1F2B else: 0x00FCF7FF
+    val body_alpha = if theme == 0: 210 else: 235
+    val border_alpha = if is_active == 1: 90 else: 45
+    val title_alpha = if theme == 0: 150 else: 205
+    val title_color = if theme == 0: 0x00262C3A else: 0x00F0E8F9
+    rrect_aa(x, y, w, h, body_color, WIN_CORNER_RADIUS, body_alpha)
+    rrect_aa(x, y, w, h, border_c(theme), WIN_CORNER_RADIUS, border_alpha)
+    blend(x + 1, y + 1, w - 2, TITLE_BAR_H, title_color, title_alpha)
+    blend(x + 14, y + TITLE_BAR_H - 1, w - 28, 1, border_c(theme), 24)
+    if is_active == 1:
+        grad_h(x + 18, y + 6, w - 36, 2, accent(theme), accent2(theme))
+    # Traffic-light dots
+    circle(x + BTN_MARGIN_X, y + BTN_MARGIN_Y, 12, BTN_CLOSE, 170)
+    circle(x + BTN_MARGIN_X + BTN_GAP + 10, y + BTN_MARGIN_Y, 12, BTN_MIN, 170)
+    circle(x + BTN_MARGIN_X + 2 * (BTN_GAP + 10), y + BTN_MARGIN_Y, 12, BTN_MAX, 170)
+    draw_window_title(x, y, w, title_chars, title_len, theme)
+
+# ===========================================================================
+# Animation Helpers
+# ===========================================================================
+
+# Get dock icon X position for minimize target (window -> dock icon slot)
+fn dock_icon_x(win_idx: u64) -> u64:
+    val num_icons: u64 = 7
+    val pill_w = DOCK_PILL_SIZE
+    val icon_gap = DOCK_ICON_GAP
+    val dock_pad = DOCK_H_PAD
+    val separator_w: u64 = 2
+    val separator_gap: u64 = 10
+    val num_util_icons: u64 = 2
+    val dock_w = num_icons * (pill_w + icon_gap) + separator_w + separator_gap * 2 + num_util_icons * (pill_w + icon_gap) - icon_gap + dock_pad * 2
+    val dock_x = (SCREEN_W - dock_w) / 2
+    # Map window index to icon position (win0=terminal=icon0, win1=editor=icon6, win2=files=icon1)
+    if win_idx == 0:
+        dock_x + dock_pad + pill_w / 2
+    else:
+        if win_idx == 1:
+            dock_x + dock_pad + 6 * (pill_w + icon_gap) + pill_w / 2
+        else:
+            dock_x + dock_pad + 1 * (pill_w + icon_gap) + pill_w / 2
+
+fn dock_icon_y() -> u64:
+    SCREEN_H - DOCK_ACTUAL_H - DOCK_MARGIN_BOTTOM + 8
+
+# Draw window scaled between two rectangles based on progress
+fn draw_animated_window(
+    src_x: u64, src_y: u64, src_w: u64, src_h: u64,
+    dst_x: u64, dst_y: u64, dst_w: u64, dst_h: u64,
+    progress: u64, theme: u64):
+    val eased = ease_out_cubic(progress)
+    val ax = lerp(src_x, dst_x, eased)
+    val ay = lerp(src_y, dst_y, eased)
+    val aw = lerp(src_w, dst_w, eased)
+    val ah = lerp(src_h, dst_h, eased)
+    # Only draw if size is reasonable
+    if aw > 20 and ah > 20:
+        draw_glass_window(ax, ay, aw, ah, 1, theme)
+
+# ===========================================================================
+# Full Desktop Rendering
+# ===========================================================================
+
+fn draw_win0_normal(boff: u64, is_active: u64, theme: u64):
+    val by = WIN0_Y - boff
+    draw_glass_window(WIN0_X, by, WIN0_W, WIN0_H, is_active, theme)
+    draw_terminal_content(WIN0_X, by, WIN0_W, WIN0_H, theme)
+    draw_window_title(WIN0_X, by, WIN0_W, pack8(84, 101, 114, 109, 105, 110, 97, 108), 8, theme)
+
+fn draw_win1_normal(boff: u64, is_active: u64, theme: u64):
+    val by = WIN1_Y - boff
+    draw_glass_window(WIN1_X, by, WIN1_W, WIN1_H, is_active, theme)
+    draw_hello_content(WIN1_X, by, WIN1_W, WIN1_H, theme)
+    draw_window_title(WIN1_X, by, WIN1_W, pack8(69, 100, 105, 116, 111, 114, 0, 0), 6, theme)
+
+fn draw_win2_normal(boff: u64, is_active: u64, theme: u64):
+    val by = WIN2_Y - boff
+    draw_glass_window(WIN2_X, by, WIN2_W, WIN2_H, is_active, theme)
+    draw_browser_content(WIN2_X, by, WIN2_W, WIN2_H, theme)
+    draw_window_title(WIN2_X, by, WIN2_W, pack8(66, 114, 111, 119, 115, 101, 114, 0), 7, theme)
+
+# Draw close animation: scale down to center + fade
+fn draw_close_animated(wx: u64, wy: u64, ww: u64, wh: u64, theme: u64):
+    val eased = ease_in_cubic(g_close_progress)
+    val shrink = eased * 15 / 100
+    val cx = wx + shrink * ww / 200
+    val cy = wy + shrink * wh / 200
+    val cw = ww - shrink * ww / 100
+    val ch = wh - shrink * wh / 100
+    if cw > 30 and ch > 30:
+        draw_glass_window(cx, cy, cw, ch, 1, theme)
+
+# Draw a single window: normal, animating-minimize, animating-close, or skip if minimized
+fn draw_single_window(win: u64, boff: u64, is_active: u64, theme: u64):
+    val minimized_bit = (g_minimize_states >> win) & 1
+    # If being actively minimized, draw animated version
+    if g_minimize_active == 1 and g_minimize_win == win:
+        if win == 0:
+            draw_animated_window(WIN0_X, WIN0_Y, WIN0_W, WIN0_H, dock_icon_x(0), dock_icon_y(), 48, 48, g_minimize_progress, theme)
+        else:
+            if win == 1:
+                draw_animated_window(WIN1_X, WIN1_Y, WIN1_W, WIN1_H, dock_icon_x(1), dock_icon_y(), 48, 48, g_minimize_progress, theme)
+            else:
+                draw_animated_window(WIN2_X, WIN2_Y, WIN2_W, WIN2_H, dock_icon_x(2), dock_icon_y(), 48, 48, g_minimize_progress, theme)
+    else:
+        # If being actively closed, draw close animation
+        if g_close_active == 1 and g_close_win == win:
+            if win == 0:
+                draw_close_animated(WIN0_X, WIN0_Y, WIN0_W, WIN0_H, theme)
+            else:
+                if win == 1:
+                    draw_close_animated(WIN1_X, WIN1_Y, WIN1_W, WIN1_H, theme)
+                else:
+                    draw_close_animated(WIN2_X, WIN2_Y, WIN2_W, WIN2_H, theme)
+        else:
+            # Skip if already minimized
+            if minimized_bit == 0:
+                if win == 0:
+                    draw_win0_normal(boff, is_active, theme)
+                else:
+                    if win == 1:
+                        draw_win1_normal(boff, is_active, theme)
+                    else:
+                        draw_win2_normal(boff, is_active, theme)
+
+fn draw_desktop(active: u64, theme: u64):
+    # Begin frame
+    rt_gui_begin_frame(SCREEN_W, SCREEN_H, 0, 0)
+
+    # 1. Desktop wallpaper
+    # `rt_gui_draw_wallpaper` is safe during boot splash, but on the x86 WM
+    # path it can stall after `begin_frame`. Keep the desktop background local
+    # to the WM render path so the first compositor frame always completes.
+    if theme == 0:
+        grad_v(0, 0, SCREEN_W, SCREEN_H, DARK_BG_TOP, DARK_BG_BOT)
+        blend(0, 0, SCREEN_W, SCREEN_H, 0x00040A18, 26)
+        blend(0, SCREEN_H / 2, SCREEN_W, SCREEN_H / 2, 0x00140A22, 18)
+    else:
+        grad_v(0, 0, SCREEN_W, SCREEN_H, LIGHT_BG_TOP, LIGHT_BG_BOT)
+        blend(0, SCREEN_H / 3, SCREEN_W, SCREEN_H * 2 / 3, 0x00FFF6FB, 18)
+
+    val boff = bounce_offset(g_anim_progress)
+
+    # Lightweight window shells keep the WM usable on x86 while richer
+    # content views are validated separately.
+    if active == 0:
+        draw_window_card(WIN2_X, WIN2_Y, WIN2_W, WIN2_H, 0, theme, pack8(66, 114, 111, 119, 115, 101, 114, 0), 7)
+        draw_window_card(WIN1_X, WIN1_Y, WIN1_W, WIN1_H, 0, theme, pack8(69, 100, 105, 116, 111, 114, 0, 0), 6)
+        draw_window_card(WIN0_X, WIN0_Y - boff, WIN0_W, WIN0_H, 1, theme, pack8(84, 101, 114, 109, 105, 110, 97, 108), 8)
+    else:
+        if active == 1:
+            draw_window_card(WIN2_X, WIN2_Y, WIN2_W, WIN2_H, 0, theme, pack8(66, 114, 111, 119, 115, 101, 114, 0), 7)
+            draw_window_card(WIN0_X, WIN0_Y, WIN0_W, WIN0_H, 0, theme, pack8(84, 101, 114, 109, 105, 110, 97, 108), 8)
+            draw_window_card(WIN1_X, WIN1_Y - boff, WIN1_W, WIN1_H, 1, theme, pack8(69, 100, 105, 116, 111, 114, 0, 0), 6)
+        else:
+            draw_window_card(WIN0_X, WIN0_Y, WIN0_W, WIN0_H, 0, theme, pack8(84, 101, 114, 109, 105, 110, 97, 108), 8)
+            draw_window_card(WIN1_X, WIN1_Y, WIN1_W, WIN1_H, 0, theme, pack8(69, 100, 105, 116, 111, 114, 0, 0), 6)
+            draw_window_card(WIN2_X, WIN2_Y - boff, WIN2_W, WIN2_H, 1, theme, pack8(66, 114, 111, 119, 115, 101, 114, 0), 7)
+
+    # Present — bulk-copy shadow buffer to MMIO framebuffer
+    rt_gui_present(0, 0, 0, 0)
+
+# ===========================================================================
+# Entry Point
+# ===========================================================================
+
+fn spl_start():
+    serial_println("[WM] SimpleOS Glass Window Manager starting...")
+
+    # 1. Program BGA framebuffer
+    serial_println("[WM] Programming BGA: 1024x768x32")
+    bga_wr(4, 0)
+    bga_wr(1, SCREEN_W)
+    bga_wr(2, SCREEN_H)
+    bga_wr(3, 32)
+    bga_wr(6, SCREEN_W)
+    bga_wr(4, 0x41)
+
+    # 2. Find framebuffer
+    serial_println("[WM] Scanning PCI for VGA...")
+    val fb_addr = find_vga_fb()
+    rt_gui_set_fb(fb_addr, SCREEN_W)
+
+    # Boot splash screen
+    serial_println("[WM] Showing boot splash...")
+    rt_gui_begin_frame(SCREEN_W, SCREEN_H, 0, 0)
+
+    # Dark gradient background
+    rt_gui_draw_wallpaper(pack(SCREEN_W, SCREEN_H), 0, 0, 0)
+
+    # Center logo area — large rounded glass pill (wider for 2x text)
+    val splash_w: u64 = 300
+    val splash_h: u64 = 140
+    val splash_x = (SCREEN_W - splash_w) / 2
+    val splash_y = (SCREEN_H - splash_h) / 2 - 40
+
+    # Glass logo container
+    blur(splash_x, splash_y, splash_w, splash_h, 24)
+    rrect_aa(splash_x, splash_y, splash_w, splash_h, 0x001E1E23, 28, 140)
+    blend(splash_x + 4, splash_y + 1, splash_w - 8, 1, 0x00FFFFFF, 40)
+    blend(splash_x + 6, splash_y + 2, splash_w - 12, 1, 0x00FFFFFF, 20)
+    rrect_aa(splash_x, splash_y, splash_w, splash_h, 0x00FFFFFF, 28, 25)
+
+    # "SimpleOS" in vector font at 40px
+    draw_label_vector(splash_x + 70, splash_y + 16, 0x00F5F5F7, 240, pack8(83, 105, 109, 112, 108, 101, 79, 83), 8, 40)
+
+    # Version text below (vector with soft shadow)
+    draw_label_vector(splash_x + 131, splash_y + 61, 0x00000000, 40, pack8(118, 49, 46, 48, 0, 0, 0, 0), 4, 16)
+    draw_label_vector(splash_x + 130, splash_y + 60, 0x00EBEBF5, 160, pack8(118, 49, 46, 48, 0, 0, 0, 0), 4, 16)
+
+    # Loading bar (wider, more visible)
+    val bar_y = splash_y + 90
+    rrect_aa(splash_x + 40, bar_y, splash_w - 80, 8, 0x00FFFFFF, 4, 30)
+    grad_h(splash_x + 40, bar_y + 1, (splash_w - 80) * 2 / 3, 6, DARK_ACCENT, DARK_ACCENT2)
+    rrect_aa(splash_x + 40, bar_y, (splash_w - 80) * 2 / 3, 8, 0x00FFFFFF, 4, 20)
+
+    # "Starting..." below (vector with soft shadow)
+    draw_label_vector((SCREEN_W - 72) / 2 + 1, splash_y + splash_h + 21, 0x00000000, 30, pack8(83, 116, 97, 114, 116, 105, 110, 103), 8, 14)
+    draw_label_vector((SCREEN_W - 72) / 2, splash_y + splash_h + 20, 0x00EBEBF5, 120, pack8(83, 116, 97, 114, 116, 105, 110, 103), 8, 14)
+
+    # SimpleOS branding: "Powered " tagline in vector
+    draw_label_vector(splash_x + 56, splash_y + splash_h + 40, 0x00EBEBF5, 60, pack8(80, 111, 119, 101, 114, 101, 100, 32), 8, 12)
+
+    rt_gui_present(0, 0, 0, 0)
+
+    # Brief pause to show splash (busy wait)
+    var splash_wait: u64 = 0
+    while splash_wait < 2000000:
+        splash_wait = splash_wait + 1
+
+    # 3. Initial render (dark glass theme)
+    var theme: u64 = 0  # 0=dark, 1=light
+    var active_win: u64 = 1
+
+    # Animation state
+    var anim_frame: u64 = 0       # Frame counter
+    var anim_start: u64 = 0       # Frame when animation started
+    var anim_duration: u64 = 12   # Animation length in frames
+    var animating: u64 = 0        # 1 if currently animating
+    var needs_redraw: u64 = 1     # Redraw on next frame
+    var idle_count: u64 = 0       # Frames since last activity
+
+    # Initialize PS/2 mouse
+    mouse_init()
+
+    # Initialize browser to about:home
+    browser_navigate(0)
+    # Set default URL text to "about:home"
+    # a=97,b=98,o=111,u=117,t=116,:=58,h=104,o=111,m=109,e=101
+    g_browser_url_0 = pack8(97, 98, 111, 117, 116, 58, 104, 111)
+    g_browser_url_1 = pack8(109, 101, 0, 0, 0, 0, 0, 0)
+    g_browser_url_len = 10
+
+    # Local scancode-to-action mapping (matches os.gui.shortcut convention)
+
+    serial_println("[WM] Rendering glass desktop (dark theme)...")
+    draw_desktop(active_win, theme)
+
+    serial_println("[WM] Glass desktop rendered!")
+    serial_println("[WM] Controls: Tab=cycle, 1/2/3=focus, T=theme, M=minimize, R=restore, Q=quit")
+
+    # 4. Continuous render loop with animation
+    var running: u64 = 1
+    while running == 1:
+        # Update terminal input active state based on focused window
+        if active_win == 0:
+            g_term_input_active = 1
+        else:
+            g_term_input_active = 0
+
+        # Poll keyboard — drain all pending PS/2 data
+        var kb_poll_count: u64 = 0
+        while (io_inb(0x64) & 1) != 0 and kb_poll_count < 16:
+            val scancode = io_inb(0x60)
+            kb_poll_count = kb_poll_count + 1
+            if (scancode & 0x80) == 0:
+                # Determine which WM shortcut (if any) this scancode maps to
+                # Tab and number keys always work; letter shortcuts only when
+                # the terminal is NOT in input mode (active_win != 0)
+                var wm_shortcut: u64 = 0
+                if scancode == 0x0F: wm_shortcut = 1  # Tab always works
+                if scancode == 0x02: wm_shortcut = 2  # 1 always works
+                if scancode == 0x03: wm_shortcut = 3  # 2 always works
+                if scancode == 0x04: wm_shortcut = 4  # 3 always works
+                # T/Q/M/W/R only work as shortcuts when NOT typing in terminal or editor
+                if g_term_input_active == 0 and g_ed_editing == 0:
+                    if scancode == 0x14: wm_shortcut = 5  # T = theme
+                    if scancode == 0x10: wm_shortcut = 6  # Q = quit
+                    if scancode == 0x32: wm_shortcut = 7  # M = minimize
+                    if scancode == 0x11: wm_shortcut = 8  # W = close
+                    if scancode == 0x13: wm_shortcut = 9  # R = restore
+
+                # Process WM shortcuts
+                if wm_shortcut == 1:
+                    # Tab = cycle focus
+                    active_win = (active_win + 1) % 3
+                    animating = 1
+                    anim_start = anim_frame
+                    g_anim_progress = 0
+                    needs_redraw = 1
+                    serial_println("[WM] Focus cycled")
+                if wm_shortcut == 2:
+                    active_win = 0
+                    animating = 1
+                    anim_start = anim_frame
+                    g_anim_progress = 0
+                    needs_redraw = 1
+                if wm_shortcut == 3:
+                    active_win = 1
+                    animating = 1
+                    anim_start = anim_frame
+                    g_anim_progress = 0
+                    needs_redraw = 1
+                if wm_shortcut == 4:
+                    active_win = 2
+                    animating = 1
+                    anim_start = anim_frame
+                    g_anim_progress = 0
+                    needs_redraw = 1
+                if wm_shortcut == 5:
+                    # T = toggle theme
+                    theme = (theme + 1) % 2
+                    animating = 1
+                    anim_start = anim_frame
+                    g_anim_progress = 0
+                    needs_redraw = 1
+                    if theme == 0:
+                        serial_println("[WM] Theme: Dark Glass")
+                    else:
+                        serial_println("[WM] Theme: White Glass")
+                if wm_shortcut == 6:
+                    # Q = quit
+                    running = 0
+                    serial_println("[WM] Quit requested")
+                if wm_shortcut == 7:
+                    # M = minimize
+                    val already_minimized = (g_minimize_states >> active_win) & 1
+                    if g_minimize_active == 0 and already_minimized == 0:
+                        g_minimize_active = 1
+                        g_minimize_progress = 0
+                        g_minimize_win = active_win
+                        needs_redraw = 1
+                        serial_println("[WM] Minimizing window")
+                if wm_shortcut == 8:
+                    # W = close
+                    if g_close_active == 0:
+                        g_close_active = 1
+                        g_close_progress = 0
+                        g_close_win = active_win
+                        needs_redraw = 1
+                        serial_println("[WM] Closing window")
+                if wm_shortcut == 9:
+                    # R = restore
+                    if g_minimize_states != 0:
+                        g_minimize_states = 0
+                        needs_redraw = 1
+                        serial_println("[WM] Restored all windows")
+
+                # Forward non-shortcut key presses to active app
+                if wm_shortcut == 0:
+                    var key_handled: u64 = 0
+                    if scancode == 0x1C:  # Enter
+                        if active_win == 0:
+                            handle_terminal_enter()
+                            key_handled = 1
+                            needs_redraw = 1
+                        if active_win == 1 and g_ed_editing == 1:
+                            # Enter exits editing mode
+                            g_ed_editing = 0
+                            key_handled = 1
+                            needs_redraw = 1
+                        if active_win == 2 and g_browser_input_active == 1:
+                            browser_navigate_url()
+                            g_browser_input_active = 0
+                            key_handled = 1
+                            needs_redraw = 1
+                    if scancode == 0x0E:  # Backspace
+                        if active_win == 0:
+                            handle_terminal_backspace()
+                            key_handled = 1
+                            needs_redraw = 1
+                        if active_win == 1 and g_ed_editing == 1:
+                            if g_ed_buf_len > 0:
+                                g_ed_buf_len = g_ed_buf_len - 1
+                                ed_clear_char(g_ed_buf_len)
+                                g_editor_cursor_x = g_ed_buf_len
+                            key_handled = 1
+                            needs_redraw = 1
+                        if active_win == 2 and g_browser_input_active == 1:
+                            if g_browser_url_len > 0:
+                                g_browser_url_len = g_browser_url_len - 1
+                                browser_set_url_char(g_browser_url_len, 0)
+                            key_handled = 1
+                            needs_redraw = 1
+                    if scancode == 0x01:  # Escape
+                        if active_win == 1 and g_ed_editing == 1:
+                            g_ed_editing = 0
+                            key_handled = 1
+                            needs_redraw = 1
+                        if active_win == 2:
+                            g_browser_input_active = 0
+                            key_handled = 1
+                            needs_redraw = 1
+                    # Letter/symbol keys forwarded to active app
+                    if key_handled == 0:
+                        if active_win == 0:
+                            val ch = scancode_to_ascii(scancode)
+                            if ch != 0:
+                                handle_terminal_char(ch)
+                                key_handled = 1
+                                needs_redraw = 1
+                        if active_win == 1 and g_ed_editing == 1:
+                            val ch = scancode_to_ascii(scancode)
+                            if ch != 0 and g_ed_buf_len < 40:
+                                ed_set_char(g_ed_buf_len, ch)
+                                g_ed_buf_len = g_ed_buf_len + 1
+                                g_editor_cursor_x = g_ed_buf_len
+                                key_handled = 1
+                                needs_redraw = 1
+                        if active_win == 2 and g_browser_input_active == 1:
+                            val ch = scancode_to_ascii(scancode)
+                            if ch != 0:
+                                if g_browser_url_len < 40:
+                                    browser_set_url_char(g_browser_url_len, ch)
+                                    g_browser_url_len = g_browser_url_len + 1
+                                key_handled = 1
+                                needs_redraw = 1
+
+        # Poll mouse (PS/2 auxiliary device)
+        if g_mouse_initialized == 1:
+            val m_status = io_inb(0x64)
+            if (m_status & 0x21) == 0x21:  # Bit 0=data ready, bit 5=mouse data
+                val byte1 = io_inb(0x60)
+                if (byte1 & 0x08) != 0:
+                    # Valid packet header — read bytes 2+3
+                    mouse_wait_read()
+                    val byte2 = io_inb(0x60)
+                    mouse_wait_read()
+                    val byte3 = io_inb(0x60)
+
+                    # Process mouse packet
+                    g_mouse_prev_buttons = g_mouse_buttons
+                    g_mouse_buttons = byte1 & 0x07  # Button bits
+
+                    # X delta
+                    var dx: u64 = byte2
+                    if (byte1 & 0x10) != 0:
+                        # Negative X: subtract from position
+                        val neg_dx = 256 - dx
+                        if g_mouse_x > neg_dx:
+                            g_mouse_x = g_mouse_x - neg_dx
+                        else:
+                            g_mouse_x = 0
+                    else:
+                        g_mouse_x = g_mouse_x + dx
+                        if g_mouse_x >= SCREEN_W:
+                            g_mouse_x = SCREEN_W - 1
+
+                    # Y delta (inverted for screen coordinates)
+                    var dy: u64 = byte3
+                    if (byte1 & 0x20) != 0:
+                        # Negative Y (inverted = move down on screen)
+                        val neg_dy = 256 - dy
+                        g_mouse_y = g_mouse_y + neg_dy
+                        if g_mouse_y >= SCREEN_H:
+                            g_mouse_y = SCREEN_H - 1
+                    else:
+                        # Positive Y (inverted = move up on screen)
+                        if g_mouse_y > dy:
+                            g_mouse_y = g_mouse_y - dy
+                        else:
+                            g_mouse_y = 0
+
+                    # Left click detection
+                    val left_pressed = g_mouse_buttons & 1
+                    val left_was = g_mouse_prev_buttons & 1
+
+                    # Button just pressed — hit test for focus + start drag
+                    if left_pressed == 1:
+                        if left_was == 0:
+                            serial_println("[WM] Mouse click")
+                            # Hit test windows back-to-front (win2, win1, win0)
+                            # Window 2 (Browser)
+                            if g_mouse_x >= WIN2_X:
+                                if g_mouse_x < WIN2_X + WIN2_W:
+                                    if g_mouse_y >= WIN2_Y:
+                                        if g_mouse_y < WIN2_Y + WIN2_H:
+                                            if active_win != 2:
+                                                active_win = 2
+                                                animating = 1
+                                                anim_start = anim_frame
+                                                g_anim_progress = 0
+                                            # Start drag if in title bar
+                                            if g_mouse_y < WIN2_Y + TITLE_BAR_H:
+                                                g_dragging = 3
+                                                g_drag_offset_x = g_mouse_x - WIN2_X
+                                                g_drag_offset_y = g_mouse_y - WIN2_Y
+                            # Window 1 (Editor)
+                            if g_dragging == 0:
+                                if g_mouse_x >= WIN1_X:
+                                    if g_mouse_x < WIN1_X + WIN1_W:
+                                        if g_mouse_y >= WIN1_Y:
+                                            if g_mouse_y < WIN1_Y + WIN1_H:
+                                                if active_win != 1:
+                                                    active_win = 1
+                                                    animating = 1
+                                                    anim_start = anim_frame
+                                                    g_anim_progress = 0
+                                                if g_mouse_y < WIN1_Y + TITLE_BAR_H:
+                                                    g_dragging = 2
+                                                    g_drag_offset_x = g_mouse_x - WIN1_X
+                                                    g_drag_offset_y = g_mouse_y - WIN1_Y
+                            # Window 0 (Terminal)
+                            if g_dragging == 0:
+                                if g_mouse_x >= WIN0_X:
+                                    if g_mouse_x < WIN0_X + WIN0_W:
+                                        if g_mouse_y >= WIN0_Y:
+                                            if g_mouse_y < WIN0_Y + WIN0_H:
+                                                if active_win != 0:
+                                                    active_win = 0
+                                                    animating = 1
+                                                    anim_start = anim_frame
+                                                    g_anim_progress = 0
+                                                if g_mouse_y < WIN0_Y + TITLE_BAR_H:
+                                                    g_dragging = 1
+                                                    g_drag_offset_x = g_mouse_x - WIN0_X
+                                                    g_drag_offset_y = g_mouse_y - WIN0_Y
+
+                    # Dragging — update window position
+                    if g_dragging != 0:
+                        if left_pressed == 1:
+                            if g_dragging == 1:
+                                if g_mouse_x >= g_drag_offset_x:
+                                    WIN0_X = g_mouse_x - g_drag_offset_x
+                                if g_mouse_y >= g_drag_offset_y:
+                                    WIN0_Y = g_mouse_y - g_drag_offset_y
+                            if g_dragging == 2:
+                                if g_mouse_x >= g_drag_offset_x:
+                                    WIN1_X = g_mouse_x - g_drag_offset_x
+                                if g_mouse_y >= g_drag_offset_y:
+                                    WIN1_Y = g_mouse_y - g_drag_offset_y
+                            if g_dragging == 3:
+                                if g_mouse_x >= g_drag_offset_x:
+                                    WIN2_X = g_mouse_x - g_drag_offset_x
+                                if g_mouse_y >= g_drag_offset_y:
+                                    WIN2_Y = g_mouse_y - g_drag_offset_y
+
+                    # Propagate click to active window's content area
+                    if g_dragging == 0:
+                        if left_pressed == 1:
+                            if left_was == 0:
+                                # Compute local coordinates within the active window
+                                var local_x: u64 = 0
+                                var local_y: u64 = 0
+                                var in_content: u64 = 0
+
+                                if active_win == 0:
+                                    if g_mouse_x >= WIN0_X:
+                                        if g_mouse_x < WIN0_X + WIN0_W:
+                                            if g_mouse_y >= WIN0_Y + TITLE_BAR_H:
+                                                if g_mouse_y < WIN0_Y + WIN0_H:
+                                                    local_x = g_mouse_x - WIN0_X
+                                                    local_y = g_mouse_y - (WIN0_Y + TITLE_BAR_H)
+                                                    in_content = 1
+                                if active_win == 1:
+                                    if g_mouse_x >= WIN1_X:
+                                        if g_mouse_x < WIN1_X + WIN1_W:
+                                            if g_mouse_y >= WIN1_Y + TITLE_BAR_H:
+                                                if g_mouse_y < WIN1_Y + WIN1_H:
+                                                    local_x = g_mouse_x - WIN1_X
+                                                    local_y = g_mouse_y - (WIN1_Y + TITLE_BAR_H)
+                                                    in_content = 1
+                                if active_win == 2:
+                                    if g_mouse_x >= WIN2_X:
+                                        if g_mouse_x < WIN2_X + WIN2_W:
+                                            if g_mouse_y >= WIN2_Y + TITLE_BAR_H:
+                                                if g_mouse_y < WIN2_Y + WIN2_H:
+                                                    local_x = g_mouse_x - WIN2_X
+                                                    local_y = g_mouse_y - (WIN2_Y + TITLE_BAR_H)
+                                                    in_content = 1
+
+                                if in_content == 1:
+                                    if active_win == 0:
+                                        handle_terminal_click(local_x, local_y)
+                                    if active_win == 1:
+                                        handle_editor_click(local_x, local_y)
+                                    if active_win == 2:
+                                        handle_browser_click(local_x, local_y)
+                                    needs_redraw = 1
+
+                    # Button released — stop dragging
+                    if left_pressed == 0:
+                        if g_dragging != 0:
+                            g_dragging = 0
+
+                    needs_redraw = 1
+
+        # Update cursor shape based on mouse position
+        if g_mouse_initialized == 1:
+            update_cursor_shape()
+
+        # Update focus animation
+        if animating == 1:
+            val elapsed = anim_frame - anim_start
+            if elapsed >= anim_duration:
+                animating = 0
+                g_anim_progress = 100
+            else:
+                g_anim_progress = (elapsed * 100) / anim_duration
+            needs_redraw = 1
+
+        # Minimize animation tick (8 frames = ~130ms at 60fps)
+        if g_minimize_active == 1:
+            g_minimize_progress = g_minimize_progress + 12
+            if g_minimize_progress >= 100:
+                g_minimize_progress = 100
+                g_minimize_active = 0
+                # Mark window as minimized
+                g_minimize_states = g_minimize_states | (1 << g_minimize_win)
+                # Cycle to next non-minimized window
+                var next_win: u64 = (active_win + 1) % 3
+                var search: u64 = 0
+                while search < 3:
+                    val next_min = (g_minimize_states >> next_win) & 1
+                    if next_min == 0:
+                        search = 3  # break
+                    else:
+                        next_win = (next_win + 1) % 3
+                    search = search + 1
+                active_win = next_win
+                serial_println("[WM] Window minimized to dock")
+            needs_redraw = 1
+
+        # Close animation tick (6 frames = ~100ms)
+        if g_close_active == 1:
+            g_close_progress = g_close_progress + 16
+            if g_close_progress >= 100:
+                g_close_progress = 100
+                g_close_active = 0
+                # Mark window as minimized (same as minimize for now)
+                g_minimize_states = g_minimize_states | (1 << g_close_win)
+                active_win = (active_win + 1) % 3
+            needs_redraw = 1
+
+        # Redraw if needed
+        if needs_redraw == 1:
+            draw_desktop(active_win, theme)
+            needs_redraw = 0
+            idle_count = 0
+
+        anim_frame = anim_frame + 1
+        g_frame_count = g_frame_count + 1
+
+        # Throttle: simple busy-wait to avoid 100% CPU spin
+        # ~60fps: waste some cycles between frames when idle
+        if animating == 0 and g_minimize_active == 0 and g_close_active == 0:
+            idle_count = idle_count + 1
+            # After settling, stop redrawing until next input
+            var spin: u64 = 0
+            while spin < 50000:
+                spin = spin + 1
+
+    serial_println("[WM] Window Manager shutting down")

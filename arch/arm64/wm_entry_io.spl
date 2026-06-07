@@ -1,0 +1,727 @@
+#![allow(unnamed_duplicate_typed_args)]
+# SimpleOS Glass Window Manager — ARM64 I/O, Render Primitives, Theme
+#
+# Extracted from wm_entry.spl. Contains:
+#   - Extern FFI declarations
+#   - UART + ramfb hardware init (ARM64-specific)
+#   - Easing / animation math
+#   - Rendering primitive helpers (fill, blend, blur, etc.)
+#   - Theme-aware color getters
+#
+# No module-level var state — all functions are pure or hardware-init.
+
+# === Extern FFI declarations ===
+extern fn serial_println(msg: text)
+
+# MMIO read/write (ARM64 native -- no port I/O on AArch64)
+extern fn rt_mmio_read_u8(addr: u64) -> u64
+extern fn rt_mmio_read_u16(addr: u64) -> u64
+extern fn rt_mmio_read_u32(addr: u64) -> u64
+extern fn rt_mmio_write_u8(addr: u64, value: u64)
+extern fn rt_mmio_write_u16(addr: u64, value: u64)
+extern fn rt_mmio_write_u32(addr: u64, value: u64)
+extern fn rt_mmio_write_u64(addr: u64, value: u64)
+
+# Framebuffer setup
+extern fn rt_gui_set_fb(addr: u64, width: u64)
+
+# Glass rendering primitives (from glass_render.c -- architecture-independent)
+extern fn rt_gui_begin_frame(width: u64, height: u64, unused1: u64, unused2: u64)
+extern fn rt_gui_present(unused1: u64, unused2: u64, unused3: u64, unused4: u64)
+extern fn rt_gui_blend_fill(xy: u64, wh: u64, color: u64, alpha: u64)
+extern fn rt_gui_box_blur(xy: u64, wh: u64, radius: u64, unused: u64)
+extern fn rt_gui_gradient_h(xy: u64, wh: u64, c1: u64, c2: u64)
+extern fn rt_gui_gradient_v(xy: u64, wh: u64, c1: u64, c2: u64)
+extern fn rt_gui_shadow(xy: u64, wh: u64, blur_alpha: u64, offset: u64)
+extern fn rt_gui_rounded_rect(xy: u64, wh: u64, color_radius: u64, alpha: u64)
+extern fn rt_gui_shadow_fill(xy: u64, wh: u64, color: u64, unused: u64)
+extern fn rt_gui_rounded_rect_top(xy: u64, wh: u64, color_radius: u64, alpha: u64)
+extern fn rt_gui_filled_circle(cx_cy: u64, diam_color: u64, alpha: u64, unused: u64)
+extern fn rt_gui_draw_wallpaper(wh: u64, style: u64, unused1: u64, unused2: u64)
+extern fn rt_gui_rounded_rect_aa(xy: u64, wh: u64, color_radius: u64, alpha: u64)
+extern fn rt_gui_line(p1: u64, p2: u64, color_thick: u64, alpha: u64)
+extern fn rt_gui_ring(cx_cy: u64, diam_thick: u64, color: u64, alpha: u64)
+extern fn rt_gui_gradient_rect(xy: u64, wh: u64, color_radius: u64, c2_alpha: u64)
+extern fn rt_gui_set_text_buf(chars: u64, offset: u64, unused1: u64, unused2: u64)
+extern fn rt_gui_draw_text_buf(xy: u64, color_len: u64, alpha: u64, unused: u64)
+extern fn rt_gui_draw_text_shadow(xy: u64, color_len: u64, alpha: u64, shadow_alpha: u64)
+extern fn rt_gui_draw_text_bold(xy: u64, color_len: u64, alpha: u64, unused: u64)
+extern fn rt_gui_draw_text_2x(xy: u64, color_len: u64, alpha: u64, shadow_alpha: u64)
+extern fn rt_gui_draw_text_outline(xy: u64, color_len: u64, alpha: u64, outline_alpha: u64)
+extern fn rt_gui_draw_text_vector(xy: u64, color_size: u64, alpha: u64, unused: u64)
+extern fn rt_gui_noise_blend(xy: u64, wh: u64, intensity: u64, unused: u64)
+extern fn rt_gui_fill4(xy: u64, wh: u64, color: u64, unused: u64)
+
+# Layout engine
+extern fn rt_layout_reset(u1: u64, u2: u64, u3: u64, u4: u64)
+extern fn rt_layout_add(type_: u64, parent: u64, u1: u64, u2: u64) -> u64
+extern fn rt_layout_set_size(id: u64, w_spec: u64, h_spec: u64, u: u64)
+extern fn rt_layout_set_padding(id: u64, lr: u64, tb: u64, u: u64)
+extern fn rt_layout_set_props(id: u64, spacing: u64, align: u64, u: u64)
+extern fn rt_layout_compute(wh: u64, u1: u64, u2: u64, u3: u64)
+extern fn rt_layout_get(id: u64, u1: u64, u2: u64, u3: u64) -> u64
+extern fn rt_layout_get_size(id: u64, u1: u64, u2: u64, u3: u64) -> u64
+
+# Heap allocation (for framebuffer buffer)
+extern fn rt_alloc(size: u64) -> u64
+
+# Pack two u32 values into one u64 (high|low)
+fn pack(hi: u64, lo: u64) -> u64:
+    (hi << 32) | (lo & 0xFFFFFFFF)
+
+# === Screen dimensions ===
+var SCREEN_W: u64 = 1024
+var SCREEN_H: u64 = 768
+var SYSTEM_BAR_H: u64 = 28
+var DOCK_H: u64 = 52
+var TITLE_BAR_H: u64 = 44
+
+# ===========================================================================
+# PL011 UART Constants (ARM64 QEMU virt)
+# ===========================================================================
+var PL011_BASE: u64 = 0x09000000
+var PL011_DR: u64 = 0x000       # Data Register
+var PL011_FR: u64 = 0x018       # Flag Register
+var PL011_FR_RXFE: u64 = 0x10   # Receive FIFO empty (bit 4)
+
+# ===========================================================================
+# QEMU fw_cfg Constants (for ramfb device configuration)
+# ===========================================================================
+var FW_CFG_BASE: u64 = 0x09020000   # fw_cfg MMIO on QEMU virt
+var FW_CFG_DATA: u64 = 0x000        # Data port (8-bit)
+val FW_CFG_SEL: u64  = 0x008        # Selector port (16-bit BE)
+val FW_CFG_DMA: u64  = 0x010        # DMA address port (64-bit BE)
+
+# ===========================================================================
+# Dark Glass Theme (default) -- derived from glass_tokens.spl
+# ===========================================================================
+val DARK_BG_TOP: u64       = 0x00060508   # Slightly warm dark
+val DARK_BG_BOT: u64       = 0x00200840   # Brighter purple, more vibrant
+val DARK_SURFACE: u64      = 0x001E1E23   # Glass surface color
+val DARK_SURFACE_A: u64    = 35           # 14% opacity
+val DARK_ELEVATED: u64     = 0x002C2C32   # Elevated glass
+val DARK_ELEVATED_A: u64   = 50           # 20% opacity
+val DARK_BORDER: u64       = 0x00FFFFFF   # Glass border (white)
+val DARK_BORDER_A: u64     = 100          # 39% opacity
+val DARK_TEXT: u64         = 0x00F5F5F7   # Primary text
+val DARK_TEXT_SEC: u64     = 0x00EBEBF5   # Secondary text (60%)
+val DARK_ACCENT: u64       = 0x000A84FF   # Blue accent
+val DARK_ACCENT2: u64      = 0x00BB86FC   # Purple accent
+val DARK_SHADOW_A: u64     = 80           # Shadow opacity
+
+# ===========================================================================
+# White Glass Theme
+# ===========================================================================
+val LIGHT_BG_TOP: u64      = 0x00E8E0F0   # Brighter lavender mist
+val LIGHT_BG_BOT: u64      = 0x00F5F0FF   # Warmer white-lavender
+val LIGHT_SURFACE: u64     = 0x00F8F0FF   # Glass surface
+val LIGHT_SURFACE_A: u64   = 65           # 25% opacity
+val LIGHT_ELEVATED: u64    = 0x00FFF0F8   # Elevated glass
+val LIGHT_ELEVATED_A: u64  = 110          # 43% opacity
+val LIGHT_BORDER: u64      = 0x00000000   # Glass border (black)
+val LIGHT_BORDER_A: u64    = 90           # 35% opacity
+val LIGHT_TEXT: u64        = 0x00201820   # Primary text
+val LIGHT_TEXT_SEC: u64    = 0x003C3C43   # Secondary text
+val LIGHT_ACCENT: u64      = 0x00007AFF   # Blue accent
+val LIGHT_ACCENT2: u64     = 0x00AF6BC5   # Brighter purple accent
+val LIGHT_SHADOW_A: u64    = 30           # Shadow opacity
+
+var WARM_ACCENT: u64 = 0x00FF9500
+var SUCCESS_COLOR: u64 = 0x0030D158
+var WARNING_COLOR: u64 = 0x00FFD60A
+var WARM_HIGHLIGHT: u64 = 0x00FFD0A0
+
+# Window control button colors
+val BTN_CLOSE: u64   = 0x00FF6B8A
+val BTN_MIN: u64     = 0x008B8BFA
+val BTN_MAX: u64     = 0x0050D0A0
+
+# Blur radii
+val BLUR_SURFACE: u64  = 16
+var BLUR_ELEVATED: u64 = 24
+val BLUR_SUBTLE: u64   = 6
+
+# ===========================================================================
+# Layout Constants
+# ===========================================================================
+
+# Window frame
+var WIN_CORNER_RADIUS: u64 = 22
+var WIN_BORDER_INSET: u64 = 1
+var CONTENT_MARGIN_TOP: u64 = 2
+var CONTENT_PAD: u64 = 16
+var FOCUS_RING_PAD: u64 = 2
+
+# Traffic light buttons
+var BTN_DIAMETER: u64 = 16
+var BTN_GAP: u64 = 10
+var BTN_MARGIN_X: u64 = 12
+var BTN_MARGIN_Y: u64 = 10
+
+# Dock
+var DOCK_MARGIN_BOTTOM: u64 = 10
+var DOCK_CORNER_RADIUS: u64 = 26
+var DOCK_ICON_SIZE: u64 = 40
+var DOCK_ICON_GAP: u64 = 16
+var DOCK_ICON_PAD: u64 = 4
+var DOCK_PILL_SIZE: u64 = 48
+var DOCK_H_PAD: u64 = 20
+var DOCK_V_PAD: u64 = 8
+var DOCK_ACTUAL_H: u64 = 58
+var DOCK_INDICATOR_MARGIN: u64 = 6
+
+# System bar
+var BAR_H_PAD: u64 = 6
+var BAR_V_PAD: u64 = 5
+var MENU_ITEM_GAP: u64 = 6
+
+# Content areas
+var SIDEBAR_W: u64 = 84
+var BANNER_H: u64 = 44
+var GRID_COL_SPACING: u64 = 72
+var GRID_ROW_SPACING: u64 = 50
+
+# Window sizes (fixed)
+var WIN0_W: u64 = 420
+var WIN0_H: u64 = 300
+var WIN1_W: u64 = 380
+var WIN1_H: u64 = 260
+var WIN2_W: u64 = 340
+var WIN2_H: u64 = 220
+
+# ===========================================================================
+# ARM64 UART Input Helpers
+# ===========================================================================
+
+fn uart_data_ready() -> u64:
+    """Check if PL011 UART has data available (RXFE=0 means data ready)."""
+    val fr = rt_mmio_read_u32(PL011_BASE + PL011_FR)
+    if (fr & PL011_FR_RXFE) == 0:
+        1
+    else:
+        0
+
+fn uart_read_char() -> u64:
+    """Read a character from PL011 UART data register."""
+    rt_mmio_read_u32(PL011_BASE + PL011_DR) & 0xFF
+
+# Action codes returned by uart_char_to_action:
+#   0 = None, 1 = CycleFocus, 2 = ToggleTheme, 3 = Quit,
+#   4 = Minimize, 5 = Close, 6 = Restore,
+#   10 = FocusWindow(0), 11 = FocusWindow(1), 12 = FocusWindow(2)
+# Mirrors os.gui.shortcut.uart_char_to_action but uses numeric codes
+# so this standalone baremetal file needs no `use` imports.
+fn uart_char_to_action(ch: u64) -> u64:
+    """Map UART ASCII char to action code."""
+    if ch == 9: return 1      # Tab  -> CycleFocus
+    if ch == 49: return 10    # '1'  -> FocusWindow(0)
+    if ch == 50: return 11    # '2'  -> FocusWindow(1)
+    if ch == 51: return 12    # '3'  -> FocusWindow(2)
+    if ch == 116: return 2    # 't'  -> ToggleTheme
+    if ch == 84: return 2     # 'T'  -> ToggleTheme
+    if ch == 113: return 3    # 'q'  -> Quit
+    if ch == 81: return 3     # 'Q'  -> Quit
+    if ch == 109: return 4    # 'm'  -> Minimize
+    if ch == 77: return 4     # 'M'  -> Minimize
+    if ch == 119: return 5    # 'w'  -> Close
+    if ch == 87: return 5     # 'W'  -> Close
+    if ch == 114: return 6    # 'r'  -> Restore
+    if ch == 82: return 6     # 'R'  -> Restore
+    return 0                  # None
+
+# ===========================================================================
+# ARM64 Framebuffer Setup via ramfb
+#
+# QEMU's ramfb device exposes a simple framebuffer configured via fw_cfg.
+# The guest allocates a buffer in RAM, writes a ramfb_cfg structure via
+# fw_cfg DMA, and QEMU displays from that address.
+#
+# ramfb_cfg structure (28 bytes, big-endian):
+#   u64 addr     -- physical address of framebuffer
+#   u32 fourcc   -- pixel format (DRM_FORMAT_XRGB8888 = 0x34325258)
+#   u32 flags    -- 0
+#   u32 width    -- display width
+#   u32 height   -- display height
+#   u32 stride   -- bytes per row (width * 4 for 32bpp)
+#
+# fw_cfg DMA protocol:
+#   1. Select the "etc/ramfb" file via selector port
+#   2. Write the config struct via DMA write operation
+# ===========================================================================
+
+# Byte-swap helpers for big-endian fw_cfg protocol
+fn bswap32(v: u64) -> u64:
+    val b0 = (v >> 24) & 0xFF
+    val b1 = (v >> 16) & 0xFF
+    val b2 = (v >> 8) & 0xFF
+    val b3 = v & 0xFF
+    (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+
+fn bswap16(v: u64) -> u64:
+    val lo = v & 0xFF
+    val hi = (v >> 8) & 0xFF
+    (lo << 8) | hi
+
+var FRAMEBUFFER_SIZE: u64 = 3145728   # 1024 * 768 * 4 bytes
+
+fn setup_ramfb(fb_addr: u64) -> u64:
+    """Configure QEMU ramfb device to display from fb_addr.
+
+    Uses fw_cfg file enumeration to find 'etc/ramfb' selector,
+    then writes the ramfb configuration structure via fw_cfg DMA.
+
+    Returns 1 on success, 0 on failure.
+    """
+    serial_println("[WM] Configuring ramfb via fw_cfg...")
+
+    # The ramfb file selector is typically 0x0121 on QEMU virt.
+    # We enumerate fw_cfg directory to find it reliably.
+    #
+    # fw_cfg directory is at selector 0x0019:
+    #   u32 count (BE) -- number of files
+    #   For each file:
+    #     u32 size (BE)
+    #     u16 selector (BE)
+    #     char name[56]
+
+    # Read fw_cfg signature first (selector 0x0000, should return "QEMU")
+    rt_mmio_write_u16(0x09020008, 0x0000)
+    val sig0 = rt_mmio_read_u8(0x09020000)
+    val sig1 = rt_mmio_read_u8(0x09020000)
+    val sig2 = rt_mmio_read_u8(0x09020000)
+    val sig3 = rt_mmio_read_u8(0x09020000)
+    serial_println("[WM] fw_cfg sig: {sig0} {sig1} {sig2} {sig3}")
+    # Q=81, E=69, M=77, U=85
+    if sig0 != 81:
+        serial_println("[WM] fw_cfg signature mismatch (expected Q=81)")
+
+    # Select directory (selector 0x0019)
+    rt_mmio_write_u16(0x09020008, bswap16(0x0019))
+
+    # Read file count (4 bytes, big-endian)
+    var count: u64 = 0
+    var i: u64 = 0
+    while i < 4:
+        val byte_ = rt_mmio_read_u8(0x09020000)
+        count = (count << 8) | (byte_ & 0xFF)
+        i = i + 1
+
+    serial_println("[WM] fw_cfg: {count} directory entries")
+
+    if count == 0:
+        serial_println("[WM] fw_cfg: count is 0 -- selector may not be working")
+        return 0
+    if count > 1000:
+        serial_println("[WM] fw_cfg: count too large -- endianness issue?")
+        return 0
+
+    # Search for "etc/ramfb" in directory
+    var ramfb_sel: u64 = 0
+    var found: u64 = 0
+    var idx: u64 = 0
+    while idx < count:
+        if idx > 200:
+            idx = count   # safety limit
+
+        # Read file size (4 bytes BE)
+        var fsize: u64 = 0
+        var j: u64 = 0
+        while j < 4:
+            val b = rt_mmio_read_u8(0x09020000)
+            fsize = (fsize << 8) | (b & 0xFF)
+            j = j + 1
+
+        # Read selector (2 bytes BE)
+        var sel: u64 = 0
+        j = 0
+        while j < 2:
+            val b = rt_mmio_read_u8(0x09020000)
+            sel = (sel << 8) | (b & 0xFF)
+            j = j + 1
+
+        # Skip reserved (2 bytes)
+        rt_mmio_read_u8(0x09020000)
+        rt_mmio_read_u8(0x09020000)
+
+        # Read name (56 bytes)
+        var name_match: u64 = 1
+        # "etc/ramfb" = 101,116,99,47,114,97,109,102,98,0
+        val expected_0: u64 = 101  # 'e'
+        val expected_1: u64 = 116  # 't'
+        val expected_2: u64 = 99   # 'c'
+        val expected_3: u64 = 47   # '/'
+        val expected_4: u64 = 114  # 'r'
+        val expected_5: u64 = 97   # 'a'
+        val expected_6: u64 = 109  # 'm'
+        val expected_7: u64 = 102  # 'f'
+        val expected_8: u64 = 98   # 'b'
+
+        var c0: u64 = 0
+        var c1_ch: u64 = 0
+        var c2_ch: u64 = 0
+        var c3_ch: u64 = 0
+        j = 0
+        while j < 56:
+            val ch = rt_mmio_read_u8(0x09020000) & 0xFF
+            if j == 0: c0 = ch
+            if j == 1: c1_ch = ch
+            if j == 2: c2_ch = ch
+            if j == 3: c3_ch = ch
+            if j == 0 and ch != expected_0: name_match = 0
+            if j == 1 and ch != expected_1: name_match = 0
+            if j == 2 and ch != expected_2: name_match = 0
+            if j == 3 and ch != expected_3: name_match = 0
+            if j == 4 and ch != expected_4: name_match = 0
+            if j == 5 and ch != expected_5: name_match = 0
+            if j == 6 and ch != expected_6: name_match = 0
+            if j == 7 and ch != expected_7: name_match = 0
+            if j == 8 and ch != expected_8: name_match = 0
+            if j == 9 and ch != 0: name_match = 0
+            j = j + 1
+
+        if name_match == 1:
+            ramfb_sel = sel
+            found = 1
+            serial_println("[WM] Found etc/ramfb in fw_cfg")
+
+        idx = idx + 1
+
+    if found == 0:
+        serial_println("[WM] WARNING: etc/ramfb not found -- add -device ramfb to QEMU")
+        return 0
+
+    # Write ramfb configuration via fw_cfg DMA
+    #
+    # ramfb_cfg (28 bytes, all big-endian):
+    #   u64 addr     = fb_addr
+    #   u32 fourcc   = 0x34325258 (XR24 = DRM_FORMAT_XRGB8888)
+    #   u32 flags    = 0
+    #   u32 width    = 1024
+    #   u32 height   = 768
+    #   u32 stride   = 4096 (1024 * 4)
+
+    # Allocate config buffer (28 bytes, write manually)
+    val cfg_buf = rt_alloc(32)
+    if cfg_buf == 0:
+        serial_println("[WM] Failed to allocate ramfb config buffer")
+        return 0
+
+    # Write big-endian fields to config buffer
+    # addr (8 bytes BE)
+    val addr_ptr = cfg_buf
+    rt_mmio_write_u8(addr_ptr + 0, (fb_addr >> 56) & 0xFF)
+    rt_mmio_write_u8(addr_ptr + 1, (fb_addr >> 48) & 0xFF)
+    rt_mmio_write_u8(addr_ptr + 2, (fb_addr >> 40) & 0xFF)
+    rt_mmio_write_u8(addr_ptr + 3, (fb_addr >> 32) & 0xFF)
+    rt_mmio_write_u8(addr_ptr + 4, (fb_addr >> 24) & 0xFF)
+    rt_mmio_write_u8(addr_ptr + 5, (fb_addr >> 16) & 0xFF)
+    rt_mmio_write_u8(addr_ptr + 6, (fb_addr >> 8) & 0xFF)
+    rt_mmio_write_u8(addr_ptr + 7, fb_addr & 0xFF)
+
+    # fourcc (4 bytes BE) = 0x34325258
+    rt_mmio_write_u8(addr_ptr + 8, 0x34)
+    rt_mmio_write_u8(addr_ptr + 9, 0x32)
+    rt_mmio_write_u8(addr_ptr + 10, 0x52)
+    rt_mmio_write_u8(addr_ptr + 11, 0x58)
+
+    # flags (4 bytes BE) = 0
+    rt_mmio_write_u8(addr_ptr + 12, 0)
+    rt_mmio_write_u8(addr_ptr + 13, 0)
+    rt_mmio_write_u8(addr_ptr + 14, 0)
+    rt_mmio_write_u8(addr_ptr + 15, 0)
+
+    # width (4 bytes BE) = 1024 = 0x00000400
+    rt_mmio_write_u8(addr_ptr + 16, 0)
+    rt_mmio_write_u8(addr_ptr + 17, 0)
+    rt_mmio_write_u8(addr_ptr + 18, 0x04)
+    rt_mmio_write_u8(addr_ptr + 19, 0x00)
+
+    # height (4 bytes BE) = 768 = 0x00000300
+    rt_mmio_write_u8(addr_ptr + 20, 0)
+    rt_mmio_write_u8(addr_ptr + 21, 0)
+    rt_mmio_write_u8(addr_ptr + 22, 0x03)
+    rt_mmio_write_u8(addr_ptr + 23, 0x00)
+
+    # stride (4 bytes BE) = 4096 = 0x00001000
+    rt_mmio_write_u8(addr_ptr + 24, 0)
+    rt_mmio_write_u8(addr_ptr + 25, 0)
+    rt_mmio_write_u8(addr_ptr + 26, 0x10)
+    rt_mmio_write_u8(addr_ptr + 27, 0x00)
+
+    # DEBUG: verify cfg_buf content + selector before DMA
+    val dbg_w2 = rt_mmio_read_u8(addr_ptr + 18)
+    val dbg_w3 = rt_mmio_read_u8(addr_ptr + 19)
+    val dbg_h2 = rt_mmio_read_u8(addr_ptr + 22)
+    val dbg_f0 = rt_mmio_read_u8(addr_ptr + 8)
+    serial_println("[WM] DBG sel={ramfb_sel} cfg=({dbg_f0}) w=({dbg_w2},{dbg_w3}) h=({dbg_h2}) cfg_buf={cfg_buf} fb={fb_addr}")
+
+    # Select the ramfb file
+    rt_mmio_write_u16(0x09020008, bswap16(ramfb_sel))
+
+    # Write config via DMA
+    val dma_desc = rt_alloc(16)
+    if dma_desc == 0:
+        serial_println("[WM] Failed to allocate DMA descriptor")
+        return 0
+
+    # control (4 bytes BE) = (ramfb_sel << 16) | 0x18
+    val ctrl = (ramfb_sel << 16) | 0x18
+    rt_mmio_write_u8(dma_desc + 0, (ctrl >> 24) & 0xFF)
+    rt_mmio_write_u8(dma_desc + 1, (ctrl >> 16) & 0xFF)
+    rt_mmio_write_u8(dma_desc + 2, (ctrl >> 8) & 0xFF)
+    rt_mmio_write_u8(dma_desc + 3, ctrl & 0xFF)
+
+    # length (4 bytes BE) = 28
+    rt_mmio_write_u8(dma_desc + 4, 0)
+    rt_mmio_write_u8(dma_desc + 5, 0)
+    rt_mmio_write_u8(dma_desc + 6, 0)
+    rt_mmio_write_u8(dma_desc + 7, 28)
+
+    # address (8 bytes BE) = cfg_buf (physical address of config data)
+    rt_mmio_write_u8(dma_desc + 8, (cfg_buf >> 56) & 0xFF)
+    rt_mmio_write_u8(dma_desc + 9, (cfg_buf >> 48) & 0xFF)
+    rt_mmio_write_u8(dma_desc + 10, (cfg_buf >> 40) & 0xFF)
+    rt_mmio_write_u8(dma_desc + 11, (cfg_buf >> 32) & 0xFF)
+    rt_mmio_write_u8(dma_desc + 12, (cfg_buf >> 24) & 0xFF)
+    rt_mmio_write_u8(dma_desc + 13, (cfg_buf >> 16) & 0xFF)
+    rt_mmio_write_u8(dma_desc + 14, (cfg_buf >> 8) & 0xFF)
+    rt_mmio_write_u8(dma_desc + 15, cfg_buf & 0xFF)
+
+    # Trigger DMA: write descriptor address to FW_CFG_DMA register (big-endian u64)
+    rt_mmio_write_u32(0x09020010, bswap32((dma_desc >> 32) & 0xFFFFFFFF))
+    rt_mmio_write_u32(0x09020014, bswap32(dma_desc & 0xFFFFFFFF))
+
+    # Wait for DMA completion. The control word is the first 4 bytes of the
+    # descriptor in BIG-ENDIAN: read all four bytes, not just byte 0. (Byte 0 is
+    # the MSB, which is always 0 for the small etc/ramfb selector, so a byte-0
+    # check reports success immediately even when the DMA never ran or errored.)
+    # QEMU clears the control word to 0 on success and sets bit 0 on error.
+    var timeout: u64 = 0
+    while timeout < 1000000:
+        val c0 = rt_mmio_read_u8(dma_desc + 0)
+        val c1 = rt_mmio_read_u8(dma_desc + 1)
+        val c2 = rt_mmio_read_u8(dma_desc + 2)
+        val c3 = rt_mmio_read_u8(dma_desc + 3)
+        val ctrl_now = (c0 << 24) | (c1 << 16) | (c2 << 8) | c3
+        if ctrl_now == 0:
+            serial_println("[WM] ramfb configured successfully via fw_cfg DMA")
+            return 1
+        if (ctrl_now & 0x01) != 0:
+            serial_println("[WM] ramfb DMA ERROR: fw_cfg rejected config (ctrl bit0 set)")
+            return 0
+        timeout = timeout + 1
+
+    serial_println("[WM] ramfb DMA timeout -- DMA never completed (ctrl word nonzero)")
+    return 0   # Surface the failure instead of falsely reporting success
+
+# ===========================================================================
+# Easing / Animation Functions
+# ===========================================================================
+
+fn bounce_offset(progress: u64) -> u64:
+    if progress < 40:
+        (8 * (40 - progress)) / 40
+    else:
+        if progress < 70:
+            0
+        else:
+            0
+
+fn ease_out_cubic(t: u64) -> u64:
+    val inv = 100 - t
+    val inv2 = inv * inv / 100
+    val inv3 = inv2 * inv / 100
+    100 - inv3
+
+fn ease_in_out_quad(t: u64) -> u64:
+    if t < 50:
+        t * t * 2 / 100
+    else:
+        val inv = 100 - t
+        100 - inv * inv * 2 / 100
+
+fn spring_ease(t: u64) -> u64:
+    if t < 60:
+        t * 110 / 60
+    else:
+        if t < 80:
+            110 - (t - 60) * 15 / 20
+        else:
+            95 + (t - 80) * 5 / 20
+
+fn ease_in_cubic(t: u64) -> u64:
+    t * t * t / 10000
+
+fn lerp(start: u64, end_: u64, progress: u64) -> u64:
+    if end_ >= start:
+        start + (end_ - start) * progress / 100
+    else:
+        start - (start - end_) * progress / 100
+
+# Dock icon colors
+val ICON_TERM: u64     = 0x003498DB
+val ICON_FILES: u64    = 0x0027AE60
+val ICON_CALC: u64     = 0x00E74C3C
+val ICON_CLOCK: u64    = 0x00F39C12
+var ICON_SETTINGS: u64 = 0x009B59B6
+val ICON_BROWSER: u64  = 0x00E67E22
+val ICON_EDITOR: u64   = 0x001ABC9C
+
+# === Rendering helpers ===
+
+fn fill(x: u64, y: u64, w: u64, h: u64, color: u64):
+    rt_gui_shadow_fill(pack(x, y), pack(w, h), color, 0)
+
+fn blend(x: u64, y: u64, w: u64, h: u64, color: u64, alpha: u64):
+    rt_gui_blend_fill(pack(x, y), pack(w, h), color, alpha)
+
+fn blur(x: u64, y: u64, w: u64, h: u64, radius: u64):
+    rt_gui_box_blur(pack(x, y), pack(w, h), radius, 0)
+
+fn grad_v(x: u64, y: u64, w: u64, h: u64, c1: u64, c2: u64):
+    rt_gui_gradient_v(pack(x, y), pack(w, h), c1, c2)
+
+fn grad_h(x: u64, y: u64, w: u64, h: u64, c1: u64, c2: u64):
+    rt_gui_gradient_h(pack(x, y), pack(w, h), c1, c2)
+
+fn shadow(x: u64, y: u64, w: u64, h: u64, blur_r: u64, alpha: u64, offset: u64):
+    rt_gui_shadow(pack(x, y), pack(w, h), pack(blur_r, alpha), offset)
+
+fn rrect(x: u64, y: u64, w: u64, h: u64, color: u64, radius: u64, alpha: u64):
+    rt_gui_rounded_rect(pack(x, y), pack(w, h), pack(color, radius), alpha)
+
+fn rrect_top(x: u64, y: u64, w: u64, h: u64, color: u64, radius: u64, alpha: u64):
+    rt_gui_rounded_rect_top(pack(x, y), pack(w, h), pack(color, radius), alpha)
+
+fn circle(cx: u64, cy: u64, diameter: u64, color: u64, alpha: u64):
+    rt_gui_filled_circle(pack(cx, cy), pack(diameter, color), alpha, 0)
+
+fn rrect_aa(x: u64, y: u64, w: u64, h: u64, color: u64, radius: u64, alpha: u64):
+    rt_gui_rounded_rect_aa(pack(x, y), pack(w, h), pack(color, radius), alpha)
+
+fn line(x1: u64, y1: u64, x2: u64, y2: u64, color: u64, thick: u64, alpha: u64):
+    rt_gui_line(pack(x1, y1), pack(x2, y2), pack(color, thick), alpha)
+
+fn ring(cx: u64, cy: u64, diameter: u64, thick: u64, color: u64, alpha: u64):
+    rt_gui_ring(pack(cx, cy), pack(diameter, thick), pack(color, 0), alpha)
+
+fn grad_rect(x: u64, y: u64, w: u64, h: u64, c1: u64, radius: u64, c2: u64, alpha: u64):
+    rt_gui_gradient_rect(pack(x, y), pack(w, h), pack(c1, radius), pack(c2, alpha))
+
+fn noise(x: u64, y: u64, w: u64, h: u64, intensity: u64):
+    rt_gui_noise_blend(pack(x, y), pack(w, h), intensity, 0)
+
+# Text rendering helpers
+fn pack8(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64) -> u64:
+    (a << 56) | (b << 48) | (c << 40) | (d << 32) | (e << 24) | (f << 16) | (g << 8) | h
+
+fn draw_label(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    rt_gui_draw_text_buf(pack(x, y), pack(color, len), alpha, 0)
+
+fn draw_label_shadow(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64, shadow_a: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    rt_gui_draw_text_shadow(pack(x, y), pack(color, len), alpha, shadow_a)
+
+fn draw_label_bold(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    rt_gui_draw_text_bold(pack(x, y), pack(color, len), alpha, 0)
+
+fn draw_label_2x(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64, shadow_a: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    rt_gui_draw_text_2x(pack(x, y), pack(color, len), alpha, shadow_a)
+
+fn draw_label_outline(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64, outline_a: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    rt_gui_draw_text_outline(pack(x, y), pack(color, len), alpha, outline_a)
+
+fn draw_label_vector(x: u64, y: u64, color: u64, alpha: u64, chars: u64, len: u64, pixel_height: u64):
+    rt_gui_set_text_buf(chars, 0, 0, 0)
+    val size_and_len = (pixel_height << 16) | (len & 0xFFFF)
+    rt_gui_draw_text_vector(pack(x, y), pack(color, size_and_len), alpha, 0)
+
+# Layout engine constants
+var LT_HSTACK: u64 = 1
+var LT_VSTACK: u64 = 2
+var LT_ZSTACK: u64 = 3
+var SM_FIXED: u64 = 0
+var SM_FILL: u64 = 1
+var SM_AUTO: u64 = 2
+var ALIGN_START: u64 = 0
+var ALIGN_CENTER: u64 = 1
+var ALIGN_END: u64 = 2
+
+fn layout_fixed(size: u64) -> u64:
+    pack(SM_FIXED, size)
+
+fn layout_fill(weight: u64) -> u64:
+    pack(SM_FILL, weight)
+
+fn layout_auto() -> u64:
+    pack(SM_AUTO, 0)
+
+fn layout_x(id: u64) -> u64:
+    rt_layout_get(id, 0, 0, 0) >> 32
+
+fn layout_y(id: u64) -> u64:
+    rt_layout_get(id, 0, 0, 0) & 0xFFFFFFFF
+
+fn layout_w(id: u64) -> u64:
+    rt_layout_get_size(id, 0, 0, 0) >> 32
+
+fn layout_h(id: u64) -> u64:
+    rt_layout_get_size(id, 0, 0, 0) & 0xFFFFFFFF
+
+# === Theme-aware color getters ===
+
+fn bg_top(theme: u64) -> u64:
+    if theme == 0: DARK_BG_TOP
+    else: LIGHT_BG_TOP
+
+fn bg_bot(theme: u64) -> u64:
+    if theme == 0: DARK_BG_BOT
+    else: LIGHT_BG_BOT
+
+fn surface(theme: u64) -> u64:
+    if theme == 0: DARK_SURFACE
+    else: LIGHT_SURFACE
+
+fn surface_a(theme: u64) -> u64:
+    if theme == 0: DARK_SURFACE_A
+    else: LIGHT_SURFACE_A
+
+fn elevated(theme: u64) -> u64:
+    if theme == 0: DARK_ELEVATED
+    else: LIGHT_ELEVATED
+
+fn elevated_a(theme: u64) -> u64:
+    if theme == 0: DARK_ELEVATED_A
+    else: LIGHT_ELEVATED_A
+
+fn border_c(theme: u64) -> u64:
+    if theme == 0: DARK_BORDER
+    else: LIGHT_BORDER
+
+fn border_a(theme: u64) -> u64:
+    if theme == 0: DARK_BORDER_A
+    else: LIGHT_BORDER_A
+
+fn accent(theme: u64) -> u64:
+    if theme == 0: DARK_ACCENT
+    else: LIGHT_ACCENT
+
+fn accent2(theme: u64) -> u64:
+    if theme == 0: DARK_ACCENT2
+    else: LIGHT_ACCENT2
+
+fn shadow_a(theme: u64) -> u64:
+    if theme == 0: DARK_SHADOW_A
+    else: LIGHT_SHADOW_A
+
+fn text_c(theme: u64) -> u64:
+    if theme == 0: DARK_TEXT
+    else: LIGHT_TEXT
+
+fn text_sec(theme: u64) -> u64:
+    if theme == 0: DARK_TEXT_SEC
+    else: LIGHT_TEXT_SEC

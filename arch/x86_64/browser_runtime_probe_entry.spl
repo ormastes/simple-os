@@ -1,0 +1,78 @@
+#![allow(unnamed_duplicate_typed_args)]
+
+# Tiny x86_64 QEMU entry that exercises the real BrowserSession runtime
+# path in guest mode without the heavier framebuffer/browser shell flow.
+
+use os.kernel.arch.x86_64.console.{serial_init, serial_writeln}
+use os.kernel.arch.x86_64.interrupt.{X86Interrupt}
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_early_init}
+use os.kernel.abi.syscall_shim.{shim_init}
+use os.kernel.scheduler.scheduler.{Scheduler}
+use os.kernel.ipc.ipc.{IpcManager}
+use os.kernel.log.klog.{KernelLog}
+use examples.simple_os.assets.browser_guest_runtime.{
+    browser_runtime_guest_boot_url,
+    browser_runtime_guest_expected_body,
+    browser_runtime_guest_expected_cookie,
+    browser_runtime_guest_expected_title,
+    resolve_browser_runtime_guest_request}
+use std.common.web.browser_session.{BrowserRequest, BrowserSession}
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+
+fn _start():
+    serial_init()
+    serial_writeln("SimpleOS x86_64 browser runtime probe")
+
+    arch_x86_64_early_init()
+    shim_init(Scheduler.new(), IpcManager.new(), KernelLog.new(128))
+    if not X86Interrupt.runtime_installed():
+        X86Interrupt.install_bootstrap_runtime(64)
+
+    var session = BrowserSession.new()
+    session.begin_navigation(browser_runtime_guest_boot_url())
+    val request = BrowserRequest.create(
+        id: "document-1",
+        kind: "document",
+        url: browser_runtime_guest_boot_url(),
+        method: "GET",
+        headers: "",
+        body: "",
+        content_type: ""
+    )
+    serial_println("[BR] Session request {request.id}: {request.kind} {request.method} {request.url}")
+    val response = resolve_browser_runtime_guest_request(request)
+    serial_println("[BR] Session response {request.id}: status={response.status} body_len={response.body.len()}")
+    if response.error != "":
+        serial_println("[BR] Runtime probe failed: {response.error}")
+        rt_port_outb(0xf4, 0u8)
+        return
+    val _ = session.commit_network_response(response)
+    serial_println("[BR] Session commit call returned")
+
+    serial_println("[BR] after request pump")
+    if session.has_pending_requests():
+        serial_println("[BR] Runtime probe failed: unexpected follow-up guest runtime request queued")
+        rt_port_outb(0xf4, 0u8)
+        return
+    serial_println("[BR] before title check")
+    if session.current_title != browser_runtime_guest_expected_title():
+        serial_println("[BR] Runtime probe failed: unexpected runtime title: {session.current_title}")
+        rt_port_outb(0xf4, 0u8)
+        return
+    serial_println("[BR] before body check")
+    if session.current_body_html != browser_runtime_guest_expected_body():
+        serial_println("[BR] Runtime probe failed: unexpected runtime body: {session.current_body_html}")
+        rt_port_outb(0xf4, 0u8)
+        return
+    serial_println("[BR] before cookie check")
+    if not session.document_cookie().contains(browser_runtime_guest_expected_cookie()):
+        serial_println("[BR] Runtime probe failed: unexpected runtime cookie: {session.document_cookie()}")
+        rt_port_outb(0xf4, 0u8)
+        return
+
+    serial_println("[BR] Runtime settled title={session.current_title} body={session.current_body_html} cookie={session.document_cookie()}")
+    serial_println("[BR] Runtime probe passed")
+
+    rt_port_outb(0xf4, 0u8)

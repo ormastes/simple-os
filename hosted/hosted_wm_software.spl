@@ -1,0 +1,181 @@
+# hosted_wm_software.spl — SimpleOS Hosted Window Manager (pure-Simple render)
+#
+# The compositor's draw path uses rt_gui_* externs that only exist in the
+# baremetal runtime (glass_render.c), not on the host, so the host interpreter
+# can't drive it. This entry renders the desktop directly into a software
+# framebuffer in pure Simple and presents it to a winit window via
+# rt_winit_window_present_rgba — the same present path ui.browser uses. A PPM
+# snapshot is also written so the render can be verified headlessly.
+#
+# Run (window):   SIMPLE_GUI=1 bin/simple examples/simple_os/hosted/hosted_wm_software.spl
+# Run (headless): bin/simple examples/simple_os/hosted/hosted_wm_software.spl
+
+extern fn rt_winit_event_loop_new() -> i64
+extern fn rt_winit_window_new(el: i64, w: i64, h: i64, title: text) -> i64
+extern fn rt_winit_window_present_rgba(win: i64, w: i64, h: i64, pixels: [i64])
+extern fn rt_winit_event_loop_poll_events(el: i64, max: i64) -> i64
+extern fn rt_winit_event_free(ev: i64)
+extern fn rt_winit_window_free(win: i64)
+extern fn rt_winit_event_loop_free(el: i64)
+extern fn rt_file_write_text(path: text, content: text) -> bool
+
+val SCREEN_W: i64 = 1024
+val SCREEN_H: i64 = 768
+
+class Surface:
+    pixels: [i64]
+    w: i64
+    h: i64
+
+fn new_surface(w: i64, h: i64, bg: i64) -> Surface:
+    var px: [i64] = [bg; w * h]
+    Surface(pixels: px, w: w, h: h)
+
+fn _blend_px(dst: i64, src: i64, a: i64) -> i64:
+    if a >= 255:
+        return src
+    if a <= 0:
+        return dst
+    val inv = 255 - a
+    val dr = (dst >> 16) & 0xFF
+    val dg = (dst >> 8) & 0xFF
+    val db = dst & 0xFF
+    val sr = (src >> 16) & 0xFF
+    val sg = (src >> 8) & 0xFF
+    val sb = src & 0xFF
+    val r = (dr * inv + sr * a) / 255
+    val g = (dg * inv + sg * a) / 255
+    val b = (db * inv + sb * a) / 255
+    (r << 16) | (g << 8) | b
+
+fn fill_rect(s: Surface, x: i64, y: i64, w: i64, h: i64, color: i64, alpha: i64):
+    var yy = if y < 0: 0 else: y
+    val y_end = if y + h > s.h: s.h else: y + h
+    while yy < y_end:
+        val row = yy * s.w
+        var xx = if x < 0: 0 else: x
+        val x_end = if x + w > s.w: s.w else: x + w
+        while xx < x_end:
+            val idx = row + xx
+            if alpha >= 255:
+                s.pixels[idx] = color
+            else:
+                s.pixels[idx] = _blend_px(s.pixels[idx], color, alpha)
+            xx = xx + 1
+        yy = yy + 1
+
+fn gradient_v(s: Surface, top: i64, bottom: i64):
+    val tr = (top >> 16) & 0xFF
+    val tg = (top >> 8) & 0xFF
+    val tb = top & 0xFF
+    val br = (bottom >> 16) & 0xFF
+    val bg = (bottom >> 8) & 0xFF
+    val bb = bottom & 0xFF
+    var y = 0
+    while y < s.h:
+        val r = tr + (br - tr) * y / s.h
+        val g = tg + (bg - tg) * y / s.h
+        val b = tb + (bb - tb) * y / s.h
+        val color = (r << 16) | (g << 8) | b
+        val row = y * s.w
+        var x = 0
+        while x < s.w:
+            s.pixels[row + x] = color
+            x = x + 1
+        y = y + 1
+
+fn draw_window(s: Surface, x: i64, y: i64, w: i64, h: i64, title_color: i64, body_color: i64):
+    # shadow
+    fill_rect(s, x + 6, y + 8, w, h, 0x000000, 60)
+    # body (translucent glass)
+    fill_rect(s, x, y, w, h, body_color, 235)
+    # title bar
+    fill_rect(s, x, y, w, 30, title_color, 255)
+    # traffic-light buttons
+    fill_rect(s, x + 12, y + 10, 11, 11, 0xFF6B8A, 255)
+    fill_rect(s, x + 30, y + 10, 11, 11, 0xFFD60A, 255)
+    fill_rect(s, x + 48, y + 10, 11, 11, 0x30D158, 255)
+    # 1px top highlight
+    fill_rect(s, x, y, w, 1, 0xFFFFFF, 40)
+
+fn render_desktop(s: Surface):
+    # wallpaper: vertical gradient (deep blue -> purple)
+    gradient_v(s, 0x0B1026, 0x2A0E48)
+    # soft glow blobs
+    fill_rect(s, 700, 120, 220, 220, 0x6A4FB0, 30)
+    fill_rect(s, 160, 420, 260, 200, 0x274060, 28)
+    # system bar (top)
+    fill_rect(s, 0, 0, s.w, 28, 0x10121A, 220)
+    fill_rect(s, 16, 8, 90, 12, 0xF5F5F7, 200)      # left label glyph block
+    fill_rect(s, s.w - 120, 8, 104, 12, 0xEBEBF5, 160)  # right status
+    # windows (same layout as the QEMU WM)
+    draw_window(s, 60, 80, 400, 280, 0x2C2C32, 0x1E1E23)
+    draw_window(s, 320, 140, 360, 240, 0x2C2C32, 0x1E1E23)
+    draw_window(s, 180, 200, 380, 260, 0x2C2C32, 0x1E1E23)
+    draw_window(s, 520, 320, 320, 200, 0x2C2C32, 0x1E1E23)
+    # dock (bottom, rounded translucent bar)
+    val dock_w = 520
+    val dock_x = (s.w - dock_w) / 2
+    fill_rect(s, dock_x, s.h - 62, dock_w, 52, 0x1E1E23, 180)
+    fill_rect(s, dock_x, s.h - 62, dock_w, 1, 0xFFFFFF, 50)
+    # dock icons
+    var i = 0
+    val icon_colors = [0x3498DB, 0x27AE60, 0xE74C3C, 0xF39C12, 0x9B59B6, 0xE67E22, 0x1ABC9C]
+    while i < icon_colors.len():
+        val ix = dock_x + 18 + i * 70
+        fill_rect(s, ix, s.h - 54, 44, 44, icon_colors[i], 255)
+        fill_rect(s, ix, s.h - 54, 44, 2, 0xFFFFFF, 60)
+        i = i + 1
+
+fn write_ppm(s: Surface, path: text):
+    var parts: [text] = ["P3\n{s.w} {s.h}\n255\n"]
+    var y = 0
+    while y < s.h:
+        val row = y * s.w
+        var x = 0
+        while x < s.w:
+            val p = s.pixels[row + x]
+            val r = (p >> 16) & 0xFF
+            val g = (p >> 8) & 0xFF
+            val b = p & 0xFF
+            parts = parts.push("{r} {g} {b} ")
+            x = x + 1
+        parts = parts.push("\n")
+        y = y + 1
+    rt_file_write_text(path, parts.join(""))
+
+fn main() -> i64:
+    print "SimpleOS Hosted WM (software render) {SCREEN_W}x{SCREEN_H}"
+    val s = new_surface(SCREEN_W, SCREEN_H, 0x0B1026)
+    render_desktop(s)
+    print "Desktop rendered into software framebuffer ({s.pixels.len()} px)"
+    # Present to a winit window if a GUI runtime is available; otherwise fall back to a
+    # PPM snapshot. The per-pixel PPM encode is slow, so it only runs on the headless
+    # path — the GUI path presents the [i64] buffer directly via present_rgba.
+    val el = rt_winit_event_loop_new()
+    if el == 0:
+        print "No GUI runtime (set SIMPLE_GUI=1 to open a window); headless render only."
+        write_ppm(s, "/tmp/hosted_wm.ppm")
+        print "Wrote /tmp/hosted_wm.ppm"
+        return 0
+    val win = rt_winit_window_new(el, SCREEN_W, SCREEN_H, "SimpleOS Window Manager")
+    if win == 0:
+        print "Window creation failed."
+        return 0
+    rt_winit_window_present_rgba(win, SCREEN_W, SCREEN_H, s.pixels)
+    # macOS: poll the event loop CONTINUOUSLY (never rt_thread_sleep) so AppKit keeps a
+    # handler and the window composites; the interpreter owns the main thread. Launch via
+    # scripts/macos-gui-run.shs (.app bundle) so the process is window-server registered.
+    # See doc/08_tracking/bug/macos_winit_window_not_displayed_2026-05-28.md
+    var iters = 0
+    while iters < 20000:
+        var ev = rt_winit_event_loop_poll_events(el, 1)
+        while ev != 0:
+            rt_winit_event_free(ev)
+            ev = rt_winit_event_loop_poll_events(el, 1)
+        if iters % 200 == 0:
+            rt_winit_window_present_rgba(win, SCREEN_W, SCREEN_H, s.pixels)
+        iters = iters + 1
+    rt_winit_window_free(win)
+    rt_winit_event_loop_free(el)
+    return 0

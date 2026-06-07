@@ -1,0 +1,29 @@
+use os.crypto.sha256.{sha256, sha256_with_len}
+use lib.common.crypto.sha256.{sha256_bytes as common_sha256_bytes}
+extern fn rt_sha256_H(index: i64) -> u32
+extern fn rt_sha256_K(index: i64) -> u32
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+
+fn _pfx(label: text, bs: [u8]):
+    serial_println("{label}: {bs[0].to_i64()} {bs[1].to_i64()} {bs[2].to_i64()} {bs[3].to_i64()}")
+
+fn _start():
+    serial_println("[DBG] H0={rt_sha256_H(0).to_i64()} K0={rt_sha256_K(0).to_i64()}")
+    var empty: [u8] = []
+    val h_empty = sha256(empty)
+    val h_empty_len = sha256_with_len(empty, 0)
+    _pfx("[DBG] sha256(empty)", h_empty)
+    _pfx("[DBG] sha256_with_len(empty,0)", h_empty_len)
+
+    var abc: [u8] = [0x61u8, 0x62u8, 0x63u8]
+    val h_abc = sha256(abc)
+    val h_abc_len = sha256_with_len(abc, 3)
+    _pfx("[DBG] sha256(abc)", h_abc)
+    _pfx("[DBG] sha256_with_len(abc,3)", h_abc_len)
+    val common_empty = common_sha256_bytes([])
+    serial_println("[DBG] common_sha256_bytes(empty): {common_empty.get(0)} {common_empty.get(1)} {common_empty.get(2)} {common_empty.get(3)}")
+    val common_abc = common_sha256_bytes([0x61, 0x62, 0x63])
+    serial_println("[DBG] common_sha256_bytes(abc): {common_abc.get(0)} {common_abc.get(1)} {common_abc.get(2)} {common_abc.get(3)}")
+
+    rt_port_outb(0xf4u16, 0x03u8)

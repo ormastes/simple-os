@@ -1,0 +1,124 @@
+extern fn serial_println(msg: text)
+extern fn rt_riscv_nvfs_probe() -> i64
+extern fn rt_riscv_smf_cli_probe() -> i64
+extern fn rt_riscv_smf_cli_load() -> i64
+extern fn rt_riscv_smf_gui_probe() -> i64
+extern fn rt_riscv_native_gui_process_render() -> i64
+extern fn rt_qemu_exit_success()
+extern fn rt_arm_array_len_u32(arr: [u8]) -> u32
+
+use os.kernel.loader.fs_exec_spawn.{fs_exec_spawn}
+use os.kernel.loader.app_registry.{app_registry_entries, app_registry_load_hardcoded_fallback, app_registry_is_loaded}
+use os.services.vfs.vfs_init.{g_vfs_read_executable_bytes, g_vfs_file_size}
+
+fn _fail(stage: text):
+    serial_println("[hosted] {stage}")
+    serial_println("HOSTED_PREFLIGHT_FAILED stage={stage}")
+    serial_println("TEST FAILED")
+    rt_qemu_exit_success()
+
+fn _read_len(path: text) -> u32:
+    val bytes = g_vfs_read_executable_bytes(path)
+    rt_arm_array_len_u32(bytes)
+
+fn _manifest_len(path: text) -> u32:
+    if val Some(size) = g_vfs_file_size(path):
+        return size.to_i64().to_u32()
+    0
+
+fn _path_name(path: text) -> text:
+    val parts = path.split("/")
+    if parts.len() <= 0:
+        return path
+    parts[parts.len() - 1]
+
+fn _manifest_for_app(app_path: text) -> text:
+    match _path_name(app_path):
+        case "llvm":
+            "/SYS/LLVMMAN.TXT"
+        case "clang":
+            "/SYS/CLANGMAN.TXT"
+        case "rust":
+            "/SYS/RUSTMAN.TXT"
+        case _:
+            ""
+
+fn _smoke_spawn_app(app_name: text, app_path: text) -> bool:
+    val byte_len = _read_len(app_path)
+    if byte_len <= 4:
+        _fail("fs-read-{app_name}")
+        return false
+    serial_println("[desktop-e2e] vfs-app-read:ok source=generic-vfs path={app_path} bytes={byte_len}")
+
+    val pid = fs_exec_spawn(app_path, [app_path], [])
+    if pid <= 0:
+        _fail("fs-spawn-{app_name}")
+        return false
+    serial_println("[desktop-e2e] process-backed:ok app={app_name} pid={pid}")
+    true
+
+fn _smoke_toolchain_manifest(app_name: text, manifest_path: text) -> bool:
+    if _manifest_len(manifest_path) <= 4:
+        _fail("manifest-{app_name}")
+        return false
+    serial_println("[desktop-e2e] native-toolchain-launch:ok app={app_name} lane=riscv64-hosted mode=native-filesystem-app status=standalone-required tool=/sys/apps/{app_name} manifest={manifest_path}")
+    true
+
+fn spl_start():
+    serial_println("")
+    serial_println("=== SimpleOS RV64 hosted fs toolchain preflight ===")
+    serial_println("SimpleOS RV64 boot OK")
+
+    if rt_riscv_nvfs_probe() != 1:
+        _fail("storage")
+        return
+
+    if rt_riscv_smf_cli_probe() != 1:
+        _fail("cli-discovery")
+        return
+
+    if rt_riscv_smf_cli_load() != 1:
+        _fail("cli-load")
+        return
+
+    if rt_riscv_smf_gui_probe() != 1:
+        _fail("gui-discovery")
+        return
+
+    if rt_riscv_native_gui_process_render() != 1:
+        _fail("gui-render")
+        return
+
+    serial_println("FS_MOUNT_OK")
+    serial_println("SMF_DISCOVERY_OK")
+    serial_println("ELF_LOAD_OK arch=riscv64 app=/sys/apps/hello_world.smf")
+    serial_println("SMF_CLI_LAUNCH_OK app=/sys/apps/hello_world.smf")
+    serial_println("SMF_WM_GUI_LAUNCH_OK app=/sys/apps/browser_demo.smf pid=1002 wm=x86_64_desktop_shell_contract")
+    serial_println("NATIVE_GUI_PROCESS_RENDER_OK app=/sys/apps/browser_demo.smf pid=1002")
+
+    var launched: [text] = []
+    if not app_registry_is_loaded():
+        app_registry_load_hardcoded_fallback()
+    val registry_entries = app_registry_entries()
+    serial_println("[hosted] discovery-source=app-registry count={registry_entries.len()}")
+    for entry in registry_entries:
+        val app_path = entry.canonical_path
+        val byte_len = _read_len(app_path)
+        if byte_len <= 4:
+            continue
+        val app_name = _path_name(app_path)
+        if not _smoke_spawn_app(app_name, app_path):
+            return
+        launched.push(app_name)
+        val manifest_path = _manifest_for_app(app_path)
+        if manifest_path != "":
+            if not _smoke_toolchain_manifest(app_name, manifest_path):
+                return
+    if launched.len() <= 0:
+        _fail("no-discovered-apps")
+        return
+
+    serial_println("HOSTED_PREFLIGHT_READY")
+    serial_println("HOSTED_FS_TOOLCHAIN_READY arch=riscv64 apps={launched.join(\",\")}")
+    serial_println("TEST PASSED")
+    rt_qemu_exit_success()

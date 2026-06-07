@@ -1,0 +1,23 @@
+#![allow(unknown_attribute)]
+
+extern fn rt_mmio_write_u64(addr: u64, value: u64)
+
+@section(".text.entry")
+@naked
+fn _start():
+    asm volatile:
+        "la      sp, _stack_top"
+        "call    ghdl_boot_info_probe_entry__boot_main"
+        "j       ghdl_boot_info_probe_entry___halt"
+
+fn _halt():
+    asm volatile:
+        "ebreak"
+        ".Lghdl_boot_info_probe_halt:"
+        "wfi"
+        "j .Lghdl_boot_info_probe_halt"
+
+fn boot_main():
+    rt_mmio_write_u64(0x80FF1000, 0x1122334455667788)
+    rt_mmio_write_u64(0x80FF1008, 0x0000000000000001)
+    _halt()

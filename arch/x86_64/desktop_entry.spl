@@ -1,0 +1,209 @@
+#![allow(unnamed_duplicate_typed_args)]
+# x86_64 Desktop Entry — VGA + Keyboard + Mouse linked together
+#
+# Initializes all hardware and renders a desktop with windows:
+#   1. BGA framebuffer (1024x768x32bpp) via C rendering (rt_gui_*)
+#   2. PS/2 keyboard (port 0x60) via scancode polling
+#   3. PS/2 mouse (port 0x60/0x64) via 3-byte packet polling
+#
+# Uses C-level rendering functions from glass_render.c for reliable
+# framebuffer access (bypasses Simple mmio_write32 struct chain issues).
+
+extern fn serial_println(msg: text)
+extern fn rt_port_inb(port: u64) -> u64
+extern fn rt_port_outb(port: u64, value: u64)
+
+# C rendering API (glass_render.c / baremetal_stubs.c)
+extern fn rt_gui_set_fb(addr: u64, width: u64) -> u64
+extern fn rt_gui_fill4(xy: u64, wh: u64, color: u64, unused: u64) -> u64
+extern fn rt_gui_begin_frame(width: u64, height: u64, u1: u64, u2: u64) -> u64
+extern fn rt_gui_present(u1: u64, u2: u64, u3: u64, u4: u64) -> u64
+extern fn rt_gui_blend_fill(xy: u64, wh: u64, color: u64, alpha: u64) -> u64
+
+# Services
+use os.services.pcimgr.pcimgr.{pcimgr_init}
+use os.services.vfs.vfs_init.{vfs_boot_init}
+
+fn pack(hi: i64, lo: i64) -> u64:
+    val h = if hi < 0: 0 else: hi.to_u64()
+    val l = if lo < 0: 0 else: lo.to_u64()
+    (h << 32) | (l & 0xFFFFFFFF)
+
+# ============================================================================
+# Keyboard
+# ============================================================================
+
+fn kb_poll() -> i64:
+    val status = rt_port_inb(0x64)
+    if (status & 1) == 0: return -1
+    if (status & 0x20) != 0: return -1
+    rt_port_inb(0x60).to_i64()
+
+# ============================================================================
+# Mouse
+# ============================================================================
+
+var mouse_x: i64 = 512
+var mouse_y: i64 = 384
+var mouse_btn: i64 = 0
+var mouse_byte_idx: i64 = 0
+var mouse_bytes: [i64] = [0, 0, 0]
+
+fn mouse_init():
+    rt_port_outb(0x64, 0xA8)
+    rt_port_outb(0x64, 0x20)
+    var t: i64 = 100000
+    while t > 0 and (rt_port_inb(0x64) & 1) == 0:
+        t = t - 1
+    val config = rt_port_inb(0x60)
+    rt_port_outb(0x64, 0x60)
+    rt_port_outb(0x60, (config | 2) & 0xDF)
+    rt_port_outb(0x64, 0xD4)
+    rt_port_outb(0x60, 0xF6)
+    t = 100000
+    while t > 0 and (rt_port_inb(0x64) & 1) == 0:
+        t = t - 1
+    rt_port_inb(0x60)
+    rt_port_outb(0x64, 0xD4)
+    rt_port_outb(0x60, 0xF4)
+    t = 100000
+    while t > 0 and (rt_port_inb(0x64) & 1) == 0:
+        t = t - 1
+    rt_port_inb(0x60)
+
+fn mouse_poll():
+    val status = rt_port_inb(0x64)
+    if (status & 1) == 0: return
+    if (status & 0x20) == 0: return
+    val byte = rt_port_inb(0x60)
+    if mouse_byte_idx == 0:
+        if (byte & 0x08) == 0: return
+        mouse_bytes[0] = byte.to_i64()
+        mouse_byte_idx = 1
+    else if mouse_byte_idx == 1:
+        mouse_bytes[1] = byte.to_i64()
+        mouse_byte_idx = 2
+    else:
+        mouse_bytes[2] = byte.to_i64()
+        mouse_byte_idx = 0
+        val flags = mouse_bytes[0]
+        var dx = mouse_bytes[1]
+        var dy = mouse_bytes[2]
+        if (flags & 0x10) != 0: dx = dx - 256
+        if (flags & 0x20) != 0: dy = dy - 256
+        mouse_x = mouse_x + dx
+        mouse_y = mouse_y - dy
+        if mouse_x < 0: mouse_x = 0
+        if mouse_y < 0: mouse_y = 0
+        if mouse_x > 1023: mouse_x = 1023
+        if mouse_y > 767: mouse_y = 767
+        mouse_btn = flags & 7
+
+# ============================================================================
+# Window state
+# ============================================================================
+
+var win_x: [i64] = [50, 300, 150]
+var win_y: [i64] = [50, 150, 200]
+var win_w: [i64] = [500, 450, 400]
+var win_h: [i64] = [350, 300, 280]
+var win_title: [text] = ["Terminal", "File Browser", "Editor"]
+var focused: i64 = 2
+var dragging: bool = false
+var drag_win: i64 = -1
+var drag_ox: i64 = 0
+var drag_oy: i64 = 0
+
+val TITLE_H: i64 = 32
+
+fn render_frame():
+    rt_gui_begin_frame(1024, 768, 0, 0)
+
+    # Background
+    rt_gui_fill4(pack(0, 0), pack(1024, 768), 0xFF1A1A2E, 0)
+
+    # Windows
+    var i: i64 = 0
+    while i < 3:
+        val x = win_x[i]
+        val y = win_y[i]
+        val w = win_w[i]
+        val h = win_h[i]
+
+        # Shadow
+        rt_gui_blend_fill(pack(x + 4, y + 4), pack(w, h), 0xFF000000, 60)
+        # Body
+        rt_gui_blend_fill(pack(x, y), pack(w, h), 0xFF202040, 200)
+        # Title bar
+        val tb = if i == focused: 0xF04A4A8A else: 0xF03A3A5A
+        rt_gui_fill4(pack(x, y), pack(w, TITLE_H), tb, 0)
+        # Traffic light buttons
+        rt_gui_fill4(pack(x + 10, y + 10), pack(12, 12), 0xFFE06060, 0)
+        rt_gui_fill4(pack(x + 28, y + 10), pack(12, 12), 0xFF60A0E0, 0)
+        rt_gui_fill4(pack(x + 46, y + 10), pack(12, 12), 0xFF60C0A0, 0)
+        # Border
+        val bc = if i == focused: 0xFF6060A0 else: 0xFF404060
+        rt_gui_fill4(pack(x, y), pack(w, 1), bc, 0)
+        rt_gui_fill4(pack(x, y + h - 1), pack(w, 1), bc, 0)
+        rt_gui_fill4(pack(x, y), pack(1, h), bc, 0)
+        rt_gui_fill4(pack(x + w - 1, y), pack(1, h), bc, 0)
+
+        i = i + 1
+
+    # Mouse cursor (cross + dot)
+    rt_gui_fill4(pack(mouse_x, mouse_y - 4), pack(1, 9), 0xFFFFFFFF, 0)
+    rt_gui_fill4(pack(mouse_x - 4, mouse_y), pack(9, 1), 0xFFFFFFFF, 0)
+    rt_gui_fill4(pack(mouse_x - 1, mouse_y - 1), pack(3, 3), 0xFFFFFFFF, 0)
+
+    rt_gui_present(0, 0, 0, 0)
+
+fn handle_input():
+    # Keyboard
+    val sc = kb_poll()
+    if sc >= 0 and sc < 0x80:
+        if sc == 0x0F:  # Tab
+            focused = (focused + 1) % 3
+
+    # Mouse
+    mouse_poll()
+
+    if (mouse_btn & 1) != 0:
+        if not dragging:
+            var i: i64 = 2
+            while i >= 0:
+                if mouse_x >= win_x[i] and mouse_x < win_x[i] + win_w[i] and mouse_y >= win_y[i] and mouse_y < win_y[i] + TITLE_H:
+                    dragging = true
+                    drag_win = i
+                    drag_ox = mouse_x - win_x[i]
+                    drag_oy = mouse_y - win_y[i]
+                    focused = i
+                    i = -1
+                i = i - 1
+        else:
+            if drag_win >= 0 and drag_win < 3:
+                win_x[drag_win] = mouse_x - drag_ox
+                win_y[drag_win] = mouse_y - drag_oy
+    else:
+        dragging = false
+        drag_win = -1
+
+fn _start():
+    serial_println("")
+    serial_println("=== SimpleOS Desktop ===")
+
+    pcimgr_init()
+    vfs_boot_init()
+
+    serial_println("[desktop] Init BGA framebuffer...")
+    rt_gui_set_fb(0xFD000000, 1024)
+    serial_println("[desktop] Framebuffer: 1024x768 @ 0xFD000000")
+
+    serial_println("[desktop] Init PS/2 mouse...")
+    mouse_init()
+    serial_println("[desktop] Mouse: OK")
+
+    serial_println("[desktop] Starting desktop (Tab=focus, Mouse=drag)")
+
+    while true:
+        handle_input()
+        render_frame()

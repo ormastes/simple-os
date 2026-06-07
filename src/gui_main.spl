@@ -1,0 +1,116 @@
+# SimpleOS GUI Kernel Main -- Full Desktop with Compositor
+#
+# GUI kernel entry that:
+# 1. Prints boot status via serial
+# 2. Creates FramebufferDriver from boot info
+# 3. Initializes PS/2 keyboard and mouse drivers
+# 4. Creates Compositor with framebuffer + input devices
+# 5. Creates DesktopShell with taskbar, app launcher
+# 6. Enters the desktop shell event loop
+#
+# Build:
+#   bin/simple native-build --entry examples/simple_os/arch/x86_64/gui_entry.spl \
+#     --target x86_64-unknown-none -o build/os/simpleos_gui_x86_64.elf \
+#     --linker-script examples/simple_os/arch/x86_64/linker.ld \
+#     --entry-closure --source src/os --source src/lib
+
+use os.kernel.boot.ports.{BootOutputPort, FramebufferInfo}
+use os.drivers.framebuffer.fb_driver.{FramebufferDriver, Color}
+use os.drivers.input.ps2_keyboard.{Ps2Keyboard}
+use os.drivers.input.ps2_mouse.{Ps2Mouse}
+use os.compositor.compositor.{Compositor}
+use os.desktop.shell.{DesktopShell}
+
+# Serial output
+extern fn serial_println(msg: text)
+
+fn gui_kernel_main(boot_info: BootOutputPort):
+    """GUI kernel main -- initialize full desktop environment.
+
+    Called from gui_entry.spl after arch-specific boot completes.
+    Sets up framebuffer, input devices, compositor, and desktop shell,
+    then enters the event loop.
+    """
+    serial_println("[GUI] Starting desktop environment...")
+
+    # --- Step 1: Framebuffer ---
+    serial_println("[GUI] Initializing framebuffer...")
+    val fb_info_opt = boot_info.framebuffer
+    if val fb_info = fb_info_opt:
+        serial_println("[GUI] Framebuffer info available")
+    else:
+        serial_println("[GUI] ERROR: No framebuffer from bootloader, cannot start GUI")
+        return
+
+    var fb = FramebufferDriver.from_boot_info(fb_info)
+    serial_println("[GUI] FramebufferDriver created")
+
+    # --- Step 2: Input devices ---
+    serial_println("[GUI] Initializing PS/2 keyboard...")
+    var keyboard = Ps2Keyboard.new()
+    keyboard.init()
+    serial_println("[GUI] PS/2 keyboard initialized")
+
+    serial_println("[GUI] Initializing PS/2 mouse...")
+    var mouse = Ps2Mouse.create(fb.width.to_i64(), fb.height.to_i64())
+    mouse.init()
+    serial_println("[GUI] PS/2 mouse initialized")
+
+    # --- Step 3: Compositor ---
+    serial_println("[GUI] Creating compositor...")
+    var compositor = Compositor.new(fb, keyboard, mouse)
+    serial_println("[GUI] Compositor created")
+
+    # --- Step 4: Desktop Shell ---
+    serial_println("[GUI] Creating desktop shell...")
+    var shell = DesktopShell.new(compositor)
+    shell.init()
+    serial_println("[GUI] Desktop shell initialized (taskbar, app launcher)")
+
+    # Launch all known GUI apps
+    serial_println("[GUI] Launching all GUI apps...")
+    val app_names = [
+        "Terminal",
+        "Calculator",
+        "Clock",
+        "Hello World",
+        "Browser Demo",
+        "Editor",
+        "Memo",
+        "Paint",
+        "File Manager",
+        "File Explorer",
+        "Image Viewer",
+        "Calendar",
+        "System Monitor",
+        "Disk Manager",
+        "Screenshot",
+        "Settings",
+        "Minesweeper",
+        "Snake",
+        "Tetris",
+        "Solitaire",
+        "Todo",
+        "Hex Editor",
+        "Log Viewer",
+        "Network Monitor",
+        "Contacts",
+        "Package Manager",
+        "Color Picker",
+        "Font Viewer"
+    ]
+    var app_idx: i32 = 0
+    for app_name in app_names:
+        serial_println("[GUI] Launching app {app_idx + 1}/28: {app_name}")
+        shell.launch_app(app_name)
+        app_idx = app_idx + 1
+    serial_println("[GUI] All 28 GUI apps launched")
+
+    # --- Step 5: Event loop ---
+    serial_println("[GUI] Entering desktop event loop")
+    serial_println("[GUI] Keyboard shortcuts: Alt+Tab=cycle, Alt+F4=close, Alt+F5=minimize")
+    serial_println("[GUI] Mouse: click title bar to drag, click close button to close")
+    shell.run()
+
+    # If we ever exit the loop
+    serial_println("[GUI] Desktop shell exited")

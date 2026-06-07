@@ -1,0 +1,6 @@
+# ARM32 Entry — SimpleOS boot shim for ARMv7 QEMU virt
+
+fn _start():
+    print "[SIMPLE] Simple entry point reached"
+    print "[SIMPLE] Runtime string system working"
+    print "[SIMPLE] arm32 boot complete"

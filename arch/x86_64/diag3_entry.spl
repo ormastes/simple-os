@@ -1,0 +1,22 @@
+# Diagnostic 3 — isolate which posix init sub-function crashes
+
+extern fn serial_println(msg: text)
+
+use os.posix.fd_table.{fd_table_init}
+use os.posix.async_io.{async_io_init}
+use os.posix.signal_compat.{signal_init}
+
+fn _start():
+    serial_println("[DIAG3] Step A: fd_table_init")
+    fd_table_init()
+    serial_println("[DIAG3] Step A: OK")
+
+    serial_println("[DIAG3] Step B: async_io_init")
+    async_io_init()
+    serial_println("[DIAG3] Step B: OK")
+
+    serial_println("[DIAG3] Step C: signal_init")
+    signal_init()
+    serial_println("[DIAG3] Step C: OK")
+
+    serial_println("[DIAG3] ALL PASSED")

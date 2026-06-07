@@ -1,0 +1,47 @@
+# Device Enumeration Test for SimpleOS
+#
+# Tests PCI device discovery via syscall 80 (DevEnumerate).
+# Lists all PCI devices found on the QEMU machine.
+
+use os.userlib.device.{enumerate_devices, get_device_info, DeviceEntry}
+use os.userlib.syscall_raw.{syscall}
+
+extern fn serial_println(msg: text)
+
+fn main():
+    serial_println("========================================")
+    serial_println("  SimpleOS Device Enumeration Test")
+    serial_println("========================================")
+    serial_println("")
+
+    # Get device count via syscall 80 mode 0
+    val count_result = syscall(80, 0, 0, 0, 0, 0)
+    serial_println("[dev-test] PCI device count: {count_result}")
+
+    if count_result <= 0:
+        serial_println("[dev-test] No PCI devices found!")
+        serial_println("TEST FAILED")
+        return
+
+    val count = count_result as u64
+    serial_println("[dev-test] Enumerating {count} devices...")
+    serial_println("")
+
+    # List each device via higher-level API
+    val result = enumerate_devices()
+    if result.is_ok():
+        val devices = result.unwrap()
+        var i: u64 = 0
+        while i < devices.len():
+            val device = devices[i]
+            serial_println("[dev-test] {device.bus}:{device.device}.{device.func} — vendor=0x{device.vendor_id} device=0x{device.device_id} class={device.class_name}")
+            i = i + 1
+    else:
+        serial_println("[dev-test] enumerate_devices() failed, falling back to raw syscall")
+        # Fallback: just report the count we already got
+        serial_println("[dev-test] Found {count} devices via raw syscall")
+
+    serial_println("")
+    serial_println("[dev-test] Device enumeration complete")
+    serial_println("========================================")
+    serial_println("TEST PASSED")

@@ -1,0 +1,118 @@
+# hosted_wm.spl — SimpleOS Hosted Window Manager (1024x768)
+#
+# Runs SimpleOS desktop with app windows on macOS via winit.
+# Uses the compositor module — same rendering path as baremetal.
+#
+# Run with:
+#   SIMPLE_GUI=1 bin/simple examples/simple_os/hosted/hosted_wm.spl
+
+extern fn rt_winit_event_loop_new() -> i64
+extern fn rt_winit_window_new(el: i64, w: i64, h: i64, title: text) -> i64
+extern fn rt_winit_window_free(win: i64)
+extern fn rt_winit_event_loop_free(el: i64)
+extern fn rt_winit_event_loop_poll_events(el: i64, max: i64) -> i64
+extern fn rt_winit_event_free(ev: i64)
+extern fn rt_thread_sleep(ms: i64)
+
+use os.compositor.hosted_backend.{HostedCompositorBackend}
+use os.compositor.hosted_input_backend.{HostedInputBackend}
+use os.compositor.compositor.{Compositor}
+use os.compositor.boot_splash.{draw_boot_splash}
+use os.compositor.glass_effects_pure.{GlassConfig}
+use os.compositor.glass_port.{GlassPortConfig}
+use os.services.theme.theme_service.{get_theme_service}
+use nogc_sync_mut.ui.theme_package.{default_theme_id, load_theme_package, theme_numeric_colors, theme_glass_config}
+
+val SCREEN_W: i64 = 1024
+val SCREEN_H: i64 = 768
+val BG_COLOR: u32 = 0xFF1A1B26
+
+fn main() -> i64:
+    print "SimpleOS Window Manager — Hosted ({SCREEN_W}x{SCREEN_H})"
+    print "Controls: Alt+Tab=cycle, T=theme, Escape=quit"
+    print "          1/2/3/4=focus, M=minimize, W=close, R=restore"
+    print "          Terminal: type commands + Enter (help, ls, pwd, ps, free)"
+    print "          Editor: click to move cursor"
+
+    val el = rt_winit_event_loop_new()
+    val win = rt_winit_window_new(el, SCREEN_W, SCREEN_H, "SimpleOS Window Manager")
+    if win == 0:
+        print "ERROR: Window creation failed (is SIMPLE_GUI=1 set?)"
+        return 1
+
+    val w32: i32 = 1024
+    val h32: i32 = 768
+    var backend = HostedCompositorBackend.create(win, w32, h32, BG_COLOR)
+    var input = HostedInputBackend.create(el)
+    var compositor = Compositor.with_backends(backend, input, w32, h32)
+
+    # Load theme from folder-based package registry.
+    val theme_svc = get_theme_service()
+    val active_theme = default_theme_id()
+    val _theme_pkg = load_theme_package(active_theme)
+    theme_svc.load_theme(active_theme)
+    val c = theme_numeric_colors(active_theme)
+    val tg = theme_glass_config(active_theme)
+    val glass_cfg = GlassConfig(
+        surface_color: tg.surface_color,
+        surface_alpha: tg.surface_alpha,
+        blur_radius: tg.blur_radius,
+        border_color: tg.border_color,
+        border_alpha: tg.border_alpha,
+        shadow_offset: tg.shadow_offset,
+        shadow_blur: tg.shadow_blur,
+        shadow_alpha: tg.shadow_alpha,
+        accent_color: tg.accent_color,
+        accent2_color: tg.accent2_color,
+        bg_top: tg.bg_top,
+        bg_bottom: tg.bg_bottom
+    )
+    compositor.set_glass_config(glass_cfg)
+
+    # Enable glass theme with pure Simple rendering (DI port)
+    # Uses shared modules: desktop_chrome, window_effects, app_content, render_extras
+    compositor.set_glass_theme_pure(true)
+
+    # Boot splash screen uses the same theme package colors as the compositor.
+    val splash_cfg = GlassPortConfig(
+        surface_color: tg.surface_color,
+        surface_alpha: tg.surface_alpha,
+        blur_radius: tg.blur_radius,
+        border_color: tg.border_color,
+        border_alpha: tg.border_alpha,
+        shadow_offset: tg.shadow_offset,
+        shadow_blur: tg.shadow_blur,
+        shadow_alpha: tg.shadow_alpha,
+        accent_color: tg.accent_color,
+        accent2_color: tg.accent2_color,
+        elevated_color: c.button & 0x00FFFFFF,
+        blur_passes: 3,
+        bg_top: tg.bg_top,
+        bg_bottom: tg.bg_bottom
+    )
+    draw_boot_splash(backend, splash_cfg, "Hosted (macOS)")
+    # Brief display: pump events + sleep for 1 second
+    var pump: i32 = 0
+    while pump < 10:
+        var ev = rt_winit_event_loop_poll_events(el, 100)
+        while ev != 0:
+            rt_winit_event_free(ev)
+            ev = rt_winit_event_loop_poll_events(el, 100)
+        rt_thread_sleep(100)
+        pump = pump + 1
+
+    # Create demo windows (same layout as QEMU WM)
+    compositor.create_window("Terminal", 60, 80, 400, 280)
+    compositor.create_window("Editor", 320, 140, 360, 240)
+    compositor.create_window("Browser", 180, 200, 380, 260)
+    compositor.create_window("File Manager", 520, 320, 320, 200)
+
+    print "Desktop ready! 4 windows + system bar + dock."
+    print "Glass theme: pure Simple (shared with QEMU WM)"
+    compositor.run_loop()
+
+    print "Desktop closed"
+    backend.free()
+    rt_winit_window_free(win)
+    rt_winit_event_loop_free(el)
+    return 0

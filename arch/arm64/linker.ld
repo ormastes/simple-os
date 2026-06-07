@@ -8,8 +8,8 @@
  *   .rodata   — read-only data
  *   .data     — initialized read-write data
  *   .bss      — zero-initialized data
- *   .stack    — kernel stack (64KB)
- *   .heap     — kernel heap (16MB)
+ *   .stack    — kernel stack (8 MB — Simple code uses large stack frames)
+ *   .heap     — kernel heap (64 MB)
  *
  * Entry point: _start (in .text.entry section)
  * Exception vectors: .text.vectors (must be 2KB aligned for VBAR_EL1)
@@ -20,7 +20,7 @@ OUTPUT_FORMAT("elf64-littleaarch64")
 ENTRY(_start)
 
 MEMORY {
-    RAM (rwx) : ORIGIN = 0x40000000, LENGTH = 128M
+    RAM (rwx) : ORIGIN = 0x40000000, LENGTH = 256M
 }
 
 SECTIONS {
@@ -35,6 +35,13 @@ SECTIONS {
     /* Read-only data */
     .rodata : ALIGN(4K) {
         *(.rodata*)
+    } > RAM
+
+    .simple_sandbox : ALIGN(4K) {
+        __simple_sandbox_start = .;
+        KEEP(*(.simple.sandbox*))
+        KEEP(*(.simple.mpu*))
+        __simple_sandbox_end = .;
     } > RAM
 
     /* Initialized read-write data */
@@ -53,14 +60,14 @@ SECTIONS {
     /* Kernel stack (grows downward, _stack_top is initial SP) */
     .stack (NOLOAD) : ALIGN(16) {
         _stack_bottom = .;
-        . += 64K;
+        . += 8M;
         _stack_top = .;
     } > RAM
 
     /* Kernel heap */
     .heap (NOLOAD) : ALIGN(4K) {
         __heap_start = .;
-        . += 16M;
+        . += 64M;
         __heap_end = .;
     } > RAM
 

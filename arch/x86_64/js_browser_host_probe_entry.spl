@@ -1,0 +1,67 @@
+#![allow(unnamed_duplicate_typed_args)]
+
+use os.kernel.arch.x86_64.console.{serial_init, serial_writeln}
+use os.kernel.arch.x86_64.interrupt.{X86Interrupt}
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_early_init}
+use os.kernel.abi.syscall_shim.{shim_init}
+use os.kernel.scheduler.scheduler.{Scheduler}
+use os.kernel.ipc.ipc.{IpcManager}
+use os.kernel.log.klog.{KernelLog}
+use std.js.engine.runtime.{JsRuntime}
+use std.js.engine.js_error.{Logger, LogLevel}
+use std.js.types.js_types.{JsValue}
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+
+fn _start():
+    serial_init()
+    serial_writeln("SimpleOS x86_64 JS browser-host probe")
+
+    arch_x86_64_early_init()
+    shim_init(Scheduler.new(), IpcManager.new(), KernelLog.new(128))
+    if not X86Interrupt.runtime_installed():
+        X86Interrupt.install_bootstrap_runtime(64)
+
+    val logger = Logger.new("js-browser-host-probe", LogLevel.Error)
+    var runtime = JsRuntime.new(logger)
+
+    val body_id = runtime.interpreter.object_store.create_object()
+    runtime.interpreter.object_store.set_property(body_id, "innerHTML", JsValue.String(v: "boot"))
+    runtime.interpreter.object_store.set_property(body_id, "textContent", JsValue.String(v: "boot"))
+
+    val document_id = runtime.interpreter.object_store.create_object()
+    runtime.interpreter.object_store.set_property(document_id, "title", JsValue.String(v: "Boot"))
+    runtime.interpreter.object_store.set_property(document_id, "body", JsValue.Object(id: body_id))
+    runtime.interpreter.object_store.set_property(document_id, "cookie", JsValue.String(v: ""))
+
+    runtime.interpreter.define_global_value("document", JsValue.Object(id: document_id))
+    runtime.interpreter.host_document_id = document_id
+    runtime.interpreter.host_body_id = body_id
+    runtime.interpreter.host_document_title_value = JsValue.String(v: "Boot")
+    runtime.interpreter.host_document_cookie_value = JsValue.String(v: "")
+    runtime.interpreter.host_body_inner_html_value = JsValue.String(v: "boot")
+    runtime.interpreter.host_body_text_content_value = JsValue.String(v: "boot")
+
+    match runtime.eval("document.title = 'Runtime Ready'; document.body.innerHTML = 'runtime fetch ok'; document.cookie = 'runtime=ok; Path=/';"):
+        Ok(_) =>
+            val title_ok =
+                if val JsValue.String(v) = runtime.interpreter.host_document_title_value:
+                    v == "Runtime Ready"
+                else: false
+            val body_ok =
+                if val JsValue.String(v) = runtime.interpreter.host_body_inner_html_value:
+                    v == "runtime fetch ok"
+                else: false
+            val cookie_ok =
+                if val JsValue.String(v) = runtime.interpreter.host_document_cookie_value:
+                    v.contains("runtime=ok")
+                else: false
+            if title_ok and body_ok and cookie_ok:
+                serial_println("[JSBH] Browser host probe passed")
+            else:
+                serial_println("[JSBH] Browser host probe failed: title_ok={title_ok} body_ok={body_ok} cookie_ok={cookie_ok}")
+        Err(e) =>
+            serial_println("[JSBH] Browser host probe failed: {e.message}")
+
+    rt_port_outb(0xf4, 0u8)

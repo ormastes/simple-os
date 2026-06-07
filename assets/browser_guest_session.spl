@@ -1,0 +1,124 @@
+# Deterministic BrowserSession resources for the QEMU browser guest.
+#
+# This fixture replaces live HTTP with an embedded request/response registry
+# so the guest can exercise the BrowserSession navigation + script pump
+# without depending on a network stack.
+
+use std.common.web.browser_session.{BrowserRequest, BrowserResponse}
+
+pub fn browser_guest_boot_url() -> text:
+    "https://guest.simple/boot"
+
+pub fn browser_guest_final_url() -> text:
+    "https://guest.simple/final"
+
+pub fn browser_guest_live_probe_url() -> text:
+    "https://live.simple/probe"
+
+pub fn browser_guest_script_url() -> text:
+    "https://guest.simple/final.js"
+
+pub fn browser_guest_style_url() -> text:
+    "https://guest.simple/final.css"
+
+pub fn browser_guest_expected_title() -> text:
+    "SimpleOS Browser Session"
+
+pub fn browser_guest_title_for_url(url: text) -> text:
+    if url == browser_guest_boot_url():
+        return "Boot"
+    if url == browser_guest_final_url():
+        return browser_guest_expected_title()
+    url
+
+pub fn browser_guest_body_for_url(url: text) -> text:
+    if url == browser_guest_boot_url():
+        return "boot"
+    if url == browser_guest_final_url():
+        return "final guest frame"
+    ""
+
+pub fn browser_guest_expected_carry_cookie() -> text:
+    "carry=boot"
+
+pub fn browser_guest_expected_cookie_route() -> text:
+    "route=final"
+
+pub fn browser_guest_live_transport_error() -> text:
+    "live HTTP transport unavailable in simple_os bare metal"
+
+fn _is_deterministic_guest_url(url: text) -> bool:
+    url.starts_with("https://guest.simple/")
+
+pub fn resolve_browser_guest_request(request: BrowserRequest) -> BrowserResponse:
+    if not _is_deterministic_guest_url(request.url):
+        return BrowserResponse.create(
+            request_id: request.id,
+            kind: request.kind,
+            url: request.url,
+            status: 0,
+            headers: "",
+            body: "",
+            error: "{browser_guest_live_transport_error()}: {request.url}"
+        )
+    if request.kind == "document" and request.url == browser_guest_boot_url():
+        return BrowserResponse.create(
+            request_id: request.id,
+            kind: "document",
+            url: request.url,
+            status: 200,
+            headers: "Set-Cookie: carry=boot; Path=/",
+            body: _boot_document_html(),
+            error: ""
+        )
+    if request.kind == "document" and request.url == browser_guest_final_url():
+        return BrowserResponse.create(
+            request_id: request.id,
+            kind: "document",
+            url: request.url,
+            status: 200,
+            headers: "Set-Cookie: route=final; Path=/",
+            body: _final_document_html(),
+            error: ""
+        )
+    if request.kind == "style" and request.url == browser_guest_style_url():
+        return BrowserResponse.create(
+            request_id: request.id,
+            kind: "style",
+            url: request.url,
+            status: 200,
+            headers: "",
+            body: _final_style_css(),
+            error: ""
+        )
+    if request.kind == "script" and request.url == browser_guest_script_url():
+        return BrowserResponse.create(
+            request_id: request.id,
+            kind: "script",
+            url: request.url,
+            status: 200,
+            headers: "",
+            body: _final_script_js(),
+            error: ""
+        )
+    BrowserResponse.create(
+        request_id: request.id,
+        kind: request.kind,
+        url: request.url,
+        status: 404,
+        headers: "",
+        body: "",
+        error: "deterministic guest resource not found: {request.url}"
+    )
+
+fn _boot_document_html() -> text:
+    "<html><head><title>Boot</title></head><body>boot</body></html>"
+
+fn _final_document_html() -> text:
+    "<html><head><title>SimpleOS Browser Session</title><link rel='stylesheet' href='/final.css'></head><body><div class='hero'>final guest frame</div></body></html>"
+
+fn _final_style_css() -> text:
+    ".hero { background: rgb(240, 248, 255); color: rgb(16, 24, 32); }"
+
+fn _final_script_js() -> text:
+    "document.title = 'SimpleOS Browser Session'; document.body.innerHTML = 'final guest frame'; document.cookie = 'script=guest; Path=/';"

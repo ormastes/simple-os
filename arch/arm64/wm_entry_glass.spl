@@ -1,0 +1,704 @@
+#![allow(unnamed_duplicate_typed_args)]
+# SimpleOS Glass Window Manager — ARM64 Glass Drawing
+#
+# Extracted from wm_entry.spl. Contains:
+#   - draw_glass_window — frosted glass window chrome
+#   - draw_glass_system_bar — top menu bar
+#   - draw_glass_dock — bottom dock
+#   - draw_hello_content, draw_terminal_content, draw_files_content
+#
+# No module-level var state — all functions take explicit parameters.
+
+use examples.simple_os.arch.arm64.wm_entry_io.{
+    pack, pack8, fill, blend, blur, grad_v, grad_h, shadow, rrect, rrect_top,
+    circle, rrect_aa, line, ring, grad_rect, noise,
+    draw_label, draw_label_shadow, draw_label_bold, draw_label_2x,
+    draw_label_outline, draw_label_vector,
+    layout_fixed, layout_fill, layout_auto,
+    layout_x, layout_y, layout_w, layout_h,
+    surface, surface_a, elevated, elevated_a, border_c, border_a,
+    accent, accent2, shadow_a, text_c, text_sec,
+    LT_HSTACK, SM_FIXED, SM_FILL, ALIGN_CENTER,
+    ICON_TERM, ICON_FILES, ICON_CALC, ICON_CLOCK, ICON_SETTINGS,
+    ICON_BROWSER, ICON_EDITOR,
+    SIDEBAR_W, BANNER_H,
+    rt_layout_reset, rt_layout_add, rt_layout_set_size,
+    rt_layout_set_padding, rt_layout_set_props, rt_layout_compute
+}
+
+# ===========================================================================
+# Glass Window Drawing
+# ===========================================================================
+
+fn draw_glass_window(x: u64, y: u64, w: u64, h: u64, is_active: u64, theme: u64):
+    # 1. Multi-layer shadows
+    if is_active == 1:
+        shadow(x, y, w, h, 36, 120, 3)
+        blend(x - 2, y + 2, w + 4, h + 4, 0x00C8C8FF, 3)
+        shadow(x, y, w, h, 20, shadow_a(theme) + 80, 8)
+        shadow(x, y, w, h, 4, 50, 9)
+        shadow(x - 4, y + 8, w + 8, h + 4, 48, 30, 1)
+        blend(x - 10, y + h + 4, w + 20, 10, 0x00000000, 20)
+        blend(x + 4, y + h - 2, w - 8, 6, accent(theme), 8)
+        shadow(x - 8, y + 10, w + 16, h + 8, 60, 15, 0)
+        blend(x - 10, y + h + 6, w + 20, 8, 0x00102040, 12)
+        blend(x + 20, y + h + 1, w - 40, 1, accent(theme), 10)
+    else:
+        shadow(x, y, w, h, 6, 12, 2)
+        shadow(x, y, w, h, 3, shadow_a(theme) / 3, 3)
+        shadow(x - 2, y + 4, w + 4, h + 2, 20, 8, 1)
+
+    # 2. Frosted glass blur
+    blur(x, y, w, h, 16)
+    blur(x, y, w, h, 10)
+    blur(x, y, w, h, 6)
+    blur(x, y, w, h, 4)
+    blur(x, y, w, h, 3)
+    blur(x, y, w, h, 2)
+    blend(x, y, w, h, accent(theme), 8)
+    blend(x, y, w, h, accent2(theme), 5)
+    blend(x, y, w, h, 0x004080FF, 30)
+    blend(x, y, w, h, 0x00FFFFFF, 28)
+    blend(x + 4, y + 4, w - 8, h / 3, 0x00FFFFFF, 8)
+    blend(x, y, w, h, 0x00FF6B8A, 12)
+    blend(x + 20, y + 1, w - 40, 1, 0x00FFE0B2, 12)
+    blend(x + 4, y + h - 4, w - 8, 4, 0x001A2040, 15)
+    blend(x, y, w, h, 0x003060A0, 12)
+    blend(x + 2, y + 2, w - 4, h / 4, 0x00FFFFFF, 6)
+    blend(x, y, w, h, 0x00402060, 10)
+    blend(x + 10, y + 3, w - 20, 1, 0x00FFFFFF, 4)
+
+    # 3. Glass surface
+    rrect_aa(x, y, w, h, surface(theme), 22, surface_a(theme))
+    rrect_aa(x + 1, y + 1, w - 2, h - 2, 0x00FFFFFF, 22 - 1, 20)
+    blend(x + 4, y + 1, w - 8, 1, 0x00FFFFFF, 40)
+    blend(x + 6, y + 2, w - 12, 1, 0x00FFFFFF, 20)
+    blend(x + 8, y + 3, w - 16, 1, 0x00FFFFFF, 10)
+    blend(x + 10, y + 4, w - 20, 1, 0x00FFFFFF, 5)
+    blend(x + 6, y + 6, 30, 30, 0x00FFFFFF, 8)
+    blend(x + 8, y + 8, 15, 15, 0x00FFFFFF, 12)
+
+    # 4. Title bar
+    val tb_light = elevated(theme)
+    val tb_dark = surface(theme)
+    grad_rect(x + 1, y + 1, w - 2, 44, tb_light, 22, tb_dark, elevated_a(theme))
+    val tb_top_h = 44 * 40 / 100
+    blend(x + 2, y + 1, w - 4, tb_top_h, 0x00FFFFFF, 12)
+    val tb_bot_start = 44 * 70 / 100
+    val tb_bot_h = 44 - tb_bot_start
+    blend(x + 2, y + 1 + tb_bot_start, w - 4, tb_bot_h, 0x00000000, 8)
+    noise(x + 2, y + 2, w - 4, 44 - 2, 1)
+    if is_active == 1:
+        blend(x + 2, y + 2, w - 4, 44 - 4, accent(theme), 10)
+    blend(x + 6, y + 1, w - 12, 2, 0x00FFFFFF, 30)
+    blend(x + 14, y + 2, w - 28, 1, 0x00FFFFFF, 25)
+    grad_h(x + 20, y + 1, w - 40, 2, accent(theme), accent2(theme))
+    blend(x + 1, y + 44, w - 2, 1, border_c(theme), border_a(theme) + 15)
+    blend(x + 30, y + 44 - 1, w - 60, 1, accent(theme), 8)
+    blend(x + 2, y + 44 + 1, w - 4, 2, 0x00000000, 12)
+    if is_active == 0:
+        blend(x + 1, y + 1, w - 2, 44 - 1, 0x00304060, 25)
+    blend(x + 1, y + 44 + 1, w - 2, 3, 0x00FFFFFF, 10)
+    blend(x + 1, y + 44 + 4, w - 2, 3, 0x00FFFFFF, 4)
+    blend(x + 10, y + 44 + 6, w - 20, 1, 0x00FFFFFF, 12)
+    if is_active == 1:
+        rrect_aa(x + w - 80, y + 44 + 2, 20, 12, accent(theme), 4, 80)
+        rrect_aa(x + w - 80, y + 44 + 2, 20, 12, border_c(theme), 4, 20)
+        blend(x + w - 79, y + 44 + 2, 18, 1, 0x00FFFFFF, 15)
+        rrect_aa(x + w - 56, y + 44 + 2, 20, 12, surface(theme), 4, 60)
+        rrect_aa(x + w - 56, y + 44 + 2, 20, 12, border_c(theme), 4, 20)
+        blend(x + w - 55, y + 44 + 2, 18, 1, 0x00FFFFFF, 15)
+        rrect_aa(x + w - 32, y + 44 + 2, 20, 12, surface(theme), 4, 60)
+        rrect_aa(x + w - 32, y + 44 + 2, 20, 12, border_c(theme), 4, 20)
+        blend(x + w - 31, y + 44 + 2, 18, 1, 0x00FFFFFF, 15)
+
+    # 5. Traffic light buttons
+    val btn_y = y + 10
+    val btn_d = 16
+    val btn_gap = 10
+    var bx: u64 = x + 12
+    if is_active == 1:
+        ring(bx - 1, btn_y - 1, btn_d + 2, 1, 0x00FF6B8A, 20)
+        circle(bx, btn_y, btn_d, 0x00FF6B8A, 255)
+        blend(bx + 2, btn_y + 1, btn_d - 4, btn_d / 2 - 2, 0x00FFFFFF, 18)
+        circle(bx + 4, btn_y + 3, 4, 0x00FFFFFF, 60)
+        ring(bx + 1, btn_y + 1, btn_d - 2, 1, 0x00000000, 20)
+        line(bx + 5, btn_y + 5, bx + btn_d - 5, btn_y + btn_d - 5, 0x00000000, 2, 180)
+        line(bx + btn_d - 5, btn_y + 5, bx + 5, btn_y + btn_d - 5, 0x00000000, 2, 180)
+        blend(bx + 3, btn_y + btn_d - 3, btn_d - 6, 2, 0x00000000, 10)
+        blend(bx + 3, btn_y + btn_d, btn_d - 6, 2, 0x00000000, 40)
+        bx = bx + btn_d + btn_gap
+        ring(bx - 1, btn_y - 1, btn_d + 2, 1, 0x008B8BFA, 20)
+        circle(bx, btn_y, btn_d, 0x008B8BFA, 255)
+        blend(bx + 2, btn_y + 1, btn_d - 4, btn_d / 2 - 2, 0x00FFFFFF, 18)
+        circle(bx + 4, btn_y + 3, 4, 0x00FFFFFF, 60)
+        ring(bx + 1, btn_y + 1, btn_d - 2, 1, 0x00000000, 20)
+        line(bx + 5, btn_y + btn_d / 2, bx + btn_d - 5, btn_y + btn_d / 2, 0x00000000, 2, 180)
+        blend(bx + 3, btn_y + btn_d - 3, btn_d - 6, 2, 0x00000000, 10)
+        blend(bx + 3, btn_y + btn_d, btn_d - 6, 2, 0x00000000, 40)
+        bx = bx + btn_d + btn_gap
+        ring(bx - 1, btn_y - 1, btn_d + 2, 1, 0x0050D0A0, 20)
+        circle(bx, btn_y, btn_d, 0x0050D0A0, 255)
+        blend(bx + 2, btn_y + 1, btn_d - 4, btn_d / 2 - 2, 0x00FFFFFF, 18)
+        circle(bx + 4, btn_y + 3, 4, 0x00FFFFFF, 60)
+        ring(bx + 1, btn_y + 1, btn_d - 2, 1, 0x00000000, 20)
+        line(bx + 5, btn_y + btn_d / 2, bx + btn_d - 5, btn_y + btn_d / 2, 0x00000000, 2, 180)
+        line(bx + btn_d / 2, btn_y + 5, bx + btn_d / 2, btn_y + btn_d - 5, 0x00000000, 2, 180)
+        blend(bx + 3, btn_y + btn_d - 3, btn_d - 6, 2, 0x00000000, 10)
+        blend(bx + 3, btn_y + btn_d, btn_d - 6, 2, 0x00000000, 40)
+        blend(x + 12, btn_y + btn_d + 1, 3 * (btn_d + 10), 2, 0x00FFFFFF, 8)
+    else:
+        circle(bx, btn_y, btn_d, 0x00808080, 60)
+        blend(bx + 3, btn_y + btn_d - 3, btn_d - 6, 1, 0x00000000, 25)
+        bx = bx + btn_d + btn_gap
+        circle(bx, btn_y, btn_d, 0x00808080, 60)
+        blend(bx + 3, btn_y + btn_d - 3, btn_d - 6, 1, 0x00000000, 25)
+        bx = bx + btn_d + btn_gap
+        circle(bx, btn_y, btn_d, 0x00808080, 60)
+        blend(bx + 3, btn_y + btn_d - 3, btn_d - 6, 1, 0x00000000, 25)
+
+    # 6. Glass border
+    rrect_aa(x, y, w, h, border_c(theme), 22, border_a(theme))
+    rrect_aa(x - 1, y - 1, w + 2, h + 2, border_c(theme), 22 + 1, border_a(theme) / 4)
+    rrect_aa(x - 2, y - 2, w + 4, h + 4, 0x00FFFFFF, 22 + 2, 5)
+    rrect_aa(x + 1, y + 1, w - 2, h - 2, 0x00FFFFFF, 22 - 1, 6)
+    rrect_aa(x + 1, y + 1, w - 2, h - 2, surface(theme), 22 - 1, 8)
+
+    # Rainbow edge refraction
+    blend(x + 10, y, (w - 20) / 3, 1, 0x00FF6B6B, 12)
+    blend(x + 10 + (w - 20) / 3, y, (w - 20) / 3, 1, 0x0044FF44, 12)
+    blend(x + 10 + (w - 20) * 2 / 3, y, (w - 20) / 3, 1, 0x006B6BFF, 12)
+
+    # Contact shadow
+    if is_active == 1:
+        blend(x + 2, y + h, w - 4, 5, 0x00000000, 55)
+        blend(x + 6, y + h + 3, w - 12, 2, 0x00000000, 25)
+    else:
+        blend(x + 4, y + h, w - 8, 4, 0x00000000, 50)
+        blend(x + 8, y + h + 2, w - 16, 1, 0x00000000, 15)
+
+    # Dim inactive
+    if is_active == 0:
+        blend(x, y, w, h, 0x00203050, 75)
+        blend(x, y, w, h, 0x00000000, 40)
+        blend(x + 1, y + 1, w - 2, 44, 0x00000000, 30)
+        blur(x, y, w, h, 5)
+
+    # 7. Focus ring
+    if is_active == 1:
+        val focus_r_outer = 22 + 2
+        val focus_r_inner = 22 + 1
+        rrect_aa(x - 2, y - 2, w + 4, h + 4, accent(theme), focus_r_outer, 80)
+        rrect_aa(x - 1, y - 1, w + 2, h + 2, accent(theme), focus_r_inner, 90)
+        rrect_aa(x - 5, y - 5, w + 10, h + 10, accent(theme), focus_r_outer + 3, 25)
+        blend(x - 2, y + 10, 2, h - 20, accent(theme), 60)
+        blend(x - 2, y + 10, 2, (h - 20) / 2, accent2(theme), 30)
+        rrect_aa(x, y, w, h, accent(theme), 22, 25)
+        blend(x + 20, y + 1, w - 40, 1, 0x00FFD0A0, 30)
+        blend(x + 30, y + 1, w / 3, 1, 0x00FFFFFF, 25)
+        blend(x + 10, y + h - 4, w - 20, 4, accent(theme), 40)
+        blend(x + 2, y + 44 + 8, w - 4, 2, accent(theme), 30)
+        blend(x + 2, y + 44 + 8, w - 4, h - 44 - 10, accent(theme), 5)
+        rrect_aa(x + 2, y + 44 + 2, w - 4, h - 44 - 4, accent(theme), 22 - 2, 8)
+
+# ===========================================================================
+# Glass System Bar (top)
+# ===========================================================================
+
+fn draw_glass_system_bar(theme: u64, active: u64):
+    val y: u64 = 0
+    val h = 28
+
+    blur(0, y, 1024, h, 24)
+    blur(0, y, 1024, h, 10)
+    blend(0, y, 1024, h, accent(theme), 5)
+    blend(0, 0, 1024, 28, 0x004080FF, 12)
+    blend(0, 0, 1024, 28, 0x00FF6B8A, 3)
+
+    grad_v(0, y, 1024, h, elevated(theme), surface(theme))
+    blend(0, y, 1024, h / 2, 0x00FFFFFF, 8)
+    blend(0, y + h / 2, 1024, h / 2, 0x00000000, 8)
+    blend(0, y + 1, 1024, 1, 0x00FFFFFF, 35)
+    blend(0, 0, 1024, 1, 0x00FFFFFF, 30)
+    blend(6, 2, 20, 15, 0x00FFFFFF, 5)
+    blend(0, h - 1, 1024, 1, border_c(theme), 38)
+    blend(0, h - 2, 1024, 1, accent(theme), 15)
+    blend(4, y + 4, 2, h - 8, accent(theme), 30)
+    blend(1024 - 6, y + 4, 2, h - 8, accent2(theme), 30)
+
+    rt_layout_reset(0, 0, 0, 0)
+
+    val root = rt_layout_add(LT_HSTACK, 0 - 1, 0, 0)
+    rt_layout_set_size(root, layout_fixed(1024), layout_fixed(h), 0)
+    rt_layout_set_padding(root, pack(8, 8), pack(4, 4), 0)
+    rt_layout_set_props(root, 12, pack(0, ALIGN_CENTER), 0)
+
+    val logo = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(logo, layout_fixed(28), layout_fixed(20), 0)
+
+    val app_name = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(app_name, layout_fixed(68), layout_fixed(16), 0)
+
+    val menu1 = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(menu1, layout_fixed(42), layout_fixed(16), 0)
+
+    val menu2 = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(menu2, layout_fixed(40), layout_fixed(16), 0)
+
+    val menu3 = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(menu3, layout_fixed(40), layout_fixed(16), 0)
+
+    val menu4 = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(menu4, layout_fixed(28), layout_fixed(16), 0)
+
+    val menu5 = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(menu5, layout_fixed(58), layout_fixed(16), 0)
+
+    val spacer = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(spacer, layout_fill(1), layout_fixed(16), 0)
+
+    val search_btn = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(search_btn, layout_fixed(24), layout_fixed(18), 0)
+
+    val ctrl_center = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(ctrl_center, layout_fixed(20), layout_fixed(18), 0)
+
+    val wifi = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(wifi, layout_fixed(22), layout_fixed(18), 0)
+
+    val battery = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(battery, layout_fixed(30), layout_fixed(14), 0)
+
+    val volume = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(volume, layout_fixed(16), layout_fixed(14), 0)
+
+    val clock = rt_layout_add(0, root, 0, 0)
+    rt_layout_set_size(clock, layout_fixed(68), layout_fixed(18), 0)
+
+    rt_layout_compute(pack(1024, h), 0, 0, 0)
+
+    # SimpleOS gem logo
+    val lx = layout_x(logo)
+    val ly = layout_y(logo)
+    val lw = layout_w(logo)
+    val lh = layout_h(logo)
+    rrect_aa(lx, ly, lw, lh, accent(theme), 8, 200)
+    blend(lx + 2, ly + 1, lw - 4, lh / 2 - 1, 0x00FFFFFF, 40)
+    fill(lx + lw - 6, ly + 2, 3, 3, 0x00FFFFFF)
+
+    # Active app name
+    val anx = layout_x(app_name)
+    val any_ = layout_y(app_name)
+    if active == 0:
+        draw_label_vector(anx, any_, text_c(theme), 230, pack8(84, 101, 114, 109, 105, 110, 97, 108), 8, 18)
+    else:
+        if active == 1:
+            draw_label_vector(anx, any_, text_c(theme), 230, pack8(69, 100, 105, 116, 111, 114, 0, 0), 6, 18)
+        else:
+            draw_label_vector(anx, any_, text_c(theme), 230, pack8(70, 105, 110, 100, 101, 114, 0, 0), 6, 18)
+
+    circle(anx + 68, any_ + 6, 4, 0x0030D158, 180)
+
+    # Menu items
+    rrect_aa(layout_x(menu1) - 2, layout_y(menu1) - 1, layout_w(menu1) + 4, layout_h(menu1) + 2, text_c(theme), 4, 25)
+    blend(layout_x(menu1) - 2, layout_y(menu1) - 1, layout_w(menu1) + 4, layout_h(menu1) + 2, accent(theme), 8)
+    draw_label_vector(layout_x(menu1) + 2, layout_y(menu1), text_c(theme), 220, pack8(70, 105, 108, 101, 0, 0, 0, 0), 4, 14)
+    blend(layout_x(menu1), layout_y(menu1) + 14, layout_w(menu1), 1, accent(theme), 120)
+    blend(layout_x(menu1), layout_y(menu1) + 16, layout_w(menu1), 1, accent(theme), 40)
+    draw_label_vector(layout_x(menu2) + 2, layout_y(menu2), text_c(theme), 200, pack8(69, 100, 105, 116, 0, 0, 0, 0), 4, 14)
+    draw_label_vector(layout_x(menu3) + 2, layout_y(menu3), text_c(theme), 200, pack8(86, 105, 101, 119, 0, 0, 0, 0), 4, 14)
+    draw_label_vector(layout_x(menu4) + 2, layout_y(menu4), text_c(theme), 200, pack8(71, 111, 0, 0, 0, 0, 0, 0), 2, 14)
+    draw_label_vector(layout_x(menu5) + 2, layout_y(menu5), text_c(theme), 200, pack8(87, 105, 110, 100, 111, 119, 0, 0), 6, 14)
+
+    val div_x = layout_x(search_btn) - 6
+    blend(div_x, 6, 1, 16, border_c(theme), 20)
+
+    # Spotlight search
+    val srx = layout_x(search_btn)
+    val sry = layout_y(search_btn)
+    ring(srx + 2, sry + 1, 12, 2, text_c(theme), 150)
+    line(srx + 12, sry + 11, srx + 16, sry + 15, text_c(theme), 2, 150)
+
+    # Control Center
+    val ccx = layout_x(ctrl_center)
+    val ccy = layout_y(ctrl_center)
+    rrect_aa(ccx + 1, ccy + 1, 14, 6, text_c(theme), 3, 120)
+    rrect_aa(ccx + 1, ccy + 10, 14, 6, text_c(theme), 3, 120)
+    circle(ccx + 10, ccy + 3, 6, text_c(theme), 200)
+    circle(ccx + 4, ccy + 12, 6, text_c(theme), 200)
+
+    blend(layout_x(wifi) - 6, y + 6, 1, h - 12, text_c(theme), 20)
+
+    # Wi-Fi
+    val wx = layout_x(wifi)
+    val wy = layout_y(wifi)
+    ring(wx + 2, wy + 2, 16, 3, text_c(theme), 140)
+    ring(wx + 5, wy + 5, 10, 2, text_c(theme), 160)
+    circle(wx + 9, wy + 11, 4, text_c(theme), 200)
+
+    # Battery
+    val batt_x = layout_x(battery)
+    val by = layout_y(battery)
+    rrect_aa(batt_x, by, 24, 12, text_c(theme), 3, 160)
+    rrect_aa(batt_x + 2, by + 2, 16, 8, 0x0030D158, 2, 200)
+    rrect_aa(batt_x + 24, by + 3, 3, 6, text_c(theme), 1, 100)
+    draw_label_vector(batt_x + 28, by - 2, text_c(theme), 100, pack8(56, 53, 0, 0, 0, 0, 0, 0), 2, 12)
+    draw_label(batt_x + 42, by - 1, text_c(theme), 100, pack8(37, 0, 0, 0, 0, 0, 0, 0), 1)
+    blend(batt_x + 4, by + 4, 12, 1, 0x00FFFFFF, 40)
+
+    # Volume
+    val vx = layout_x(volume)
+    val vy = layout_y(volume)
+    rrect_aa(vx, vy + 2, 6, 10, text_c(theme), 2, 120)
+    line(vx + 6, vy + 2, vx + 10, vy, text_c(theme), 2, 100)
+    line(vx + 6, vy + 12, vx + 10, vy + 14, text_c(theme), 2, 100)
+
+    # Clock
+    val clx = layout_x(clock)
+    val cly = layout_y(clock)
+    rrect_aa(clx, cly, layout_w(clock), layout_h(clock), elevated(theme), 8, 100)
+    blend(clx - 2, cly - 1, layout_w(clock) + 4, layout_h(clock) + 2, accent(theme), 8)
+    draw_label_vector(clx + 4, cly + 1, text_c(theme), 230, pack8(49, 50, 58, 48, 48, 32, 80, 77), 8, 16)
+    circle(clx + layout_w(clock) - 4, cly - 1, 7, 0x00FF3B30, 255)
+    circle(clx + layout_w(clock) - 4, cly - 1, 5, 0x00FF3B30, 255)
+    circle(clx + layout_w(clock) + 8, cly + 2, 14, accent2(theme), 180)
+    circle(clx + layout_w(clock) + 10, cly + 3, 6, 0x00FFFFFF, 200)
+    circle(clx + layout_w(clock) + 26, cly + 5, 8, 0x0030D158, 200)
+
+# ===========================================================================
+# Glass Dock (bottom)
+# ===========================================================================
+
+fn draw_glass_dock(theme: u64, active: u64):
+    val num_app_icons: u64 = 7
+    val num_util_icons: u64 = 2
+    val separator_w: u64 = 2
+    val separator_gap: u64 = 10
+    val icon_size = 40
+    val icon_gap = 16
+    val icon_pad = 4
+    val pill_w = 48
+    val dock_pad = 20
+    val dock_w = num_app_icons * (pill_w + icon_gap) + separator_w + separator_gap * 2 + num_util_icons * (pill_w + icon_gap) - icon_gap + dock_pad * 2
+    val dock_h = 58
+    val dock_x = (1024 - dock_w) / 2
+    val dock_y = 768 - dock_h - 10
+
+    shadow(dock_x, dock_y, dock_w, dock_h, 24, 80, 8)
+    blur(dock_x, dock_y, dock_w, dock_h, 24)
+    blur(dock_x, dock_y, dock_w, dock_h, 12)
+    blur(dock_x, dock_y, dock_w, dock_h, 6)
+    blur(dock_x, dock_y, dock_w, dock_h, 4)
+    blend(dock_x, dock_y, dock_w, dock_h, accent(theme), 6)
+    blend(dock_x, dock_y, dock_w, dock_h, 0x00FFFFFF, 12)
+    blend(dock_x, dock_y, dock_w, dock_h, 0x004080FF, 12)
+
+    rrect(dock_x, dock_y, dock_w, dock_h, surface(theme), 26, surface_a(theme))
+    rrect(dock_x + 1, dock_y + 1, dock_w - 2, dock_h - 2, 0x00FFFFFF, 26 - 1, 10)
+    blend(dock_x + 2, dock_y + 2, dock_w - 4, dock_h - 4, 0x00FFFFFF, 15)
+    blend(dock_x + 4, dock_y + 4, dock_w - 8, dock_h - 8, 0x00FF6B8A, 3)
+    blend(dock_x + 4, dock_y + 1, dock_w - 8, 1, 0x00FFFFFF, 40)
+    blend(dock_x + 2, dock_y + 2, dock_w - 4, 1, 0x00FFFFFF, 15)
+
+    rrect(dock_x, dock_y, dock_w, dock_h, border_c(theme), 26, border_a(theme))
+    blend(dock_x + 2, dock_y, 3, dock_h, 0x00FFFFFF, 8)
+    blend(dock_x + dock_w - 5, dock_y, 3, dock_h, 0x00FFFFFF, 8)
+    blend(dock_x + 10, dock_y + dock_h - 3, dock_w - 20, 1, 0x00000000, 15)
+    blend(dock_x + 8, dock_y + 1, dock_w - 16, 1, 0x00FFFFFF, 35)
+    grad_h(dock_x + 20, dock_y, dock_w - 40, 2, accent(theme), accent2(theme))
+    grad_h(dock_x + 30, dock_y + dock_h - 2, dock_w - 60, 2, accent2(theme), accent(theme))
+    blend(dock_x + 6, dock_y + dock_h - 1, dock_w - 12, 1, 0x00000000, 25)
+
+    # Dynamic Island notch
+    val notch_w: u64 = 80
+    val notch_h: u64 = 6
+    val notch_x = dock_x + (dock_w - notch_w) / 2
+    val notch_y = dock_y - notch_h + 2
+    rrect_aa(notch_x, notch_y, notch_w, notch_h + 4, surface(theme), 8, surface_a(theme) + 30)
+    rrect_aa(notch_x, notch_y, notch_w, notch_h + 4, border_c(theme), 8, border_a(theme))
+    circle(notch_x + notch_w / 2 - 12, notch_y + 3, 6, accent(theme), 180)
+    circle(notch_x + notch_w / 2, notch_y + 3, 6, 0x0030D158, 180)
+    circle(notch_x + notch_w / 2 + 12, notch_y + 3, 6, accent2(theme), 180)
+
+    blend(dock_x + 6, dock_y + 4, 25, 20, 0x00FFFFFF, 6)
+    blend(dock_x + 15, dock_y + dock_h, dock_w - 30, 3, surface(theme), 15)
+    blend(dock_x + 25, dock_y + dock_h + 2, dock_w - 50, 2, surface(theme), 8)
+
+    # Icons
+    val icon_y = dock_y + 8
+    var ix: u64 = dock_x + dock_pad
+
+    # Terminal icon
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix, icon_y, pill_w, pill_w, 0x00FFFFFF, 14, 20)
+    blend(ix + 2, icon_y + 1, pill_w - 4, 1, 0x00FFFFFF, 25)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size - 6, icon_size, 6, 0x00000000, 40)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, ICON_TERM, 10, 255)
+    blend(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size / 3, 0x00FFFFFF, 25)
+    blend(ix + icon_pad, icon_y + icon_pad + icon_size * 2 / 3, icon_size, icon_size / 3, 0x00000000, 20)
+    rrect_aa(ix + 8, icon_y + 8, icon_size - 8, icon_size - 8, 0x001A1A2E, 6, 200)
+    line(ix + 12, icon_y + 18, ix + 18, icon_y + 18, 0x0044FF44, 2, 255)
+    fill(ix + 20, icon_y + 16, 2, 6, 0x0044FF44)
+    blend(ix + 6, icon_y + pill_w + 2, 36, 4, ICON_TERM, 22)
+    ix = ix + pill_w + icon_gap
+
+    # Files icon
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, ICON_FILES, 10, 255)
+    blend(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size / 3, 0x00FFFFFF, 25)
+    rrect_aa(ix + 8, icon_y + 12, 24, 20, 0x001E8449, 4, 220)
+    fill(ix + 12, icon_y + 18, 16, 2, 0x00FFFFFF)
+    fill(ix + 12, icon_y + 22, 12, 2, 0x00FFFFFF)
+    blend(ix + 6, icon_y + pill_w + 2, 36, 4, ICON_FILES, 22)
+    ix = ix + pill_w + icon_gap
+
+    # Calculator icon
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, ICON_CALC, 10, 255)
+    blend(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size / 3, 0x00FFFFFF, 25)
+    rrect_aa(ix + 8, icon_y + 8, 24, 8, 0x00FFFFFF, 3, 120)
+    rrect_aa(ix + 9, icon_y + 19, 7, 7, 0x00FFFFFF, 2, 200)
+    rrect_aa(ix + 17, icon_y + 19, 7, 7, 0x00FFFFFF, 2, 200)
+    rrect_aa(ix + 25, icon_y + 19, 7, 7, 0x00FFFFFF, 2, 200)
+    blend(ix + 6, icon_y + pill_w + 2, 36, 4, ICON_CALC, 22)
+    ix = ix + pill_w + icon_gap
+
+    # Clock icon
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, ICON_CLOCK, 10, 255)
+    ring(ix + 8, icon_y + 8, 24, 2, 0x00FFFFFF, 180)
+    line(ix + 20, icon_y + 20, ix + 20, icon_y + 12, 0x00FFFFFF, 2, 200)
+    line(ix + 20, icon_y + 20, ix + 26, icon_y + 18, 0x00FFFFFF, 2, 200)
+    blend(ix + 6, icon_y + pill_w + 2, 36, 4, ICON_CLOCK, 22)
+    ix = ix + pill_w + icon_gap
+
+    # Settings icon
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, ICON_SETTINGS, 10, 255)
+    ring(ix + 10, icon_y + 10, 20, 3, 0x00FFFFFF, 160)
+    circle(ix + 17, icon_y + 17, 8, 0x00FFFFFF, 180)
+    fill(ix + 20, icon_y + 6, 2, 4, 0x00FFFFFF)
+    fill(ix + 20, icon_y + 30, 2, 4, 0x00FFFFFF)
+    fill(ix + 8, icon_y + 18, 4, 2, 0x00FFFFFF)
+    fill(ix + 30, icon_y + 18, 4, 2, 0x00FFFFFF)
+    blend(ix + 6, icon_y + pill_w + 2, 36, 4, ICON_SETTINGS, 22)
+    ix = ix + pill_w + icon_gap
+
+    # Browser icon
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, ICON_BROWSER, 10, 255)
+    ring(ix + 8, icon_y + 8, 24, 2, 0x00FFFFFF, 180)
+    line(ix + 14, icon_y + 8, ix + 14, icon_y + 32, 0x00FFFFFF, 1, 120)
+    line(ix + 26, icon_y + 8, ix + 26, icon_y + 32, 0x00FFFFFF, 1, 120)
+    blend(ix + 6, icon_y + pill_w + 2, 36, 4, ICON_BROWSER, 22)
+    ix = ix + pill_w + icon_gap
+
+    # Editor icon
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, ICON_EDITOR, 10, 255)
+    rrect_aa(ix + 10, icon_y + 8, 20, 24, 0x00FFFFFF, 3, 140)
+    fill(ix + 14, icon_y + 13, 12, 2, 0x00148F77)
+    fill(ix + 14, icon_y + 18, 10, 2, 0x00148F77)
+    fill(ix + 14, icon_y + 23, 14, 2, 0x00148F77)
+    blend(ix + 6, icon_y + pill_w + 2, 36, 4, ICON_EDITOR, 22)
+
+    # Separator
+    val sep_x = ix + separator_gap
+    blend(sep_x, dock_y + 8, separator_w, dock_h - 16, border_c(theme), border_a(theme))
+    ix = sep_x + separator_w + separator_gap
+
+    # Finder icon
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, 0x004A90D9, 10, 255)
+    blend(ix + icon_pad + icon_size / 2, icon_y + icon_pad, icon_size / 2, icon_size, 0x00357ABD, 120)
+    circle(ix + 12, icon_y + 14, 6, 0x00FFFFFF, 255)
+    circle(ix + 24, icon_y + 14, 6, 0x00FFFFFF, 255)
+    circle(ix + 13, icon_y + 14, 4, 0x00000000, 255)
+    circle(ix + 25, icon_y + 14, 4, 0x00000000, 255)
+    rrect_aa(ix + 12, icon_y + 24, 18, 6, 0x00FFFFFF, 3, 200)
+    ix = ix + pill_w + icon_gap
+
+    # Trash icon
+    rrect(ix, icon_y, pill_w, pill_w, surface(theme), 14, 60)
+    rrect_aa(ix + icon_pad, icon_y + icon_pad, icon_size, icon_size, 0x00808080, 10, 255)
+    rrect_aa(ix + 10, icon_y + 8, 22, 4, 0x00C0C0C0, 2, 255)
+    rrect_aa(ix + 12, icon_y + 14, 18, 20, 0x00A0A0A0, 3, 220)
+    blend(ix + 16, icon_y + 17, 2, 14, 0x00808080, 180)
+    blend(ix + 20, icon_y + 17, 2, 14, 0x00808080, 180)
+    blend(ix + 24, icon_y + 17, 2, 14, 0x00808080, 180)
+
+    # Running indicators
+    val dot_y = dock_y + dock_h - 6
+    val first_ix = dock_x + dock_pad + pill_w / 2 - 2
+
+    circle(first_ix - 1, dot_y - 1, 8, accent(theme), 40)
+    circle(first_ix, dot_y, 6, accent(theme), 220)
+
+    val files_dot_x = first_ix + (pill_w + icon_gap)
+    circle(files_dot_x - 1, dot_y - 1, 8, accent(theme), 40)
+    circle(files_dot_x, dot_y, 6, accent(theme), 220)
+
+    circle(first_ix + (pill_w + icon_gap) * 3 - 1, dot_y - 1, 8, accent(theme), 40)
+    circle(first_ix + (pill_w + icon_gap) * 3, dot_y, 6, accent(theme), 220)
+
+    val editor_dot_x = first_ix + 6 * (pill_w + icon_gap)
+    circle(editor_dot_x - 1, dot_y - 1, 8, accent(theme), 40)
+    circle(editor_dot_x, dot_y, 6, accent(theme), 220)
+
+    if active == 0:
+        circle(first_ix, dot_y, 6, 0x00FFFFFF, 140)
+    else:
+        if active == 1:
+            circle(editor_dot_x, dot_y, 6, 0x00FFFFFF, 140)
+        else:
+            circle(files_dot_x, dot_y, 6, 0x00FFFFFF, 140)
+
+    val refl_y = dock_y + dock_h + 2
+    blend(dock_x + 10, refl_y, dock_w - 20, 1, surface(theme), 20)
+    blend(dock_x + 16, refl_y + 1, dock_w - 32, 1, surface(theme), 12)
+
+# ===========================================================================
+# Application Window Content
+# ===========================================================================
+
+fn draw_hello_content(x: u64, y: u64, w: u64, h: u64, theme: u64):
+    val cy = y + 44 + 2
+    val content_h = h - 44 - 3
+    val sidebar_w: u64 = 70
+    val line_h: u64 = 16
+    val status_h: u64 = 20
+
+    # Tab bar
+    val tab_y = cy
+    val tab_h: u64 = 24
+    blend(x + 1, tab_y, w - 2, tab_h, surface(theme), 50)
+    blend(x + 1, tab_y + tab_h - 1, w - 2, 1, border_c(theme), border_a(theme))
+    rrect_aa(x + sidebar_w + 2, tab_y + 2, 80, tab_h - 3, elevated(theme), 4, 120)
+    blend(x + sidebar_w + 2, tab_y + tab_h - 2, 80, 2, accent(theme), 200)
+    draw_label(x + sidebar_w + 10, tab_y + 4, text_c(theme), 200, pack8(109, 97, 105, 110, 46, 115, 112, 108), 8)
+    draw_label(x + sidebar_w + 92, tab_y + 4, text_sec(theme), 100, pack8(109, 111, 100, 46, 115, 112, 108, 0), 7)
+
+    # File tree sidebar
+    val sb_y = tab_y + tab_h
+    rrect(x + 1, sb_y, sidebar_w, content_h - tab_h - status_h, 0x00181820, 0, 200)
+    blend(x + sidebar_w, sb_y, 1, content_h - tab_h - status_h, border_c(theme), border_a(theme))
+    draw_label(x + 6, sb_y + 4, text_sec(theme), 80, pack8(69, 88, 80, 76, 79, 82, 69, 82), 8)
+    draw_label(x + 6, sb_y + 20, 0x00CCCCCC, 160, pack8(62, 32, 115, 114, 99, 47, 0, 0), 6)
+    draw_label_bold(x + 16, sb_y + 36, accent(theme), 200, pack8(109, 97, 105, 110, 46, 115, 112, 108), 8)
+    draw_label(x + 16, sb_y + 52, 0x00CCCCCC, 140, pack8(109, 111, 100, 46, 115, 112, 108, 0), 7)
+    draw_label(x + 6, sb_y + 72, 0x00CCCCCC, 160, pack8(62, 32, 116, 101, 115, 116, 47, 0), 7)
+    draw_label(x + 16, sb_y + 88, 0x00CCCCCC, 140, pack8(115, 112, 101, 99, 46, 115, 112, 108), 8)
+
+    # Editor area
+    val ed_x = x + sidebar_w + 1
+    val ed_y = sb_y
+    val ed_w = w - sidebar_w - 2
+    val ed_h = content_h - tab_h - status_h
+    rrect(ed_x, ed_y, ed_w, ed_h, 0x000D0D14, 0, 220)
+
+    val gutter_w: u64 = 30
+    blend(ed_x, ed_y, gutter_w, ed_h, 0x00FFFFFF, 8)
+    blend(ed_x + gutter_w, ed_y, 1, ed_h, border_c(theme), 20)
+
+    var ln: u64 = 0
+    while ln < 8:
+        val ly = ed_y + 4 + ln * line_h
+        val ln_num = ln + 1
+        if ln_num < 10:
+            draw_label(ed_x + 16, ly, 0x00666688, 120, pack8(48 + ln_num, 0, 0, 0, 0, 0, 0, 0), 1)
+        ln = ln + 1
+
+    val code_x = ed_x + gutter_w + 8
+    draw_label_outline(code_x, ed_y + 4, 0x00CC7832, 220, pack8(102, 110, 0, 0, 0, 0, 0, 0), 2, 40)
+    draw_label_outline(code_x + 24, ed_y + 4, 0x00FFC66D, 220, pack8(109, 97, 105, 110, 0, 0, 0, 0), 4, 40)
+    draw_label(code_x + 56, ed_y + 4, 0x00CCCCCC, 200, pack8(40, 41, 58, 0, 0, 0, 0, 0), 3)
+    draw_label_outline(code_x + 32, ed_y + 20, 0x00CC7832, 220, pack8(118, 97, 108, 0, 0, 0, 0, 0), 3, 40)
+    draw_label(code_x + 56, ed_y + 20, 0x00CCCCCC, 200, pack8(120, 32, 61, 32, 0, 0, 0, 0), 4)
+    draw_label(code_x + 88, ed_y + 20, 0x006897BB, 220, pack8(52, 50, 0, 0, 0, 0, 0, 0), 2)
+    draw_label(code_x + 32, ed_y + 36, 0x00FFC66D, 220, pack8(112, 114, 105, 110, 116, 0, 0, 0), 5)
+    draw_label(code_x + 72, ed_y + 36, 0x00CCCCCC, 200, pack8(32, 120, 0, 0, 0, 0, 0, 0), 2)
+    draw_label(code_x, ed_y + 68, 0x00629755, 180, pack8(35, 32, 67, 111, 109, 109, 101, 110), 8)
+    draw_label(code_x, ed_y + 84, 0x00CC7832, 220, pack8(102, 110, 0, 0, 0, 0, 0, 0), 2)
+    draw_label(code_x + 24, ed_y + 84, 0x00FFC66D, 220, pack8(115, 113, 117, 97, 114, 101, 0, 0), 6)
+    draw_label(code_x + 72, ed_y + 84, 0x00CCCCCC, 200, pack8(40, 110, 41, 58, 0, 0, 0, 0), 4)
+    draw_label(code_x + 32, ed_y + 100, 0x00CCCCCC, 200, pack8(110, 32, 42, 32, 110, 0, 0, 0), 5)
+
+    blend(code_x + 88, ed_y + 36, 2, 14, accent(theme), 255)
+    blend(ed_x + gutter_w + 1, ed_y + 34, ed_w - gutter_w - 2, line_h, 0x00FFFFFF, 8)
+
+    # Status bar
+    val st_y = y + h - status_h - 2
+    blend(x + 1, st_y, w - 2, status_h, accent(theme), 200)
+    draw_label(x + 8, st_y + 3, 0x00FFFFFF, 200, pack8(76, 110, 32, 51, 44, 32, 67, 111), 8)
+    draw_label_shadow(x + w - 56, st_y + 3, 0x00FFFFFF, 200, pack8(83, 105, 109, 112, 108, 101, 0, 0), 6, 60)
+
+fn draw_terminal_content(x: u64, y: u64, w: u64, h: u64, theme: u64):
+    val cy = y + 44 + 2
+    rrect(x + 1, cy, w - 2, h - 44 - 3, 0x000A0A14, 10, 200)
+    rrect(x + 14, cy + 14, 8, 16, 0x0044FF44, 2, 255)
+    fill(x + 26, cy + 14, 140, 3, 0x0044FF44)
+    fill(x + 14, cy + 36, 220, 3, 0x00888888)
+    fill(x + 14, cy + 52, 180, 3, 0x00888888)
+    fill(x + 14, cy + 68, 260, 3, 0x005588CC)
+    fill(x + 14, cy + 84, 120, 3, 0x00888888)
+    fill(x + 14, cy + 100, 200, 3, 0x0044FF44)
+    fill(x + 14, cy + 116, 160, 3, 0x00888888)
+    fill(x + 14, cy + 132, 100, 3, 0x005588CC)
+    fill(x + 14, cy + 148, 90, 3, 0x005588CC)
+    fill(x + 14, cy + 164, 150, 3, 0x0044FF44)
+    fill(x + 14, cy + 180, 80, 3, 0x00FF8844)
+    rrect(x + 14, cy + 196, 8, 16, 0x0044FF44, 2, 180)
+
+fn draw_files_content(x: u64, y: u64, w: u64, h: u64, theme: u64):
+    val cy = y + 44 + 2
+    val content_h = h - 44 - 3
+    val sidebar_w: u64 = 110
+
+    # Toolbar
+    val tb_y = cy
+    val tb_h: u64 = 28
+    blend(x + 1, tb_y, w - 2, tb_h, surface(theme), 60)
+    blend(x + 1, tb_y + tb_h - 1, w - 2, 1, border_c(theme), border_a(theme))
+    line(x + 12, tb_y + 14, x + 18, tb_y + 9, text_c(theme), 2, 140)
+    line(x + 12, tb_y + 14, x + 18, tb_y + 19, text_c(theme), 2, 140)
+    line(x + 28, tb_y + 9, x + 34, tb_y + 14, text_c(theme), 2, 140)
+    line(x + 28, tb_y + 19, x + 34, tb_y + 14, text_c(theme), 2, 140)
+
+    # Sidebar
+    val sb_y = tb_y + tb_h
+    rrect(x + 1, sb_y, sidebar_w, content_h - tb_h, surface(theme), 8, 80)
+    blend(x + sidebar_w, sb_y, 1, content_h - tb_h, border_c(theme), border_a(theme))
+    draw_label(x + 12, sb_y + 6, text_sec(theme), 100, pack8(70, 97, 118, 111, 114, 105, 116, 101), 8)
+    rrect_aa(x + 6, sb_y + 22, sidebar_w - 10, 18, accent(theme), 6, 80)
+    draw_label(x + 28, sb_y + 23, text_c(theme), 220, pack8(68, 101, 115, 107, 116, 111, 112, 0), 7)
+    draw_label(x + 28, sb_y + 43, text_c(theme), 160, pack8(68, 111, 99, 117, 109, 101, 110, 116), 8)
+    draw_label(x + 28, sb_y + 61, text_c(theme), 160, pack8(68, 111, 119, 110, 108, 111, 97, 100), 8)
+
+    # Content area: folders
+    val cx = x + sidebar_w + 8
+    val grid_y = sb_y + 8
+    val icon_w: u64 = 56
+    val icon_h: u64 = 60
+    val gap_x: u64 = 12
+
+    # Folder: Project (blue)
+    val f0x = cx + 0 * (icon_w + gap_x)
+    blend(f0x + 5, grid_y + 37, 40, 4, 0x00000000, 30)
+    rrect_aa(f0x + 6, grid_y + 8, 18, 8, 0x004080B8, 3, 230)
+    grad_rect(f0x + 4, grid_y + 13, 40, 22, 0x0070BEFF, 4, 0x004A90D9, 240)
+    blend(f0x + 6, grid_y + 13, 36, 1, 0x00FFFFFF, 50)
+    draw_label_shadow(f0x + 6, grid_y + 42, text_c(theme), 200, pack8(80, 114, 111, 106, 101, 99, 116, 0), 7, 45)
+
+    # Folder: Photos (green)
+    val f1x = cx + 1 * (icon_w + gap_x)
+    blend(f1x + 5, grid_y + 37, 40, 4, 0x00000000, 30)
+    rrect_aa(f1x + 6, grid_y + 8, 18, 8, 0x00207050, 3, 230)
+    grad_rect(f1x + 4, grid_y + 13, 40, 22, 0x0058D0A0, 4, 0x0030A070, 240)
+    blend(f1x + 6, grid_y + 13, 36, 1, 0x00FFFFFF, 50)
+    draw_label_shadow(f1x + 8, grid_y + 42, text_c(theme), 200, pack8(80, 104, 111, 116, 111, 115, 0, 0), 6, 45)
+
+    # Path bar
+    val pb_y = y + h - 22
+    blend(x + 1, pb_y, w - 2, 20, surface(theme), 50)
+    blend(x + 1, pb_y, w - 2, 1, border_c(theme), border_a(theme))
+    draw_label(x + 10, pb_y + 3, text_sec(theme), 120, pack8(83, 105, 109, 112, 108, 101, 72, 68), 8)

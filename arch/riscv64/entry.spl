@@ -7,26 +7,78 @@
 
 use os.kernel.arch.riscv64.console.{Riscv64Console, uart_init, uart_writeln}
 use os.kernel.arch.riscv64.boot.{Riscv64Boot}
-use os.kernel.arch.riscv64.sbi.{sbi_console_putchar}
+use os.kernel.arch.riscv64.interrupt.{Rv64Interrupt}
+use os.kernel.arch.riscv64.context.{Rv64ContextSwitch}
+use os.kernel.boot.ports.{BootOutputPort}
+use os.kernel.scheduler.scheduler.{Scheduler}
+use os.kernel.ipc.ipc.{IpcManager}
+use os.kernel.log.klog.{KernelLog}
+use os.kernel.types.task_types.{TaskPriority}
+use os.kernel.types.capability_types.{CapabilitySet}
+use os.kernel.loader.executable_source.{resolve_executable_bytes, RV64_PROOF_BINARY_PATH}
+use os.kernel.loader.elf_loader.{parse_elf}
+use os.kernel.loader.process_image.{build_user_process_image}
+use os.kernel.arch.arch_context.{Architecture}
+
+extern fn _rv64_enter_user(ctx_addr: u64)
+
+fn kernel_main(boot_info: BootOutputPort):
+    """Kernel main for RISC-V 64 — initializes subsystems and spawns user task."""
+    uart_writeln("[KERNEL] kernel_main entered")
+    uart_writeln("[KERNEL] memory regions: {boot_info.memory_map.len()}")
+    uart_writeln("[KERNEL] serial base: 0x{boot_info.serial_base}")
+
+    # Initialize interrupt controller and install stvec -> _rv64_trap_vector
+    Rv64Interrupt.init()
+    uart_writeln("[KERNEL] trap vector installed")
+
+    # Create kernel subsystems
+    var scheduler = Scheduler.new()
+    var ipc = IpcManager.new()
+    var klog = KernelLog.new(64)
+
+    # Install trap runtime so dispatcher can reach scheduler/IPC/klog
+    Rv64Interrupt.install_runtime(scheduler, ipc, klog)
+    uart_writeln("[KERNEL] trap runtime installed")
+
+    # Load and spawn the RV64 user proof binary
+    val elf_result = resolve_executable_bytes(RV64_PROOF_BINARY_PATH, Architecture.Riscv64)
+    if elf_result.is_err():
+        uart_writeln("[KERNEL] FATAL: failed to resolve proof binary")
+        return
+
+    val elf_bytes = elf_result.unwrap()
+    val parse_result = parse_elf(elf_bytes)
+    if parse_result.is_err():
+        uart_writeln("[KERNEL] FATAL: failed to parse proof ELF")
+        return
+
+    val elf_info = parse_result.unwrap()
+    val image = build_user_process_image(elf_info)
+    val caps = CapabilitySet.empty()
+    val task_id = scheduler.create_user_task(image, TaskPriority.Normal, caps)
+    uart_writeln("[KERNEL] spawned user task id={task_id.id} entry=0x{image.entry}")
+
+    # Enter user mode: retrieve the user context and jump via sret
+    val user_ctx = scheduler.get_user_context(task_id)
+    if user_ctx.?:
+        val ctx = user_ctx.unwrap()
+        uart_writeln("[KERNEL] entering U-mode at sepc=0x{ctx.sepc}")
+        unsafe:
+            val ctx_ptr = &ctx as u64
+            _rv64_enter_user(ctx_ptr)
+
+    uart_writeln("[KERNEL] kernel_main complete")
 
 fn _start():
-    """RISC-V 64 entry point — called from S-mode after OpenSBI.
-
-    Initializes 16550 UART via real MMIO register writes or SBI
-    console fallback, constructs BootOutputPort from QEMU virt
-    memory map, then calls kernel_main() for PMM/scheduler init.
-    """
-    # Real UART init: configures 16550 at 0x10000000 via MMIO,
-    # or falls back to SBI putchar for earliest output
+    """RISC-V 64 entry point — called from S-mode after OpenSBI."""
     uart_init()
     uart_writeln("SimpleOS RISC-V 64 boot")
     uart_writeln("[BOOT] UART initialized via SBI")
 
-    # Real memory map: RAM at 0x80000000, kernel + usable regions
     val boot_info = Riscv64Boot.build_boot_output()
     uart_writeln("[BOOT] Memory map parsed")
 
-    # Call real kernel main — runs PMM bitmap init, scheduler ReadyQueue creation
     kernel_main(boot_info)
 
     uart_writeln("[BOOT] RISC-V 64 boot complete")

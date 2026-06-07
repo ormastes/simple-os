@@ -1,0 +1,69 @@
+#![allow(unnamed_duplicate_typed_args)]
+
+# Deterministic BrowserSession runtime resources for a tiny QEMU guest.
+#
+# This fixture is intentionally small so the guest can exercise the real
+# BrowserSession runtime path (`BrowserSession.new()`) without the heavier
+# framebuffer/browser shell path. The goal is to prove that:
+# - a document request is pumped through BrowserSession
+# - inline JS runs inside the guest
+# - `fetch()` creates a pending BrowserRequest
+# - the fetch response settles the promise and mutates DOM/cookie state
+
+use std.common.web.browser_session.{BrowserRequest, BrowserResponse}
+
+pub fn browser_runtime_guest_boot_url() -> text:
+    "https://guest.runtime/boot"
+
+pub fn browser_runtime_guest_fetch_url() -> text:
+    "https://guest.runtime/data"
+
+pub fn browser_runtime_guest_expected_title() -> text:
+    "Runtime Ready"
+
+pub fn browser_runtime_guest_expected_body() -> text:
+    "runtime fetch ok"
+
+pub fn browser_runtime_guest_expected_cookie() -> text:
+    "runtime=ok"
+
+fn _is_runtime_guest_url(url: text) -> bool:
+    url.starts_with("https://guest.runtime/")
+
+pub fn resolve_browser_runtime_guest_request(request: BrowserRequest) -> BrowserResponse:
+    if not _is_runtime_guest_url(request.url):
+        return BrowserResponse.create(
+            request_id: request.id,
+            kind: request.kind,
+            url: request.url,
+            status: 0,
+            headers: "",
+            body: "",
+            error: "runtime guest resource not found: {request.url}"
+        )
+    if request.kind == "document" and request.url == browser_runtime_guest_boot_url():
+        return BrowserResponse.create(
+            request_id: request.id,
+            kind: "document",
+            url: request.url,
+            status: 200,
+            headers: "",
+            body: _runtime_boot_html(),
+            error: ""
+        )
+    BrowserResponse.create(
+        request_id: request.id,
+        kind: request.kind,
+        url: request.url,
+        status: 404,
+        headers: "",
+        body: "",
+        error: "runtime guest resource not found: {request.url}"
+    )
+
+fn _runtime_boot_html() -> text:
+    """<html><head><title>Boot</title></head><body>boot<script>
+document.title = 'Runtime Ready';
+document.body.innerHTML = 'runtime fetch ok';
+document.cookie = 'runtime=ok; Path=/';
+</script></body></html>"""

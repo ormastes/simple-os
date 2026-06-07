@@ -1,0 +1,27 @@
+# Diagnostic 4 — test pipe_init and socket/select imports
+
+extern fn serial_println(msg: text)
+
+use os.posix.fd_table.{fd_table_init}
+use os.posix.async_io.{async_io_init}
+use os.posix.signal_compat.{signal_init}
+use os.posix.pipe_compat.{pipe_init}
+
+fn _start():
+    serial_println("[DIAG4] Step A: fd_table_init")
+    fd_table_init()
+    serial_println("[DIAG4] Step A: OK")
+
+    serial_println("[DIAG4] Step B: async_io_init")
+    async_io_init()
+    serial_println("[DIAG4] Step B: OK")
+
+    serial_println("[DIAG4] Step C: signal_init")
+    signal_init()
+    serial_println("[DIAG4] Step C: OK")
+
+    serial_println("[DIAG4] Step D: _pipe_init")
+    pipe_init()
+    serial_println("[DIAG4] Step D: OK")
+
+    serial_println("[DIAG4] ALL PASSED")

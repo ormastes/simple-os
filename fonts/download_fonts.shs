@@ -1,0 +1,198 @@
+#!/bin/sh
+# Download open-source fonts for SimpleOS
+# All fonts are OFL-1.1 licensed (SIL Open Font License)
+#
+# Usage: sh download_fonts.shs [--sans-only] [--subset]
+#
+# Creates: fonts/sans/, fonts/serif/, fonts/mono/
+
+set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+SANS_ONLY=0
+for arg in "$@"; do
+    case "$arg" in
+        --sans-only) SANS_ONLY=1 ;;
+    esac
+done
+
+mkdir -p sans serif mono
+
+echo "=== Downloading fonts for 10 languages (6 script groups) ==="
+echo ""
+
+# --- Helper ---
+download() {
+    local url="$1"
+    local dest="$2"
+    if [ -f "$dest" ]; then
+        echo "  [skip] $dest (already exists)"
+        return
+    fi
+    echo "  [download] $dest"
+    curl -sL "$url" -o "$dest" || wget -q "$url" -O "$dest" 2>/dev/null || echo "  [FAIL] $dest"
+}
+
+# ============================================================================
+# 1. Latin + Cyrillic (English, Spanish, French, Portuguese, Russian)
+# ============================================================================
+echo "--- Latin + Cyrillic ---"
+
+# Sans: Noto Sans (Regular) — ~500 KB
+download "https://github.com/notofonts/latin-greek-cyrillic/releases/download/NotoSans-v2.015/NotoSans-v2.015.zip" "/tmp/NotoSans.zip"
+if [ -f /tmp/NotoSans.zip ] && [ ! -f sans/NotoSans-Regular.ttf ]; then
+    unzip -q -o /tmp/NotoSans.zip "NotoSans/unhinted/ttf/NotoSans-Regular.ttf" -d /tmp/noto_extract 2>/dev/null || true
+    find /tmp/noto_extract -name "NotoSans-Regular.ttf" -exec cp {} sans/NotoSans-Regular.ttf \; 2>/dev/null || true
+fi
+
+if [ "$SANS_ONLY" = "0" ]; then
+    # Serif: Noto Serif
+    download "https://github.com/notofonts/latin-greek-cyrillic/releases/download/NotoSerif-v2.015/NotoSerif-v2.015.zip" "/tmp/NotoSerif.zip"
+    if [ -f /tmp/NotoSerif.zip ] && [ ! -f serif/NotoSerif-Regular.ttf ]; then
+        unzip -q -o /tmp/NotoSerif.zip "*/NotoSerif-Regular.ttf" -d /tmp/noto_extract 2>/dev/null || true
+        find /tmp/noto_extract -name "NotoSerif-Regular.ttf" -exec cp {} serif/NotoSerif-Regular.ttf \; 2>/dev/null || true
+    fi
+
+    # Mono (default): Fira Code Nerd Font Mono — ships Nerd Font glyphs for
+    # the shell Starship prompt (powerline, devicons, etc.).
+    download "https://github.com/ryanoasis/nerd-fonts/releases/latest/download/FiraCode.zip" "/tmp/FiraCodeNerd.zip"
+    if [ -f /tmp/FiraCodeNerd.zip ] && [ ! -f mono/FiraCodeNerdFontMono-Regular.ttf ]; then
+        unzip -q -o /tmp/FiraCodeNerd.zip "FiraCodeNerdFontMono-Regular.ttf" -d /tmp/firacode_extract 2>/dev/null || true
+        # Some release ZIPs keep a slightly different filename casing; cover both.
+        find /tmp/firacode_extract -iname "FiraCodeNerdFontMono-Regular.ttf" -exec cp {} mono/FiraCodeNerdFontMono-Regular.ttf \; 2>/dev/null || true
+        find /tmp/firacode_extract -iname "FiraCodeNerdFontMono-Bold.ttf"    -exec cp {} mono/FiraCodeNerdFontMono-Bold.ttf \; 2>/dev/null || true
+    fi
+
+    # Mono (alt): JetBrains Mono — kept as a fallback, no Nerd glyphs.
+    download "https://github.com/JetBrains/JetBrainsMono/releases/download/v2.304/JetBrainsMono-2.304.zip" "/tmp/JetBrainsMono.zip"
+    if [ -f /tmp/JetBrainsMono.zip ] && [ ! -f mono/JetBrainsMono-Regular.ttf ]; then
+        unzip -q -o /tmp/JetBrainsMono.zip "fonts/ttf/JetBrainsMono-Regular.ttf" -d /tmp/jbm_extract 2>/dev/null || true
+        find /tmp/jbm_extract -name "JetBrainsMono-Regular.ttf" -exec cp {} mono/JetBrainsMono-Regular.ttf \; 2>/dev/null || true
+    fi
+fi
+
+# ============================================================================
+# 2. CJK Simplified Chinese
+# ============================================================================
+echo "--- CJK (Chinese Simplified) ---"
+
+# Sans: Noto Sans SC — ~16 MB (large!)
+download "https://github.com/notofonts/noto-cjk/releases/download/Sans2.004/09_NotoSansCJKsc.zip" "/tmp/NotoSansSC.zip"
+if [ -f /tmp/NotoSansSC.zip ] && [ ! -f sans/NotoSansSC-Regular.otf ]; then
+    unzip -q -o /tmp/NotoSansSC.zip "*/NotoSansCJKsc-Regular.otf" -d /tmp/noto_cjk 2>/dev/null || true
+    find /tmp/noto_cjk -name "NotoSansCJKsc-Regular.otf" -exec cp {} sans/NotoSansSC-Regular.otf \; 2>/dev/null || true
+fi
+
+if [ "$SANS_ONLY" = "0" ]; then
+    # Serif: Noto Serif SC
+    download "https://github.com/notofonts/noto-cjk/releases/download/Serif2.003/08_NotoSerifCJKsc.zip" "/tmp/NotoSerifSC.zip"
+    if [ -f /tmp/NotoSerifSC.zip ] && [ ! -f serif/NotoSerifSC-Regular.otf ]; then
+        unzip -q -o /tmp/NotoSerifSC.zip "*/NotoSerifCJKsc-Regular.otf" -d /tmp/noto_cjk 2>/dev/null || true
+        find /tmp/noto_cjk -name "NotoSerifCJKsc-Regular.otf" -exec cp {} serif/NotoSerifSC-Regular.otf \; 2>/dev/null || true
+    fi
+fi
+
+# ============================================================================
+# 3. Korean (Hangul)
+# ============================================================================
+echo "--- Korean (Hangul) ---"
+
+# Sans: Noto Sans KR — ~5 MB
+download "https://github.com/notofonts/noto-cjk/releases/download/Sans2.004/06_NotoSansCJKkr.zip" "/tmp/NotoSansKR.zip"
+if [ -f /tmp/NotoSansKR.zip ] && [ ! -f sans/NotoSansKR-Regular.otf ]; then
+    unzip -q -o /tmp/NotoSansKR.zip "*/NotoSansCJKkr-Regular.otf" -d /tmp/noto_cjk 2>/dev/null || true
+    find /tmp/noto_cjk -name "NotoSansCJKkr-Regular.otf" -exec cp {} sans/NotoSansKR-Regular.otf \; 2>/dev/null || true
+fi
+
+if [ "$SANS_ONLY" = "0" ]; then
+    # Serif: Noto Serif KR
+    download "https://github.com/notofonts/noto-cjk/releases/download/Serif2.003/05_NotoSerifCJKkr.zip" "/tmp/NotoSerifKR.zip"
+    if [ -f /tmp/NotoSerifKR.zip ] && [ ! -f serif/NotoSerifKR-Regular.otf ]; then
+        unzip -q -o /tmp/NotoSerifKR.zip "*/NotoSerifCJKkr-Regular.otf" -d /tmp/noto_cjk 2>/dev/null || true
+        find /tmp/noto_cjk -name "NotoSerifCJKkr-Regular.otf" -exec cp {} serif/NotoSerifKR-Regular.otf \; 2>/dev/null || true
+    fi
+
+    # Mono: D2Coding
+    download "https://github.com/naver/d2codingfont/releases/download/VER1.3.2/D2Coding-Ver1.3.2-20180524.zip" "/tmp/D2Coding.zip"
+    if [ -f /tmp/D2Coding.zip ] && [ ! -f mono/D2Coding.ttf ]; then
+        unzip -q -o /tmp/D2Coding.zip "D2Coding/D2Coding-Ver1.3.2-20180524.ttf" -d /tmp/d2c_extract 2>/dev/null || true
+        find /tmp/d2c_extract -name "D2Coding*.ttf" | head -1 | xargs -I{} cp {} mono/D2Coding.ttf 2>/dev/null || true
+    fi
+fi
+
+# ============================================================================
+# 4. Hindi (Devanagari)
+# ============================================================================
+echo "--- Hindi (Devanagari) ---"
+
+download "https://github.com/notofonts/devanagari/releases/download/NotoSansDevanagari-v2.008/NotoSansDevanagari-v2.008.zip" "/tmp/NotoSansDevanagari.zip"
+if [ -f /tmp/NotoSansDevanagari.zip ] && [ ! -f sans/NotoSansDevanagari-Regular.ttf ]; then
+    unzip -q -o /tmp/NotoSansDevanagari.zip "*/NotoSansDevanagari-Regular.ttf" -d /tmp/noto_deva 2>/dev/null || true
+    find /tmp/noto_deva -name "NotoSansDevanagari-Regular.ttf" -exec cp {} sans/NotoSansDevanagari-Regular.ttf \; 2>/dev/null || true
+fi
+
+if [ "$SANS_ONLY" = "0" ]; then
+    download "https://github.com/notofonts/devanagari/releases/download/NotoSerifDevanagari-v2.004/NotoSerifDevanagari-v2.004.zip" "/tmp/NotoSerifDevanagari.zip"
+    if [ -f /tmp/NotoSerifDevanagari.zip ] && [ ! -f serif/NotoSerifDevanagari-Regular.ttf ]; then
+        unzip -q -o /tmp/NotoSerifDevanagari.zip "*/NotoSerifDevanagari-Regular.ttf" -d /tmp/noto_deva 2>/dev/null || true
+        find /tmp/noto_deva -name "NotoSerifDevanagari-Regular.ttf" -exec cp {} serif/NotoSerifDevanagari-Regular.ttf \; 2>/dev/null || true
+    fi
+fi
+
+# ============================================================================
+# 5. Arabic
+# ============================================================================
+echo "--- Arabic ---"
+
+download "https://github.com/notofonts/arabic/releases/download/NotoSansArabic-v2.012/NotoSansArabic-v2.012.zip" "/tmp/NotoSansArabic.zip"
+if [ -f /tmp/NotoSansArabic.zip ] && [ ! -f sans/NotoSansArabic-Regular.ttf ]; then
+    unzip -q -o /tmp/NotoSansArabic.zip "*/NotoSansArabic-Regular.ttf" -d /tmp/noto_arab 2>/dev/null || true
+    find /tmp/noto_arab -name "NotoSansArabic-Regular.ttf" -exec cp {} sans/NotoSansArabic-Regular.ttf \; 2>/dev/null || true
+fi
+
+if [ "$SANS_ONLY" = "0" ]; then
+    download "https://github.com/notofonts/arabic/releases/download/NotoNaskhArabic-v2.014/NotoNaskhArabic-v2.014.zip" "/tmp/NotoNaskhArabic.zip"
+    if [ -f /tmp/NotoNaskhArabic.zip ] && [ ! -f serif/NotoNaskhArabic-Regular.ttf ]; then
+        unzip -q -o /tmp/NotoNaskhArabic.zip "*/NotoNaskhArabic-Regular.ttf" -d /tmp/noto_arab 2>/dev/null || true
+        find /tmp/noto_arab -name "NotoNaskhArabic-Regular.ttf" -exec cp {} serif/NotoNaskhArabic-Regular.ttf \; 2>/dev/null || true
+    fi
+fi
+
+# ============================================================================
+# 6. Bengali
+# ============================================================================
+echo "--- Bengali ---"
+
+download "https://github.com/notofonts/bengali/releases/download/NotoSansBengali-v2.004/NotoSansBengali-v2.004.zip" "/tmp/NotoSansBengali.zip"
+if [ -f /tmp/NotoSansBengali.zip ] && [ ! -f sans/NotoSansBengali-Regular.ttf ]; then
+    unzip -q -o /tmp/NotoSansBengali.zip "*/NotoSansBengali-Regular.ttf" -d /tmp/noto_beng 2>/dev/null || true
+    find /tmp/noto_beng -name "NotoSansBengali-Regular.ttf" -exec cp {} sans/NotoSansBengali-Regular.ttf \; 2>/dev/null || true
+fi
+
+if [ "$SANS_ONLY" = "0" ]; then
+    download "https://github.com/notofonts/bengali/releases/download/NotoSerifBengali-v2.004/NotoSerifBengali-v2.004.zip" "/tmp/NotoSerifBengali.zip"
+    if [ -f /tmp/NotoSerifBengali.zip ] && [ ! -f serif/NotoSerifBengali-Regular.ttf ]; then
+        unzip -q -o /tmp/NotoSerifBengali.zip "*/NotoSerifBengali-Regular.ttf" -d /tmp/noto_beng 2>/dev/null || true
+        find /tmp/noto_beng -name "NotoSerifBengali-Regular.ttf" -exec cp {} serif/NotoSerifBengali-Regular.ttf \; 2>/dev/null || true
+    fi
+fi
+
+# ============================================================================
+# Summary
+# ============================================================================
+echo ""
+echo "=== Download complete ==="
+echo ""
+echo "Installed fonts:"
+echo "  sans/"
+ls -1 sans/ 2>/dev/null | sed 's/^/    /'
+if [ "$SANS_ONLY" = "0" ]; then
+    echo "  serif/"
+    ls -1 serif/ 2>/dev/null | sed 's/^/    /'
+    echo "  mono/"
+    ls -1 mono/ 2>/dev/null | sed 's/^/    /'
+fi
+echo ""
+echo "Total size:"
+du -sh sans/ serif/ mono/ 2>/dev/null || du -sh sans/ 2>/dev/null

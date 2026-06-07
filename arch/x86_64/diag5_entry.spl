@@ -1,0 +1,17 @@
+# Diagnostic 5 — test full posix_init via mod.spl import
+
+extern fn serial_println(msg: text)
+
+use os.posix.mod.{posix_init}
+
+fn _start():
+    serial_println("[DIAG5] Calling posix_init from mod.spl")
+    posix_init()
+    serial_println("[DIAG5] posix_init OK")
+
+    serial_println("[DIAG5] Calling init_all_services")
+    use os.kernel.boot.init_services.{init_all_services}
+    init_all_services()
+    serial_println("[DIAG5] init_all_services OK")
+
+    serial_println("TEST PASSED")

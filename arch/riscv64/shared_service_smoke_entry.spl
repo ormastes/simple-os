@@ -1,0 +1,66 @@
+use os.services.desktop_app_ownership_contract.{desktop_app_ownership_valid}
+
+extern fn serial_println(msg: text)
+extern fn rt_qemu_exit_success()
+extern fn rt_riscv_nvfs_probe() -> i64
+extern fn rt_riscv_smf_cli_probe() -> i64
+extern fn rt_riscv_smf_cli_load() -> i64
+extern fn rt_riscv_smf_gui_probe() -> i64
+extern fn rt_riscv_native_gui_process_render() -> i64
+
+fn spl_start():
+    serial_println("")
+    serial_println("=== SimpleOS RV64 shared-service SMF boot ===")
+    serial_println("SimpleOS RV64 boot OK")
+
+    if rt_riscv_nvfs_probe() == 1:
+        serial_println("[riscv-nvfs] image read ok")
+    else:
+        serial_println("[riscv-nvfs] image read failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+
+    if rt_riscv_smf_cli_probe() == 1:
+        serial_println("FS_MOUNT_OK")
+        serial_println("SMF_DISCOVERY_OK")
+    else:
+        serial_println("[riscv-smf] cli launch probe failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+
+    if rt_riscv_smf_cli_load() == 1:
+        serial_println("ELF_LOAD_OK arch=riscv64 app=/sys/apps/hello_world.smf")
+        serial_println("SMF_CLI_LAUNCH_OK app=/sys/apps/hello_world.smf")
+    else:
+        serial_println("[riscv-smf] cli elf load failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+
+    if rt_riscv_smf_gui_probe() != 1:
+        serial_println("[riscv-smf] wm gui launch probe failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+
+    if rt_riscv_native_gui_process_render() != 1:
+        serial_println("[riscv-smf] native gui process render failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+
+    val pid: u64 = 1002
+    val app_id = "/sys/apps/browser_demo.smf"
+    if not desktop_app_ownership_valid(pid, app_id, 1, 1, pid, app_id):
+        serial_println("[riscv-smf] shared desktop ownership contract mismatch")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+
+    serial_println("SMF_WM_GUI_LAUNCH_OK app=/sys/apps/browser_demo.smf pid=1002 wm=x86_64_desktop_shell_contract")
+    serial_println("NATIVE_GUI_PROCESS_RENDER_OK app=/sys/apps/browser_demo.smf pid=1002")
+    serial_println("SIMPLEOS_RISCV_SMF_FS_PASS")
+    serial_println("TEST PASSED")
+    rt_qemu_exit_success()

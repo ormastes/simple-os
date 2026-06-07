@@ -1,0 +1,36 @@
+# ARM64 OS Entry — Full-stack SimpleOS boot (bare-metal QEMU virt)
+
+extern fn serial_println(msg: text)
+
+# Direct POSIX init (bypass mod.spl to avoid weak-stub cascade)
+use os.posix.fd_table.{fd_table_init}
+use os.posix.async_io.{async_io_init}
+use os.posix.signal_compat.{signal_init}
+
+# Services
+use os.kernel.boot.init_services.{init_all_services}
+
+# Shell
+use os.apps.shell.shell_app.{ShellApp}
+
+fn spl_start():
+    serial_println("")
+    serial_println("=== SimpleOS Boot ===")
+    serial_println("")
+
+    # POSIX layer init
+    fd_table_init()
+    async_io_init()
+    signal_init()
+    serial_println("[boot] POSIX layer initialized")
+
+    # Services
+    init_all_services()
+
+    # Shell
+    var shell = ShellApp.new()
+    serial_println("[boot] Shell ready")
+
+    serial_println("")
+    serial_println("=== SimpleOS ready ===")
+    serial_println("TEST PASSED")

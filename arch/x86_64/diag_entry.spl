@@ -1,0 +1,55 @@
+# Diagnostic Entry — trace each init step to find where os_main crashes
+#
+# Steps through initialization one import at a time to isolate the crash.
+
+extern fn serial_println(msg: text)
+extern fn rt_exit(code: i32)
+
+# Step 1: Just serial (should always work)
+fn step1_serial():
+    serial_println("[DIAG] Step 1: Serial works")
+
+# Step 2: POSIX init — call each sub-init directly to avoid transitive weak-stub cascade
+use os.posix.fd_table.{fd_table_init}
+use os.posix.async_io.{async_io_init}
+use os.posix.signal_compat.{signal_init}
+
+fn step2_posix():
+    serial_println("[DIAG] Step 2: Calling POSIX init functions directly...")
+    fd_table_init()
+    serial_println("[DIAG] Step 2a: fd_table OK")
+    async_io_init()
+    serial_println("[DIAG] Step 2b: async_io OK")
+    signal_init()
+    serial_println("[DIAG] Step 2c: signal OK")
+    serial_println("[DIAG] Step 2: POSIX initialized OK")
+
+# Step 3: Try importing init_services
+use os.kernel.boot.init_services.{init_all_services}
+
+fn step3_services():
+    serial_println("[DIAG] Step 3: Calling init_all_services()...")
+    init_all_services()
+    serial_println("[DIAG] Step 3: Services initialized OK")
+
+# Step 4: Try shell
+use os.apps.shell.shell_app.{ShellApp}
+
+fn step4_shell():
+    serial_println("[DIAG] Step 4: Creating shell...")
+    var shell = ShellApp.new()
+    serial_println("[DIAG] Step 4: Shell created OK")
+
+fn _start():
+    serial_println("")
+    serial_println("=== SimpleOS Diagnostic Boot ===")
+    serial_println("")
+
+    step1_serial()
+    step2_posix()
+    step3_services()
+    step4_shell()
+
+    serial_println("")
+    serial_println("=== All steps passed ===")
+    serial_println("TEST PASSED")

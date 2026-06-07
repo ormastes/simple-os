@@ -1,0 +1,5 @@
+extern fn serial_println(msg: text)
+extern fn rt_qemu_exit_success()
+
+fn spl_start():
+    rt_qemu_exit_success()

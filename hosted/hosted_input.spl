@@ -1,0 +1,399 @@
+# Hosted Input Adapters — winit events to SimpleOS input events
+#
+# Translates host windowing system events (via winit FFI) into the
+# compositor-compatible poll() API.
+#
+# The compositor calls keyboard.poll() and mouse.poll() each frame.
+# On baremetal these read PS/2 hardware ports; on hosted builds these
+# adapters drain the host event queue and convert to the same types.
+
+# ============================================================================
+# Local types — avoid importing baremetal ps2_keyboard/ps2_mouse modules
+# ============================================================================
+
+enum Key:
+    Escape | F1 | F2 | F3 | F4 | F5 | F6 | F7 | F8 | F9 | F10 | F11 | F12
+    Backtick | Num1 | Num2 | Num3 | Num4 | Num5 | Num6 | Num7 | Num8 | Num9 | Num0
+    Minus | Equals | Backspace | Tab
+    Q | W | E | R | T | Y | U | I | O | P | LeftBracket | RightBracket | Backslash
+    CapsLock | A | S | D | F | G | H | J | K | L | Semicolon | Quote | Enter
+    LeftShift | Z | X | C | V | B | N | M | Comma | Period | Slash | RightShift
+    LeftCtrl | LeftAlt | Space | RightAlt | RightCtrl
+    Up | Down | Left | Right
+    Insert | Delete | Home | End | PageUp | PageDown
+    Unknown
+
+enum KeyEvent:
+    Press(key: Key)
+    Release(key: Key)
+
+struct MouseEvent:
+    x: i64
+    y: i64
+    dx: i64
+    dy: i64
+    left_pressed: bool
+    right_pressed: bool
+    middle_pressed: bool
+    left_just_pressed: bool
+    right_just_pressed: bool
+    left_just_released: bool
+
+struct HostedKeyEvent:
+    scancode: i64
+    keycode: i64
+    pressed: bool
+
+struct HostedMouseEvent:
+    x: i64
+    y: i64
+    left_pressed: bool
+    right_pressed: bool
+
+# ============================================================================
+# Winit event FFI — direct extern declarations
+# ============================================================================
+
+extern fn rt_winit_event_loop_poll_events(event_loop_id: i64, max_events: i64) -> i64
+extern fn rt_winit_event_get_type(event_id: i64) -> i64
+extern fn rt_winit_event_keyboard_input(event_id: i64) -> (i64, i64, bool)
+extern fn rt_winit_event_mouse_moved(event_id: i64) -> (i64, i64)
+extern fn rt_winit_event_mouse_button(event_id: i64) -> (i64, bool)
+extern fn rt_winit_event_free(event_id: i64)
+
+# Event type constants (from winit_ffi.rs)
+val EVENT_KEYBOARD_INPUT: i64 = 10
+val EVENT_MOUSE_BUTTON: i64 = 20
+val EVENT_MOUSE_MOVED: i64 = 21
+val EVENT_MOUSE_WHEEL: i64 = 22
+val EVENT_WINDOW_CLOSE: i64 = 3
+
+# ============================================================================
+# Scancode / keycode → Key mapping
+# ============================================================================
+# The SDL2 keysym values are ASCII-like:
+#   a=97..z=122, 0=48..9=57, Enter=13, Escape=27, Backspace=8, Tab=9,
+#   Space=32, arrows use SDL extended codes (left=1073741904, etc.)
+#
+# The winit backend uses KeyCode values:
+#   A=65..Z=90, Space=32, Escape=27, Enter=13, arrows 37-40
+#
+# We handle both sets to work with either backend.
+
+fn keycode_to_key(code: i64) -> Key:
+    """Map a winit/SDL2 keycode to the SimpleOS Key enum."""
+    # Letters — uppercase (winit: A=65..Z=90)
+    if code == 65: return Key.A
+    if code == 66: return Key.B
+    if code == 67: return Key.C
+    if code == 68: return Key.D
+    if code == 69: return Key.E
+    if code == 70: return Key.F
+    if code == 71: return Key.G
+    if code == 72: return Key.H
+    if code == 73: return Key.I
+    if code == 74: return Key.J
+    if code == 75: return Key.K
+    if code == 76: return Key.L
+    if code == 77: return Key.M
+    if code == 78: return Key.N
+    if code == 79: return Key.O
+    if code == 80: return Key.P
+    if code == 81: return Key.Q
+    if code == 82: return Key.R
+    if code == 83: return Key.S
+    if code == 84: return Key.T
+    if code == 85: return Key.U
+    if code == 86: return Key.V
+    if code == 87: return Key.W
+    if code == 88: return Key.X
+    if code == 89: return Key.Y
+    if code == 90: return Key.Z
+
+    # Letters — lowercase (SDL2 keysym: a=97..z=122)
+    if code == 97: return Key.A
+    if code == 98: return Key.B
+    if code == 99: return Key.C
+    if code == 100: return Key.D
+    if code == 101: return Key.E
+    if code == 102: return Key.F
+    if code == 103: return Key.G
+    if code == 104: return Key.H
+    if code == 105: return Key.I
+    if code == 106: return Key.J
+    if code == 107: return Key.K
+    if code == 108: return Key.L
+    if code == 109: return Key.M
+    if code == 110: return Key.N
+    if code == 111: return Key.O
+    if code == 112: return Key.P
+    if code == 113: return Key.Q
+    if code == 114: return Key.R
+    if code == 115: return Key.S
+    if code == 116: return Key.T
+    if code == 117: return Key.U
+    if code == 118: return Key.V
+    if code == 119: return Key.W
+    if code == 120: return Key.X
+    if code == 121: return Key.Y
+    if code == 122: return Key.Z
+
+    # Digits (ASCII 48..57)
+    if code == 48: return Key.Num0
+    if code == 49: return Key.Num1
+    if code == 50: return Key.Num2
+    if code == 51: return Key.Num3
+    if code == 52: return Key.Num4
+    if code == 53: return Key.Num5
+    if code == 54: return Key.Num6
+    if code == 55: return Key.Num7
+    if code == 56: return Key.Num8
+    if code == 57: return Key.Num9
+
+    # Common keys
+    if code == 13: return Key.Enter
+    if code == 27: return Key.Escape
+    if code == 8: return Key.Backspace
+    if code == 9: return Key.Tab
+    if code == 32: return Key.Space
+
+    # Arrow keys (winit: Left=37, Up=38, Right=39, Down=40)
+    if code == 37: return Key.Left
+    if code == 38: return Key.Up
+    if code == 39: return Key.Right
+    if code == 40: return Key.Down
+
+    # Arrow keys (SDL2 extended: Left=1073741904, Right=1073741903,
+    #   Down=1073741905, Up=1073741906)
+    if code == 1073741904: return Key.Left
+    if code == 1073741903: return Key.Right
+    if code == 1073741905: return Key.Down
+    if code == 1073741906: return Key.Up
+
+    # Punctuation / symbols (ASCII)
+    if code == 45: return Key.Minus
+    if code == 61: return Key.Equals
+    if code == 91: return Key.LeftBracket
+    if code == 93: return Key.RightBracket
+    if code == 92: return Key.Backslash
+    if code == 59: return Key.Semicolon
+    # Note: ASCII 39 (single-quote) conflicts with winit Right arrow (also 39).
+    # SDL2 uses extended code 1073741903 for Right, so 39 maps to Right above.
+    # Quote is only reachable via SDL2 keysym, but SDL2 SDLK_QUOTE is also 39.
+    # We prioritize the arrow key mapping; quote input uses text events instead.
+    if code == 44: return Key.Comma
+    if code == 46: return Key.Period
+    if code == 47: return Key.Slash
+    if code == 96: return Key.Backtick
+
+    # Function keys (SDL2: F1=1073741882..F12=1073741893)
+    if code == 1073741882: return Key.F1
+    if code == 1073741883: return Key.F2
+    if code == 1073741884: return Key.F3
+    if code == 1073741885: return Key.F4
+    if code == 1073741886: return Key.F5
+    if code == 1073741887: return Key.F6
+    if code == 1073741888: return Key.F7
+    if code == 1073741889: return Key.F8
+    if code == 1073741890: return Key.F9
+    if code == 1073741891: return Key.F10
+    if code == 1073741892: return Key.F11
+    if code == 1073741893: return Key.F12
+
+    # Modifier keys (SDL2 extended codes)
+    if code == 1073742049: return Key.LeftShift
+    if code == 1073742053: return Key.RightShift
+    if code == 1073742048: return Key.LeftCtrl
+    if code == 1073742052: return Key.RightCtrl
+    if code == 1073742050: return Key.LeftAlt
+    if code == 1073742054: return Key.RightAlt
+
+    # Navigation keys (SDL2 extended codes)
+    if code == 1073741901: return Key.End
+    if code == 1073741898: return Key.Home
+    if code == 1073741899: return Key.PageUp
+    if code == 1073741902: return Key.PageDown
+    if code == 1073741897: return Key.Insert
+    if code == 127: return Key.Delete
+
+    Key.Unknown
+
+# ============================================================================
+# HostedKeyboard — winit events → KeyEvent
+# ============================================================================
+
+class HostedKeyboard:
+    """Keyboard adapter that reads from the host windowing system.
+
+    Provides the same poll() -> KeyEvent? API as Ps2Keyboard so the
+    compositor can use either transparently.
+    """
+    event_loop_id: i64
+    pending_events: [KeyEvent]
+
+impl HostedKeyboard:
+    static fn new(event_loop_id: i64) -> HostedKeyboard:
+        HostedKeyboard(
+            event_loop_id: event_loop_id,
+            pending_events: []
+        )
+
+    me poll() -> KeyEvent?:
+        """Poll for the next keyboard event. Returns nil if none pending."""
+        # If we have buffered events from a previous drain, return one
+        if self.pending_events.len() > 0:
+            val event = self.pending_events[0]
+            # Remove the first element by rebuilding the list
+            var remaining: [KeyEvent] = []
+            var i = 1
+            while i < self.pending_events.len():
+                remaining.push(self.pending_events[i])
+                i = i + 1
+            self.pending_events = remaining
+            return event
+
+        # Drain host events, buffer keyboard events, discard others
+        var max_polls: i64 = 64
+        while max_polls > 0:
+            max_polls = max_polls - 1
+            val event_handle = rt_winit_event_loop_poll_events(self.event_loop_id, 1)
+            if event_handle == 0:
+                return nil
+
+            val event_type = rt_winit_event_get_type(event_handle)
+
+            if event_type == EVENT_KEYBOARD_INPUT:
+                val (scancode, keycode, pressed) = rt_winit_event_keyboard_input(event_handle)
+                val key = keycode_to_key(keycode)
+                if pressed:
+                    self.pending_events.push(KeyEvent.Press(key: key))
+                else:
+                    self.pending_events.push(KeyEvent.Release(key: key))
+
+            rt_winit_event_free(event_handle)
+
+        # Return first buffered event if any
+        if self.pending_events.len() > 0:
+            val event = self.pending_events[0]
+            var remaining: [KeyEvent] = []
+            var i = 1
+            while i < self.pending_events.len():
+                remaining.push(self.pending_events[i])
+                i = i + 1
+            self.pending_events = remaining
+            return event
+
+        nil
+
+# ============================================================================
+# HostedMouse — winit events → MouseEvent
+# ============================================================================
+
+class HostedMouse:
+    """Mouse adapter that reads from the host windowing system.
+
+    Provides the same poll() -> MouseEvent? API as Ps2Mouse so the
+    compositor can use either transparently.
+
+    Tracks absolute position and button state, generates edge-triggered
+    just_pressed / just_released fields matching the baremetal MouseEvent.
+    """
+    event_loop_id: i64
+    x: i64
+    y: i64
+    left_pressed: bool
+    right_pressed: bool
+    prev_left: bool
+    prev_right: bool
+    has_event: bool
+    dx: i64
+    dy: i64
+    screen_width: i64
+    screen_height: i64
+
+impl HostedMouse:
+    static fn create(event_loop_id: i64, screen_width: i64, screen_height: i64) -> HostedMouse:
+        HostedMouse(
+            event_loop_id: event_loop_id,
+            x: screen_width / 2,
+            y: screen_height / 2,
+            left_pressed: false,
+            right_pressed: false,
+            prev_left: false,
+            prev_right: false,
+            has_event: false,
+            dx: 0,
+            dy: 0,
+            screen_width: screen_width,
+            screen_height: screen_height
+        )
+
+    me poll() -> MouseEvent?:
+        """Poll for the next mouse event. Returns nil if no mouse activity."""
+        # Save previous button state for edge detection
+        self.prev_left = self.left_pressed
+        self.prev_right = self.right_pressed
+        self.has_event = false
+        self.dx = 0
+        self.dy = 0
+
+        # Drain host events looking for mouse events
+        var max_polls: i64 = 64
+        while max_polls > 0:
+            max_polls = max_polls - 1
+            val event_handle = rt_winit_event_loop_poll_events(self.event_loop_id, 1)
+            if event_handle == 0:
+                break
+
+            val event_type = rt_winit_event_get_type(event_handle)
+            self._update_from_event(event_handle, event_type)
+            rt_winit_event_free(event_handle)
+
+        if not self.has_event:
+            return nil
+
+        # Compute edge-triggered button transitions
+        val left_just = self.left_pressed and not self.prev_left
+        val left_released = not self.left_pressed and self.prev_left
+        val right_just = self.right_pressed and not self.prev_right
+
+        MouseEvent(
+            x: self.x,
+            y: self.y,
+            dx: self.dx,
+            dy: self.dy,
+            left_pressed: self.left_pressed,
+            right_pressed: self.right_pressed,
+            middle_pressed: false,
+            left_just_pressed: left_just,
+            right_just_pressed: right_just,
+            left_just_released: left_released
+        )
+
+    me _update_from_event(event_handle: i64, event_type: i64):
+        """Process a single host event and update internal mouse state."""
+        if event_type == EVENT_MOUSE_MOVED:
+            val (new_x, new_y) = rt_winit_event_mouse_moved(event_handle)
+            self.dx = new_x - self.x
+            self.dy = new_y - self.y
+            self.x = new_x
+            self.y = new_y
+            # Clamp to screen bounds
+            if self.x < 0:
+                self.x = 0
+            if self.x >= self.screen_width:
+                self.x = self.screen_width - 1
+            if self.y < 0:
+                self.y = 0
+            if self.y >= self.screen_height:
+                self.y = self.screen_height - 1
+            self.has_event = true
+
+        elif event_type == EVENT_MOUSE_BUTTON:
+            val (button_code, pressed) = rt_winit_event_mouse_button(event_handle)
+            # button_code: 0=left, 1=right, 2=middle
+            if button_code == 0:
+                self.left_pressed = pressed
+            elif button_code == 1:
+                self.right_pressed = pressed
+            self.has_event = true

@@ -1,0 +1,193 @@
+# x86_64 GUI Entry — VirtIO-GPU wrapper proof lane
+#
+# Sibling of gui_entry_engine2d.spl, but targets the VirtIO-GPU wrapper
+# lane instead of the BGA-backed BaremetalBackend path.
+#
+# This entry keeps a small deterministic proof path: initialize
+# VirtIO-GPU, construct a wrapper-local direct-framebuffer backend,
+# paint the verification scene, flush the scanout, emit the
+# render-ready marker, and halt.
+#
+# Backend selection: virtio-gpu (wraps an initialized VirtioGpuDriver).
+#
+# Boot sequence:
+#   1. Serial init
+#   2. Query the C-side PCI cache and locate VirtIO-GPU
+#   3. VirtioGpuDriver.init_from_grant()
+#   4. Build the wrapper-local proof backend on the direct-FB path
+#   5. Assert backend_name() == "virtio-gpu" (verification gate)
+#   6. Clear + draw rectangles + blit + flush
+#   7. Halt (compositor hand-off intentionally deferred — A1 will wire it)
+#
+# NOTE on the assert value: the backend's name() returns "virtio-gpu"
+# (hyphen), not "virtio_gpu" (underscore). We assert against the actual
+# backend string so the gate passes when everything is wired correctly.
+
+use os.kernel.arch.x86_64.console.{serial_init, serial_writeln}
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_early_init}
+use os.drivers.pci.pci.{PciDevice}
+use os.drivers.virtio.virtio_gpu.{VirtioGpuDriver}
+use os.kernel.types.device_mem_types.{DeviceGrant, new_device_grant}
+use os.kernel.abi.syscall_shim.{shim_init}
+use os.kernel.scheduler.scheduler.{Scheduler}
+use os.kernel.ipc.ipc.{IpcManager}
+use os.kernel.log.klog.{KernelLog}
+use std.gpu.engine2d.backend_virtio_gpu.{VirtioGpuBackend}
+
+extern fn serial_println(msg: text)
+extern fn rt_pci_device_count() -> i64
+extern fn rt_pci_get_field(index: i64, field: i64) -> i64
+extern fn rt_pci_read_bar0(index: i64) -> i64
+
+# ============================================================================
+# Helper — build a DeviceGrant from a discovered PciDevice.
+# Kept local so this wrapper proof lane can stay self-contained.
+# ============================================================================
+
+fn grant_from_pci(dev: PciDevice) -> DeviceGrant:
+    """Construct a DeviceGrant for VirtIO PCI transport."""
+    var bar0_phys: u64 = dev.bar0.to_u64()
+    if bar0_phys == 0:
+        bar0_phys = (dev.bar1 & 0xFFFFFFF0).to_u64()
+    serial_writeln("[grant] dev.bar0={dev.bar0} dev.bar1={dev.bar1} using=0x{bar0_phys}")
+
+    val bar0_size: u64 = 4096
+
+    var grant = new_device_grant()
+    grant.pci_vendor = dev.vendor_id
+    grant.pci_device = dev.device_id
+    grant.pci_bus = dev.bus
+    grant.pci_dev = dev.device
+    grant.pci_func = dev.func
+    grant.pci_class = dev.class_code
+    grant.pci_subclass = dev.subclass
+    grant.bar0_phys = bar0_phys
+    grant.bar0_size = bar0_size
+    grant.bar0_cap = 1
+    grant.irq_vector = dev.irq_line.to_u32()
+    grant
+
+fn halt_forever():
+    """Spin halt — end-of-entry gate when we don't want to continue booting."""
+    while true:
+        pass_dn
+
+fn init_proof_backend(gpu: VirtioGpuDriver, surface_w: i32, surface_h: i32) -> VirtioGpuBackend:
+    """Build the wrapper-local backend object on the verified direct-FB path."""
+    VirtioGpuBackend(
+        gpu: gpu,
+        buf: [],
+        w: surface_w,
+        h: surface_h,
+        resource_id: 1u32,
+        fb_virt: gpu.get_fb_virt(),
+        fb_size: gpu.get_fb_size(),
+        gpu_w: gpu.get_width().to_i32(),
+        gpu_h: gpu.get_height().to_i32(),
+        clip_x: 0,
+        clip_y: 0,
+        clip_w: surface_w,
+        clip_h: surface_h,
+        clip_active: false,
+        direct_fb: true
+    )
+
+fn find_virtio_gpu_from_c_pci_cache() -> PciDevice?:
+    """Find the first display-class VirtIO-GPU using the C-side PCI cache."""
+    val count = rt_pci_device_count()
+    var i: i64 = 0
+    while i < count:
+        val vendor_id = rt_pci_get_field(i, 5)
+        val device_id = rt_pci_get_field(i, 6)
+        val class_code = rt_pci_get_field(i, 3)
+        val subclass = rt_pci_get_field(i, 4)
+        val is_display = class_code == 0x03 and (subclass == 0x80 or subclass == 0x00)
+        val is_virtio_gpu = vendor_id == 0x1AF4 and (device_id == 0x1050 or device_id == 0x1040)
+        if is_display and is_virtio_gpu:
+            val bus = rt_pci_get_field(i, 0).to_u8()
+            val dev = rt_pci_get_field(i, 1).to_u8()
+            val func = rt_pci_get_field(i, 2).to_u8()
+            return Some(PciDevice(
+                bus: bus,
+                device: dev,
+                func: func,
+                vendor_id: vendor_id.to_u16(),
+                device_id: device_id.to_u16(),
+                class_code: class_code.to_u8(),
+                subclass: subclass.to_u8(),
+                prog_if: 0,
+                header_type: 0,
+                bar0: rt_pci_read_bar0(i).to_u32(),
+                bar1: 0,
+                irq_line: rt_pci_get_field(i, 7).to_u8()
+            ))
+        i = i + 1
+    nil
+
+fn spl_start():
+    """x86_64 GUI entry — VirtIO-GPU wrapper proof lane.
+
+    Initializes a VirtIO-GPU device, constructs the wrapper-local
+    direct-framebuffer backend, paints the verification scene, flushes
+    the scanout, emits the render-ready marker, and halts.
+    """
+    serial_init()
+    serial_writeln("SimpleOS x86_64 GUI boot (VirtIO-GPU mode, Engine2D variant)")
+    serial_writeln("[BOOT] COM1 serial initialized at 0x3F8")
+    arch_x86_64_early_init()
+    # Pull syscall_shim's strong spl_handle_* exports into the link graph so
+    # linker.ld aliases resolve in this baremetal wrapper entry too.
+    shim_init(Scheduler.new(), IpcManager.new(), KernelLog.new(256))
+
+    # --- PCI discovery via baremetal C cache ---
+    serial_println("[BOOT] Scanning PCI for VirtIO-GPU...")
+    if val Some(found_dev) = find_virtio_gpu_from_c_pci_cache():
+        serial_println("[BOOT] Found GPU")
+
+        # --- VirtIO-GPU driver init ---
+        val grant = grant_from_pci(found_dev)
+        var gpu = VirtioGpuDriver.new()
+        if val Ok(_ok) = gpu.init_legacy_from_bar0(found_dev.bar0.to_u64(), 4096, 0):
+            serial_println("[BOOT] VirtIO-GPU initialized")
+
+            # --- VirtioGpuBackend verification ---
+            serial_println("[E2D] Creating backend")
+            val surface_w: i32 = 320
+            val surface_h: i32 = 200
+            var backend = init_proof_backend(gpu, surface_w, surface_h)
+            serial_println("[E2D] Backend initialized (manual)")
+
+            # Backend verification gate
+            if backend.name() == "virtio-gpu":
+                serial_println("[E2D] GATE OK")
+            else:
+                serial_println("[E2D] GATE FAIL")
+                halt_forever()
+
+            serial_println("[E2D] Clearing to dark blue...")
+            backend.clear(0xFF0A2540)
+
+            serial_println("[E2D] Drawing 3 colored window rectangles...")
+            backend.draw_rect_filled(16, 16, 96, 60, 0xFF1E1E2E)
+            backend.draw_rect_filled(16, 16, 96, 12, 0xFFE74C3C)
+
+            backend.draw_rect_filled(120, 32, 96, 60, 0xFF1E1E2E)
+            backend.draw_rect_filled(120, 32, 96, 12, 0xFF27AE60)
+
+            backend.draw_rect_filled(72, 104, 96, 60, 0xFF1E1E2E)
+            backend.draw_rect_filled(72, 104, 96, 12, 0xFF2980B9)
+
+            serial_println("[E2D] Blitting to framebuffer...")
+            backend.blit_only()
+            serial_println("[E2D] Flushing scanout...")
+            gpu.flush()
+            serial_println("[E2D] Backend verification frame painted")
+            serial_println("[gui-e2d-virtio] render-ready")
+        else:
+            serial_println("[BOOT] VirtIO-GPU init failed")
+    else:
+        serial_println("[BOOT] NO VIRTIO-GPU FOUND")
+
+    # Compositor hand-off deferred — this entry only proves the engine path.
+    serial_println("[BOOT] Halting (compositor wiring is follow-up work)")
+    halt_forever()

@@ -1,0 +1,22 @@
+# V3 simple_browser shell entry — M1 acceptance command target.
+#
+# Invoked by:
+#   bin/simple run examples/simple_os/desktop_shell --backend chromium
+#
+# This file exists so the M1 milestone command works against an
+# in-tree path; the real work lives in `src/app/ui.chromium/`.
+# All other backends (wm, hosted, baremetal) keep their existing
+# entry points — this script is *only* the V3 chromium shell entry.
+
+use app.ui.chromium.main.{chromium_main, parse_chromium_backend}
+
+extern fn rt_cli_get_args() -> [text]
+
+fn main() -> i64:
+    val args = rt_cli_get_args()
+    val backend = parse_chromium_backend(args)
+    if backend != "" and backend != "chromium":
+        print "desktop_shell: --backend={backend} not implemented in M1"
+        print "desktop_shell: only --backend chromium is wired (V3 shell, M1)"
+        return 1
+    return chromium_main()

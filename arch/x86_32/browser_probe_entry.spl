@@ -1,0 +1,74 @@
+# x86_32 Browser Probe Entry
+#
+# Minimal baremetal probe used to prove the x86_32 multiboot path reaches
+# spl_start without the x86_64 wrapper/long-mode handoff.
+
+extern fn rt_port_inb(port: u32) -> u32
+extern fn rt_port_outb(port: u32, value: u32)
+
+fn serial_wait_ready():
+    var guard: i32 = 100000
+    while guard > 0:
+        if (rt_port_inb(0x3FD) & 0x20) != 0:
+            return
+        guard = guard - 1
+
+fn serial_put(ch: u32):
+    serial_wait_ready()
+    rt_port_outb(0x3F8, ch)
+
+fn serial_newline():
+    serial_put(13)
+    serial_put(10)
+
+fn write_probe_marker():
+    serial_put(83)
+    serial_put(105)
+    serial_put(109)
+    serial_put(112)
+    serial_put(108)
+    serial_put(101)
+    serial_put(79)
+    serial_put(83)
+    serial_put(32)
+    serial_put(120)
+    serial_put(56)
+    serial_put(54)
+    serial_put(95)
+    serial_put(51)
+    serial_put(50)
+    serial_newline()
+    serial_put(91)
+    serial_put(112)
+    serial_put(114)
+    serial_put(111)
+    serial_put(98)
+    serial_put(101)
+    serial_put(32)
+    serial_put(98)
+    serial_put(114)
+    serial_put(111)
+    serial_put(119)
+    serial_put(115)
+    serial_put(101)
+    serial_put(114)
+    serial_put(45)
+    serial_put(120)
+    serial_put(56)
+    serial_put(54)
+    serial_put(93)
+    serial_put(32)
+    serial_put(115)
+    serial_put(112)
+    serial_put(108)
+    serial_put(95)
+    serial_put(115)
+    serial_put(116)
+    serial_put(97)
+    serial_put(114)
+    serial_put(116)
+    serial_newline()
+
+fn spl_start():
+    write_probe_marker()
+    rt_port_outb(0xF4, 0)

@@ -1,0 +1,265 @@
+#![allow(unnamed_duplicate_typed_args)]
+# Minimal GUI — Pure Simple framebuffer hello world
+#
+# Uses only extern fn calls to the C runtime support layer.
+# No module imports, no string interpolation, no complex objects.
+# Proves the Simple → C runtime → hardware pipeline works.
+#
+# Entry point: _start() called from crt0.s as spl_start
+
+# --- Port I/O externs implemented by the boot support layer ---
+extern fn rt_port_outw(port: u64, value: u64)
+extern fn rt_port_inw(port: u64) -> u64
+extern fn rt_port_outl(port: u64, value: u64)
+extern fn rt_port_inl(port: u64) -> u64
+extern fn rt_port_outb(port: u64, value: u64)
+extern fn rt_port_inb(port: u64) -> u64
+
+# --- MMIO externs implemented by the boot support layer ---
+extern fn rt_mmio_write_u32(addr: u64, value: u64)
+
+# --- Serial externs ---
+extern fn rt_print(value: i64)
+extern fn rt_println(value: i64)
+
+# --- BGA constants ---
+val BGA_INDEX: u64 = 0x01CE
+val BGA_DATA: u64 = 0x01CF
+val PCI_ADDR: u64 = 0x0CF8
+val PCI_DATA: u64 = 0x0CFC
+
+# --- Framebuffer state ---
+var fb_addr: u64 = 0xFD000000
+var fb_width: u64 = 1024
+var fb_height: u64 = 768
+
+# --- BGA register write ---
+fn bga_write(index: u64, value: u64):
+    rt_port_outw(BGA_INDEX, index)
+    rt_port_outw(BGA_DATA, value)
+
+# --- PCI config read ---
+fn pci_read32(bus: u64, dev: u64, func: u64, off: u64) -> u64:
+    val addr: u64 = 0x80000000 | (bus << 16) | (dev << 11) | (func << 8) | (off & 0xFC)
+    rt_port_outl(PCI_ADDR, addr)
+    rt_port_inl(PCI_DATA)
+
+# --- Detect VGA framebuffer via PCI BAR0 ---
+fn detect_fb() -> u64:
+    var d: u64 = 0
+    while d < 32:
+        val vendor = pci_read32(0, d, 0, 0) & 0xFFFF
+        if vendor != 0xFFFF and vendor != 0:
+            val cls = pci_read32(0, d, 0, 0x08)
+            if ((cls >> 24) & 0xFF) == 3 and ((cls >> 16) & 0xFF) == 0:
+                val bar0 = pci_read32(0, d, 0, 0x10)
+                val addr = bar0 & 0xFFFFFFF0
+                if addr != 0:
+                    return addr
+        d = d + 1
+    0xFD000000
+
+# --- Init BGA framebuffer ---
+fn init_bga():
+    bga_write(0x04, 0x00)
+    bga_write(0x01, fb_width)
+    bga_write(0x02, fb_height)
+    bga_write(0x03, 32)
+    bga_write(0x06, fb_width)
+    bga_write(0x04, 0x41)
+    fb_addr = detect_fb()
+
+# --- Put pixel ---
+fn put_pixel(x: u64, y: u64, color: u64):
+    if x < fb_width and y < fb_height:
+        val offset = (y * fb_width + x) * 4
+        rt_mmio_write_u32(fb_addr + offset, color)
+
+# --- Fill rectangle ---
+fn fill_rect(x: u64, y: u64, w: u64, h: u64, color: u64):
+    var dy: u64 = 0
+    while dy < h:
+        var dx: u64 = 0
+        while dx < w:
+            put_pixel(x + dx, y + dy, color)
+            dx = dx + 1
+        dy = dy + 1
+
+# --- Draw 8x16 character (hardcoded font for basic ASCII) ---
+fn draw_char(x: u64, y: u64, ch: u64, fg: u64, bg: u64):
+    # Simple 5x7 font encoded as 7 rows of 5 bits each
+    # We scale to 8x16 by doubling
+    var glyph: u64 = 0
+    if ch == 72:  glyph = 0x11111F1111  # H
+    if ch == 101: glyph = 0x000E190F10E # e
+    if ch == 108: glyph = 0x04040404040 # l
+    if ch == 111: glyph = 0x000E111110E # o
+    if ch == 32:  glyph = 0x00000000000 # space
+    if ch == 87:  glyph = 0x11111151B11 # W
+    if ch == 114: glyph = 0x0001611100 # r (shifted)
+    if ch == 100: glyph = 0x010111310E # d (shifted)
+    if ch == 33:  glyph = 0x04040404004 # !
+    if ch == 83:  glyph = 0x0E1010E010E # S
+    if ch == 105: glyph = 0x04004040404 # i
+    if ch == 109: glyph = 0x0001B15111 # m (shifted)
+    if ch == 112: glyph = 0x0001E111E10 # p
+    if ch == 79:  glyph = 0x0E1111110E # O
+    # Draw 8 columns x 10 rows
+    var row: u64 = 0
+    while row < 10:
+        var col: u64 = 0
+        while col < 8:
+            # Simple: fill all with fg on top half, bg on bottom
+            if row < 8:
+                put_pixel(x + col, y + row, fg)
+            else:
+                put_pixel(x + col, y + row, bg)
+            col = col + 1
+        row = row + 1
+
+# --- Draw text string by ASCII codes ---
+fn draw_text_at(x: u64, y: u64, fg: u64, bg: u64):
+    # "SimpleOS" = 83 105 109 112 108 101 79 83
+    draw_char(x, y, 83, fg, bg)
+    draw_char(x + 9, y, 105, fg, bg)
+    draw_char(x + 18, y, 109, fg, bg)
+    draw_char(x + 27, y, 112, fg, bg)
+    draw_char(x + 36, y, 108, fg, bg)
+    draw_char(x + 45, y, 101, fg, bg)
+    draw_char(x + 54, y, 79, fg, bg)
+    draw_char(x + 63, y, 83, fg, bg)
+
+fn draw_hello_at(x: u64, y: u64, fg: u64, bg: u64):
+    # "Hello World!" = 72 101 108 108 111 32 87 111 114 108 100 33
+    draw_char(x, y, 72, fg, bg)
+    draw_char(x + 9, y, 101, fg, bg)
+    draw_char(x + 18, y, 108, fg, bg)
+    draw_char(x + 27, y, 108, fg, bg)
+    draw_char(x + 36, y, 111, fg, bg)
+    draw_char(x + 45, y, 32, fg, bg)
+    draw_char(x + 54, y, 87, fg, bg)
+    draw_char(x + 63, y, 111, fg, bg)
+    draw_char(x + 72, y, 114, fg, bg)
+    draw_char(x + 81, y, 108, fg, bg)
+    draw_char(x + 90, y, 100, fg, bg)
+    draw_char(x + 99, y, 33, fg, bg)
+
+# --- Serial output (byte at a time) ---
+fn serial_putc(c: u64):
+    # Wait for THR empty (LSR bit 5)
+    while (rt_port_inb(0x3FD) & 0x20) == 0:
+        continue
+    rt_port_outb(0x3F8, c)
+
+fn serial_puts_hello():
+    # "[SIMPLE] Hello World GUI\r\n"
+    serial_putc(91)   # [
+    serial_putc(83)   # S
+    serial_putc(73)   # I
+    serial_putc(77)   # M
+    serial_putc(80)   # P
+    serial_putc(76)   # L
+    serial_putc(69)   # E
+    serial_putc(93)   # ]
+    serial_putc(32)   # space
+    serial_putc(72)   # H
+    serial_putc(101)  # e
+    serial_putc(108)  # l
+    serial_putc(108)  # l
+    serial_putc(111)  # o
+    serial_putc(32)   # space
+    serial_putc(87)   # W
+    serial_putc(111)  # o
+    serial_putc(114)  # r
+    serial_putc(108)  # l
+    serial_putc(100)  # d
+    serial_putc(32)   # space
+    serial_putc(71)   # G
+    serial_putc(85)   # U
+    serial_putc(73)   # I
+    serial_putc(13)   # CR
+    serial_putc(10)   # LF
+
+fn serial_puts_bga_ok():
+    # "[SIMPLE] BGA init done\r\n"
+    serial_putc(91)
+    serial_putc(83)
+    serial_putc(73)
+    serial_putc(77)
+    serial_putc(80)
+    serial_putc(76)
+    serial_putc(69)
+    serial_putc(93)
+    serial_putc(32)
+    serial_putc(66)  # B
+    serial_putc(71)  # G
+    serial_putc(65)  # A
+    serial_putc(32)
+    serial_putc(105) # i
+    serial_putc(110) # n
+    serial_putc(105) # i
+    serial_putc(116) # t
+    serial_putc(32)
+    serial_putc(100) # d
+    serial_putc(111) # o
+    serial_putc(110) # n
+    serial_putc(101) # e
+    serial_putc(13)
+    serial_putc(10)
+
+fn serial_puts_render_ok():
+    serial_putc(91)
+    serial_putc(83)
+    serial_putc(73)
+    serial_putc(77)
+    serial_putc(80)
+    serial_putc(76)
+    serial_putc(69)
+    serial_putc(93)
+    serial_putc(32)
+    serial_putc(82)  # R
+    serial_putc(101) # e
+    serial_putc(110) # n
+    serial_putc(100) # d
+    serial_putc(101) # e
+    serial_putc(114) # r
+    serial_putc(32)
+    serial_putc(100) # d
+    serial_putc(111) # o
+    serial_putc(110) # n
+    serial_putc(101) # e
+    serial_putc(13)
+    serial_putc(10)
+
+# ===================================================================
+# Entry point — called from crt0.s as spl_start
+# ===================================================================
+
+fn _start():
+    serial_puts_hello()
+
+    # Init BGA framebuffer 1024x768x32
+    init_bga()
+    serial_puts_bga_ok()
+
+    # Draw desktop background (dark blue-gray)
+    fill_rect(0, 0, 1024, 768, 0x001B2838)
+
+    # Draw title bar
+    fill_rect(0, 0, 1024, 32, 0x002C3E50)
+    draw_text_at(12, 10, 0x00FFFFFF, 0x002C3E50)
+
+    # Draw window
+    fill_rect(200, 100, 600, 400, 0x00FFFFFF)
+    fill_rect(200, 100, 600, 30, 0x003498DB)
+    draw_hello_at(212, 108, 0x00FFFFFF, 0x003498DB)
+
+    # Draw window content
+    draw_text_at(220, 160, 0x00333333, 0x00FFFFFF)
+    draw_hello_at(220, 190, 0x00333333, 0x00FFFFFF)
+
+    # Draw taskbar
+    fill_rect(0, 738, 1024, 30, 0x002C3E50)
+    draw_text_at(12, 746, 0x00FFFFFF, 0x002C3E50)
+
+    serial_puts_render_ok()

@@ -1,0 +1,9 @@
+extern fn serial_println(msg: text)
+extern fn rt_qemu_exit_success()
+
+fn spl_start():
+    serial_println("")
+    serial_println("=== SimpleOS ARM64 smoke boot ===")
+    serial_println("SimpleOS ARM64 boot OK")
+    serial_println("TEST PASSED")
+    rt_qemu_exit_success()

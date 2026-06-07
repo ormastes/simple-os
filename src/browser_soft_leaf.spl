@@ -1,0 +1,14 @@
+#![allow(unnamed_duplicate_typed_args)]
+# Browser Soft Leaf Probe
+#
+# Minimal imported helper used to prove a clean module can be called from the
+# x86_64 trampoline entry without inheriting the heavy browser pipeline frame.
+
+extern fn rt_port_outb(port: u64, value: u64)
+
+val SERIAL_DATA: u64 = 0x3F8
+
+fn run() -> i32:
+    rt_port_outb(SERIAL_DATA, 98)
+    return 1
+

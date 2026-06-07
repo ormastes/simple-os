@@ -1,0 +1,26 @@
+use os.kernel.boot.ports.{BootMemoryRegion, MemoryRegionKind}
+
+extern fn rt_mmio_write_u8(addr: u64, value: u8)
+extern fn rt_mmio_write_u64(addr: u64, value: u64)
+extern fn proof_store_u64(slot: u64, value: u64)
+extern fn proof_store_bool(slot: u64, value: bool)
+
+fn proof_emit_marker():
+    proof_emit_uart_byte(0x42)
+    proof_emit_uart_byte(0x49)
+    proof_emit_uart_byte(0x0D)
+    proof_emit_uart_byte(0x0A)
+
+fn proof_emit_uart_byte(value: u8):
+    rt_mmio_write_u8(0x10000000, value)
+
+fn memory_region_kind_code(kind: MemoryRegionKind) -> u64:
+    match kind:
+        MemoryRegionKind.Usable: 1
+        MemoryRegionKind.Reserved: 2
+        MemoryRegionKind.AcpiReclaimable: 3
+        MemoryRegionKind.AcpiNvs: 4
+        MemoryRegionKind.BadMemory: 5
+        MemoryRegionKind.BootloaderReclaimable: 6
+        MemoryRegionKind.Framebuffer: 7
+        MemoryRegionKind.Kernel: 8

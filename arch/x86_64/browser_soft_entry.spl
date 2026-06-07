@@ -1,0 +1,332 @@
+#![allow(unnamed_duplicate_typed_args)]
+# x86_64 Browser Software Entry -- DOM/layout/paint/software raster smoke test
+#
+# Exercises the direct browser pipeline without BrowserRenderer, Engine2D,
+# or backend_cuda:
+#   BeDomNode -> layout_tree -> generate_paint_list ->
+#   paint_commands_to_scene -> execute_scene_to_buffer
+
+extern fn rt_port_inb(port: u16) -> u8
+extern fn rt_port_outb(port: u16, value: u8)
+
+use std.gc_async_mut.gpu.browser_engine.dom.{BeDomNode}
+use std.gc_async_mut.gpu.browser_engine.layout.{layout_tree}
+use std.gc_async_mut.gpu.browser_engine.paint.{generate_paint_list,
+    paint_commands_to_scene}
+use common.render_scene.executor.{execute_scene_to_buffer}
+
+val VIEWPORT_W: i32 = 400
+val VIEWPORT_H: i32 = 300
+val BG_COLOR: u32 = 0xFFF5F5F5
+val SERIAL_DATA: u16 = 0x3F8
+val SERIAL_LSR: u16 = 0x3FD
+val DEBUG_EXIT: u16 = 0xF4
+
+fn serial_wait_ready():
+    var guard: i64 = 100000
+    while guard > 0:
+        if (rt_port_inb(SERIAL_LSR) & 0x20) != 0:
+            return
+        guard = guard - 1
+
+fn serial_put(ch: u8):
+    rt_port_outb(SERIAL_DATA, ch)
+
+fn serial_newline():
+    serial_put(13)
+    serial_put(10)
+
+fn write_browser_start():
+    serial_put(91)
+    serial_put(98)
+    serial_put(114)
+    serial_put(111)
+    serial_put(119)
+    serial_put(115)
+    serial_put(101)
+    serial_put(114)
+    serial_put(45)
+    serial_put(115)
+    serial_put(111)
+    serial_put(102)
+    serial_put(116)
+    serial_put(93)
+    serial_put(32)
+    serial_put(115)
+    serial_put(116)
+    serial_put(97)
+    serial_put(114)
+    serial_put(116)
+    serial_newline()
+
+fn write_browser_stage_dom():
+    serial_put(91)
+    serial_put(98)
+    serial_put(114)
+    serial_put(111)
+    serial_put(119)
+    serial_put(115)
+    serial_put(101)
+    serial_put(114)
+    serial_put(45)
+    serial_put(115)
+    serial_put(111)
+    serial_put(102)
+    serial_put(116)
+    serial_put(93)
+    serial_put(32)
+    serial_put(100)
+    serial_put(111)
+    serial_put(109)
+    serial_newline()
+
+fn write_browser_stage_layout():
+    serial_put(91)
+    serial_put(98)
+    serial_put(114)
+    serial_put(111)
+    serial_put(119)
+    serial_put(115)
+    serial_put(101)
+    serial_put(114)
+    serial_put(45)
+    serial_put(115)
+    serial_put(111)
+    serial_put(102)
+    serial_put(116)
+    serial_put(93)
+    serial_put(32)
+    serial_put(108)
+    serial_put(97)
+    serial_put(121)
+    serial_put(111)
+    serial_put(117)
+    serial_put(116)
+    serial_newline()
+
+fn write_browser_stage_paint():
+    serial_put(91)
+    serial_put(98)
+    serial_put(114)
+    serial_put(111)
+    serial_put(119)
+    serial_put(115)
+    serial_put(101)
+    serial_put(114)
+    serial_put(45)
+    serial_put(115)
+    serial_put(111)
+    serial_put(102)
+    serial_put(116)
+    serial_put(93)
+    serial_put(32)
+    serial_put(112)
+    serial_put(97)
+    serial_put(105)
+    serial_put(110)
+    serial_put(116)
+    serial_newline()
+
+fn write_browser_stage_scene():
+    serial_put(91)
+    serial_put(98)
+    serial_put(114)
+    serial_put(111)
+    serial_put(119)
+    serial_put(115)
+    serial_put(101)
+    serial_put(114)
+    serial_put(45)
+    serial_put(115)
+    serial_put(111)
+    serial_put(102)
+    serial_put(116)
+    serial_put(93)
+    serial_put(32)
+    serial_put(115)
+    serial_put(99)
+    serial_put(101)
+    serial_put(110)
+    serial_put(101)
+    serial_newline()
+
+fn write_browser_stage_raster():
+    serial_put(91)
+    serial_put(98)
+    serial_put(114)
+    serial_put(111)
+    serial_put(119)
+    serial_put(115)
+    serial_put(101)
+    serial_put(114)
+    serial_put(45)
+    serial_put(115)
+    serial_put(111)
+    serial_put(102)
+    serial_put(116)
+    serial_put(93)
+    serial_put(32)
+    serial_put(114)
+    serial_put(97)
+    serial_put(115)
+    serial_put(116)
+    serial_put(101)
+    serial_put(114)
+    serial_newline()
+
+fn write_browser_pass():
+    serial_put(91)
+    serial_put(80)
+    serial_put(65)
+    serial_put(83)
+    serial_put(83)
+    serial_put(93)
+    serial_put(32)
+    serial_put(98)
+    serial_put(114)
+    serial_put(111)
+    serial_put(119)
+    serial_put(115)
+    serial_put(101)
+    serial_put(114)
+    serial_put(95)
+    serial_put(115)
+    serial_put(111)
+    serial_put(102)
+    serial_put(116)
+    serial_put(95)
+    serial_put(101)
+    serial_put(110)
+    serial_put(116)
+    serial_put(114)
+    serial_put(121)
+    serial_newline()
+    serial_put(84)
+    serial_put(69)
+    serial_put(83)
+    serial_put(84)
+    serial_put(32)
+    serial_put(80)
+    serial_put(65)
+    serial_put(83)
+    serial_put(83)
+    serial_put(69)
+    serial_put(68)
+    serial_newline()
+
+fn write_browser_fail():
+    serial_put(91)
+    serial_put(70)
+    serial_put(65)
+    serial_put(73)
+    serial_put(76)
+    serial_put(93)
+    serial_put(32)
+    serial_put(98)
+    serial_put(114)
+    serial_put(111)
+    serial_put(119)
+    serial_put(115)
+    serial_put(101)
+    serial_put(114)
+    serial_put(95)
+    serial_put(115)
+    serial_put(111)
+    serial_put(102)
+    serial_put(116)
+    serial_put(95)
+    serial_put(101)
+    serial_put(110)
+    serial_put(116)
+    serial_put(114)
+    serial_put(121)
+    serial_newline()
+    serial_put(84)
+    serial_put(69)
+    serial_put(83)
+    serial_put(84)
+    serial_put(32)
+    serial_put(70)
+    serial_put(65)
+    serial_put(73)
+    serial_put(76)
+    serial_put(69)
+    serial_put(68)
+    serial_newline()
+
+fn build_dom() -> BeDomNode:
+    var root = BeDomNode.element("div")
+    root.set_style("background-color", "#f5f5f5")
+
+    var green_box = BeDomNode.element("div")
+    green_box.set_style("width", "200")
+    green_box.set_style("height", "50")
+    green_box.set_style("background-color", "#22aa44")
+    root.add_child(green_box)
+
+    var blue_box = BeDomNode.element("div")
+    blue_box.set_style("width", "160")
+    blue_box.set_style("height", "36")
+    blue_box.set_style("margin-top", "8")
+    blue_box.set_style("background-color", "#1d4ed8")
+    root.add_child(blue_box)
+
+    return root
+
+fn init_buffer(width: i32, height: i32, bg: u32) -> [u32]:
+    var buffer: [u32] = []
+    var i: i32 = 0
+    val total = width * height
+    while i < total:
+        buffer = buffer + [bg]
+        i = i + 1
+    return buffer
+
+fn count_non_background_pixels(buffer: [u32], bg: u32) -> i32:
+    var count: i32 = 0
+    var i: i32 = 0
+    while i < buffer.len():
+        if buffer[i] != bg:
+            count = count + 1
+        i = i + 1
+    return count
+
+fn run_browser_pipeline() -> i32:
+    val dom = build_dom()
+    rt_port_outb(SERIAL_DATA, 99)
+
+    val layout = layout_tree(dom, VIEWPORT_W, VIEWPORT_H)
+    rt_port_outb(SERIAL_DATA, 100)
+
+    val commands = generate_paint_list(layout)
+    rt_port_outb(SERIAL_DATA, 101)
+
+    val scene = paint_commands_to_scene(commands, VIEWPORT_W, VIEWPORT_H)
+    rt_port_outb(SERIAL_DATA, 102)
+
+    var buffer = init_buffer(VIEWPORT_W, VIEWPORT_H, BG_COLOR)
+    rt_port_outb(SERIAL_DATA, 103)
+    execute_scene_to_buffer(scene, buffer, VIEWPORT_W, VIEWPORT_H)
+    rt_port_outb(SERIAL_DATA, 104)
+
+    val visible = count_non_background_pixels(buffer, BG_COLOR)
+    return visible
+
+fn browser_soft_leaf_probe() -> i32:
+    rt_port_outb(SERIAL_DATA, 98)
+    return 1
+
+fn spl_start():
+    write_browser_start()
+    val leaf_ok = browser_soft_leaf_probe()
+    if leaf_ok == 0:
+        write_browser_fail()
+        rt_port_outb(DEBUG_EXIT, 0)
+        return
+
+    val visible = run_browser_pipeline()
+    if visible > 0:
+        write_browser_pass()
+    else:
+        write_browser_fail()
+    rt_port_outb(DEBUG_EXIT, 0)

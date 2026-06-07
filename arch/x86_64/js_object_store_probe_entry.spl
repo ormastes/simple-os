@@ -1,0 +1,111 @@
+#![allow(unnamed_duplicate_typed_args)]
+
+use os.kernel.arch.x86_64.console.{serial_init, serial_writeln}
+use os.kernel.arch.x86_64.interrupt.{X86Interrupt}
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_early_init}
+use os.kernel.abi.syscall_shim.{shim_init}
+use os.kernel.scheduler.scheduler.{Scheduler}
+use os.kernel.ipc.ipc.{IpcManager}
+use os.kernel.log.klog.{KernelLog}
+use std.js.engine.vm.{ObjectStore}
+use std.js.types.js_types.{JsValue}
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+
+fn _probe() -> Result<bool, text>:
+    var store = ObjectStore.new()
+    val obj_id = store.create_object()
+
+    store.set_property(obj_id, "alpha", JsValue.String(v: "A"))
+    store.set_property(obj_id, "count", JsValue.Number(v: 2.0))
+    store.set_property(obj_id, "count", JsValue.Number(v: 5.0))
+
+    if val JsValue.String(v) = store.get_property(obj_id, "alpha"):
+        if v != "A":
+            return Err("alpha value mismatch")
+    else:
+        return Err("alpha property missing or wrong type")
+
+    if val JsValue.Number(v) = store.get_property(obj_id, "count"):
+        if v != 5.0:
+            return Err("count latest-write mismatch")
+    else:
+        return Err("count property missing or wrong type")
+
+    store.remove_property(obj_id, "alpha")
+    if val JsValue.Undefined = store.get_property(obj_id, "alpha"):
+        pass_dn
+    else:
+        return Err("remove_property did not tombstone alpha")
+
+    val array_id = store.create_array_from([JsValue.Number(v: 3.0), JsValue.Number(v: 4.0)])
+    if val JsValue.Number(v) = store.get_by_index(array_id, 1):
+        if v != 4.0:
+            return Err("array index mismatch")
+    else:
+        return Err("array index missing or wrong type")
+
+    # Browser-like object churn: advance ids and store longer HTML/text values.
+    var warmup = 0
+    while warmup < 12:
+        val _unused = store.create_object()
+        warmup = warmup + 1
+    val browser_obj_id = store.create_object()
+    # Guest local i64 object-id returns are still unreliable around boxed-id boundaries.
+    # Use store.next_id as the stable expected id source for ref-persistence assertions.
+    val nested_obj_expected = store.next_id
+    val nested_obj_id = store.create_object()
+    val nested_array_expected = store.next_id
+    val nested_array_id = store.create_object()
+    val nested_function_expected = store.next_id
+    val nested_function_id = store.create_object()
+    val nested_symbol_expected = store.next_id
+    val nested_symbol_id = store.create_object()
+    store.set_property(browser_obj_id, "innerHTML", JsValue.String(v: "boot<script>document.title='Runtime Ready';document.body.innerHTML='runtime fetch ok';</script>"))
+    store.set_property(browser_obj_id, "textContent", JsValue.String(v: "runtime fetch ok"))
+    store.set_object_property_ref(browser_obj_id, "location", nested_obj_id)
+    store.set_property(nested_array_id, "0", JsValue.Number(v: 7.0))
+    store.set_property(nested_array_id, "1", JsValue.Number(v: 9.0))
+    store.set_property(nested_array_id, "length", JsValue.Number(v: 2.0))
+    store.set_array_property_ref(browser_obj_id, "children", nested_array_id)
+    store.set_function_property_ref(browser_obj_id, "onclick", nested_function_id)
+    store.set_symbol_property_ref(browser_obj_id, "token", nested_symbol_id)
+
+    if val JsValue.String(v) = store.get_property(browser_obj_id, "innerHTML"):
+        if not v.contains("Runtime Ready"):
+            return Err("browser-like innerHTML value mismatch")
+    else:
+        return Err("browser-like innerHTML property missing or wrong type")
+
+    val location_ref = store.get_object_property_ref_text(browser_obj_id, "location")
+    if location_ref != "{nested_obj_expected}":
+        return Err("browser-like nested object id mismatch")
+    val children_ref = store.get_array_property_ref_text(browser_obj_id, "children")
+    if children_ref != "{nested_array_expected}":
+        return Err("browser-like nested array id mismatch")
+    val onclick_ref = store.get_function_property_ref_text(browser_obj_id, "onclick")
+    if onclick_ref != "{nested_function_expected}":
+        return Err("browser-like nested function id mismatch")
+    val token_ref = store.get_symbol_property_ref_text(browser_obj_id, "token")
+    if token_ref != "{nested_symbol_expected}":
+        return Err("browser-like nested symbol id mismatch")
+
+    Ok(true)
+
+fn _start():
+    serial_init()
+    serial_writeln("SimpleOS x86_64 JS ObjectStore probe")
+
+    arch_x86_64_early_init()
+    shim_init(Scheduler.new(), IpcManager.new(), KernelLog.new(128))
+    if not X86Interrupt.runtime_installed():
+        X86Interrupt.install_bootstrap_runtime(64)
+
+    match _probe():
+        Ok(_) =>
+            serial_println("[JSO] ObjectStore probe passed")
+        Err(e) =>
+            serial_println("[JSO] ObjectStore probe failed: {e}")
+
+    rt_port_outb(0xf4, 0u8)

@@ -1,0 +1,46 @@
+# Hello World for SimpleOS
+#
+# Minimal application that prints "Hello from SimpleOS!" via serial output.
+# Uses DebugWrite syscall (60) directly — no VFS, no POSIX, no stdlib.
+#
+# This is the Phase 4 milestone test: if this prints to QEMU serial,
+# the SimpleOS platform is working end-to-end.
+
+extern fn serial_println(msg: text)
+extern fn serial_print(msg: text)
+
+# Syscall 60 = DebugWrite: write a byte to serial output
+# In the baremetal runtime, serial_println maps to this.
+
+fn main():
+    serial_println("========================================")
+    serial_println("  Hello from SimpleOS!")
+    serial_println("========================================")
+    serial_println("")
+    serial_println("SimpleOS L4/Exokernel Platform")
+    serial_println("Pure Simple Language Runtime")
+    serial_println("")
+
+    # Print system info
+    serial_println("[hello] Testing basic operations...")
+
+    # Test arithmetic
+    val a: i64 = 42
+    val b: i64 = 58
+    val sum = a + b
+    serial_println("[hello] 42 + 58 = {sum}")
+
+    # Test string operations
+    val name = "SimpleOS"
+    serial_println("[hello] Running on: {name}")
+
+    # Test loop
+    var i: i64 = 0
+    while i < 5:
+        serial_println("[hello] Counter: {i}")
+        i = i + 1
+
+    serial_println("")
+    serial_println("[hello] All tests passed!")
+    serial_println("========================================")
+    serial_println("TEST PASSED")

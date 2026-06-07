@@ -1,0 +1,29 @@
+# ARM64 QEMU WM shared-MDI evidence contract.
+#
+# This stays pure Simple so the AArch64-HVF lane can report the same MDI model
+# and backend evidence markers without depending on hosted or Rust glue.
+
+use os.compositor.shared_mdi_setup.{shared_mdi_surfaces}
+
+class Arm64WmSharedMdiEvidence:
+    surface_count: i32
+    simple_web_surface_count: i32
+    backend_kind: text
+    fallback_reason: text
+    readback_status: text
+    renderer_path: text
+    first_title: text
+    focused_title: text
+
+fn arm64_wm_shared_mdi_evidence(width: i32, height: i32) -> Arm64WmSharedMdiEvidence:
+    val surfaces = shared_mdi_surfaces()
+    Arm64WmSharedMdiEvidence(
+        surface_count: surfaces.len(),
+        simple_web_surface_count: surfaces.len(),
+        backend_kind: "qemu-aarch64-hvf-framebuffer-cpu-simd",
+        fallback_reason: "",
+        readback_status: "qmp-screendump-required",
+        renderer_path: "shared_mdi_framebuffer_scene",
+        first_title: "Terminal",
+        focused_title: "Calculator"
+    )

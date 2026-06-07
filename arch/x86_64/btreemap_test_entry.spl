@@ -1,0 +1,175 @@
+"""
+x86_64 BTreeMap Boot Test Entry — B1 QEMU Smoke Gate
+
+Boots SimpleOS, exercises the BTreeMap/BTreeSet C-backed implementation that
+lives in `collections.c` and `hashmap.c`.  Those files contained copy-pasted
+RuntimeValue macros (TAG_MASK, ENCODE_INT/PTR, IS_INT/HEAP/NIL, NIL_VALUE,
+HeapHeader).  The B1 refactor deletes the copies and adds:
+
+    #include "../../common/baremetal_runtime.h"
+
+This test MUST pass after that change, proving the macro include-swap does not
+silently break the ENCODE/DECODE round-trip at boot time.
+
+Pattern: follows `fs_test_entry.spl` — each test calls `serial_println` with a
+PASS/FAIL marker.  The QEMU smoke harness scans stdout for "FAIL" to detect
+regressions.
+
+Run via:
+    sh scripts/check/check-freebsd-bootstrap-qemu.shs --smoke
+"""
+
+extern fn serial_println(msg: text)
+extern fn rt_println_value(msg: text)
+extern fn __rt_btreemap_new() -> i64
+extern fn __rt_btreemap_insert(handle: i64, key: text, value: Any) -> bool
+extern fn __rt_btreemap_get(handle: i64, key: text) -> Any
+extern fn __rt_btreemap_contains_key(handle: i64, key: text) -> bool
+extern fn __rt_btreemap_remove(handle: i64, key: text) -> Any
+extern fn __rt_btreemap_len(handle: i64) -> i64
+extern fn __rt_btreemap_clear(handle: i64) -> bool
+extern fn __rt_btreemap_first_key(handle: i64) -> Any
+extern fn __rt_btreemap_last_key(handle: i64) -> Any
+extern fn __rt_btreeset_new() -> i64
+extern fn __rt_btreeset_insert(handle: i64, value: text) -> bool
+extern fn __rt_btreeset_contains(handle: i64, value: text) -> bool
+extern fn __rt_btreeset_remove(handle: i64, value: text) -> bool
+extern fn __rt_btreeset_len(handle: i64) -> i64
+extern fn __rt_btreeset_first(handle: i64) -> Any
+extern fn __rt_btreeset_last(handle: i64) -> Any
+
+fn check(label: text, ok: bool):
+    if ok:
+        serial_println("PASS: " + label)
+    else:
+        serial_println("FAIL: " + label)
+
+fn _start():
+    serial_println("=== BTreeMap Boot Test (B1 macro-include gate) ===")
+
+    # ---- BTreeMap: basic insert / lookup / remove ---------------------------
+    val m = __rt_btreemap_new()
+    check("btreemap new produces empty map", __rt_btreemap_len(m) == 0)
+
+    _ = __rt_btreemap_insert(m, "alpha", 1)
+    _ = __rt_btreemap_insert(m, "beta", 2)
+    _ = __rt_btreemap_insert(m, "gamma", 3)
+    check("btreemap len after 3 inserts", __rt_btreemap_len(m) == 3)
+
+    val got_alpha = __rt_btreemap_get(m, "alpha")
+    check("btreemap get alpha == 1", got_alpha == 1)
+
+    val got_beta = __rt_btreemap_get(m, "beta")
+    check("btreemap get beta == 2", got_beta == 2)
+
+    val got_gamma = __rt_btreemap_get(m, "gamma")
+    check("btreemap get gamma == 3", got_gamma == 3)
+
+    check("btreemap contains_key alpha", __rt_btreemap_contains_key(m, "alpha") == true)
+    check("btreemap missing key absent", __rt_btreemap_contains_key(m, "absent") == false)
+
+    # ---- BTreeMap: sorted-order guarantees (exercises DECODE_PTR / IS_HEAP) -
+    check("btreemap first_key is alpha", __rt_btreemap_first_key(m) == "alpha")
+    check("btreemap last_key is gamma", __rt_btreemap_last_key(m) == "gamma")
+
+    # ---- BTreeMap: remove ---------------------------------------------------
+    _ = __rt_btreemap_remove(m, "beta")
+    check("btreemap len after remove", __rt_btreemap_len(m) == 2)
+    check("btreemap beta gone after remove", __rt_btreemap_contains_key(m, "beta") == false)
+    check("btreemap alpha still present", __rt_btreemap_contains_key(m, "alpha") == true)
+
+    # ---- BTreeMap: remove non-existent (no-op, no crash) --------------------
+    _ = __rt_btreemap_remove(m, "ghost")
+    check("btreemap remove ghost no-op len stays 2", __rt_btreemap_len(m) == 2)
+
+    # ---- BTreeMap: double-insert last-value-wins ----------------------------
+    _ = __rt_btreemap_insert(m, "alpha", 99)
+    check("btreemap double-insert len stays 2", __rt_btreemap_len(m) == 2)
+    val got_alpha2 = __rt_btreemap_get(m, "alpha")
+    check("btreemap double-insert last value wins", got_alpha2 == 99)
+
+    # ---- BTreeMap: 32-entry stress (exercises BTree node splits) ------------
+    val m2 = __rt_btreemap_new()
+    _ = __rt_btreemap_insert(m2, "k00", 0)
+    _ = __rt_btreemap_insert(m2, "k01", 1)
+    _ = __rt_btreemap_insert(m2, "k02", 2)
+    _ = __rt_btreemap_insert(m2, "k03", 3)
+    _ = __rt_btreemap_insert(m2, "k04", 4)
+    _ = __rt_btreemap_insert(m2, "k05", 5)
+    _ = __rt_btreemap_insert(m2, "k06", 6)
+    _ = __rt_btreemap_insert(m2, "k07", 7)
+    _ = __rt_btreemap_insert(m2, "k08", 8)
+    _ = __rt_btreemap_insert(m2, "k09", 9)
+    _ = __rt_btreemap_insert(m2, "k10", 10)
+    _ = __rt_btreemap_insert(m2, "k11", 11)
+    _ = __rt_btreemap_insert(m2, "k12", 12)
+    _ = __rt_btreemap_insert(m2, "k13", 13)
+    _ = __rt_btreemap_insert(m2, "k14", 14)
+    _ = __rt_btreemap_insert(m2, "k15", 15)
+    _ = __rt_btreemap_insert(m2, "k16", 16)
+    _ = __rt_btreemap_insert(m2, "k17", 17)
+    _ = __rt_btreemap_insert(m2, "k18", 18)
+    _ = __rt_btreemap_insert(m2, "k19", 19)
+    _ = __rt_btreemap_insert(m2, "k20", 20)
+    _ = __rt_btreemap_insert(m2, "k21", 21)
+    _ = __rt_btreemap_insert(m2, "k22", 22)
+    _ = __rt_btreemap_insert(m2, "k23", 23)
+    _ = __rt_btreemap_insert(m2, "k24", 24)
+    _ = __rt_btreemap_insert(m2, "k25", 25)
+    _ = __rt_btreemap_insert(m2, "k26", 26)
+    _ = __rt_btreemap_insert(m2, "k27", 27)
+    _ = __rt_btreemap_insert(m2, "k28", 28)
+    _ = __rt_btreemap_insert(m2, "k29", 29)
+    _ = __rt_btreemap_insert(m2, "k30", 30)
+    _ = __rt_btreemap_insert(m2, "k31", 31)
+    check("btreemap 32-entry len", __rt_btreemap_len(m2) == 32)
+    check("btreemap 32-entry first key", __rt_btreemap_first_key(m2) == "k00")
+    check("btreemap 32-entry last key", __rt_btreemap_last_key(m2) == "k31")
+    val got_k15 = __rt_btreemap_get(m2, "k15")
+    check("btreemap 32-entry spot check k15", got_k15 == 15)
+
+    # ---- BTreeMap: clear ----------------------------------------------------
+    _ = __rt_btreemap_clear(m2)
+    check("btreemap clear empties map", __rt_btreemap_len(m2) == 0)
+    _ = __rt_btreemap_insert(m2, "after_clear", 1)
+    check("btreemap re-insert after clear works", __rt_btreemap_len(m2) == 1)
+
+    # ---- BTreeSet: basic insert / contains / remove -------------------------
+    val s = __rt_btreeset_new()
+    check("btreeset new produces empty set", __rt_btreeset_len(s) == 0)
+
+    _ = __rt_btreeset_insert(s, "apple")
+    _ = __rt_btreeset_insert(s, "banana")
+    _ = __rt_btreeset_insert(s, "cherry")
+    check("btreeset len after 3 inserts", __rt_btreeset_len(s) == 3)
+
+    check("btreeset contains apple", __rt_btreeset_contains(s, "apple") == true)
+    check("btreeset not contains durian", __rt_btreeset_contains(s, "durian") == false)
+
+    check("btreeset first is apple", __rt_btreeset_first(s) == "apple")
+    check("btreeset last is cherry", __rt_btreeset_last(s) == "cherry")
+
+    _ = __rt_btreeset_remove(s, "banana")
+    check("btreeset len after remove", __rt_btreeset_len(s) == 2)
+    check("btreeset banana gone", __rt_btreeset_contains(s, "banana") == false)
+
+    # ---- BTreeSet: duplicate insert is idempotent ---------------------------
+    _ = __rt_btreeset_insert(s, "apple")
+    check("btreeset dup insert len stays 2", __rt_btreeset_len(s) == 2)
+
+    # ---- Hashmap.c macro cross-check: IS_INT/IS_HEAP parity -----------------
+    # hashmap.c uses ENCODE_INT / IS_INT for integer keys.  The following
+    # test encodes integer keys as text keys and retrieves them through the
+    # btreemap (backed by collections.c which uses IS_HEAP for string values).
+    # A macro mismatch between hashmap.c and collections.c would cause wrong
+    # tag interpretation and corrupt results.
+    val mh = __rt_btreemap_new()
+    _ = __rt_btreemap_insert(mh, "int_key_0", 0)
+    _ = __rt_btreemap_insert(mh, "int_key_1", 1)
+    val v0 = __rt_btreemap_get(mh, "int_key_0")
+    val v1 = __rt_btreemap_get(mh, "int_key_1")
+    check("hashmap macro cross-check: int_key_0 == 0", v0 == 0)
+    check("hashmap macro cross-check: int_key_1 == 1", v1 == 1)
+
+    serial_println("=== BTreeMap Boot Test DONE ===")
+    rt_println_value("BTreeMap boot test complete")

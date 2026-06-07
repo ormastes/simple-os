@@ -1,0 +1,147 @@
+#![allow(unnamed_duplicate_typed_args)]
+# gui_test.spl — SimpleOS Desktop GUI (VGA window, low-res render)
+#
+# Creates a 640x480 window but renders at 160x120 internal resolution.
+# Softbuffer nearest-neighbor scales the pixels up automatically.
+#
+# Run with:
+#   SIMPLE_GUI=1 SIMPLE_TIMEOUT_SECONDS=120 bin/simple examples/simple_os/hosted/gui_test.spl
+
+extern fn rt_winit_event_loop_new() -> i64
+extern fn rt_winit_window_new(el: i64, w: i64, h: i64, title: text) -> i64
+extern fn rt_winit_event_loop_poll_events(el: i64, max: i64) -> i64
+extern fn rt_winit_event_get_type(ev: i64) -> i64
+extern fn rt_winit_event_keyboard_input(ev: i64) -> (i64, i64, bool)
+extern fn rt_winit_event_mouse_moved(ev: i64) -> (i64, i64)
+extern fn rt_winit_event_free(ev: i64)
+extern fn rt_winit_window_present_rgba(win: i64, w: i64, h: i64, pixels: [i64])
+extern fn rt_winit_window_free(win: i64)
+extern fn rt_winit_event_loop_free(el: i64)
+extern fn rt_thread_sleep(ms: i64)
+
+# Window size (VGA)
+val WIN_W: i64 = 640
+val WIN_H: i64 = 480
+
+# Internal render resolution
+val W: i64 = 160
+val H: i64 = 120
+
+# Event types
+val EVT_CLOSE: i64 = 3
+val EVT_KEYBOARD: i64 = 10
+
+fn px(r: i64, g: i64, b: i64) -> i64:
+    (255 << 24) | (r << 16) | (g << 8) | b
+
+# Compute pixel color based on position (no mutation needed)
+fn pixel_color(x: i64, y: i64) -> i64:
+    val BG = px(26, 27, 46)
+    val TITLEBAR = px(24, 24, 37)
+    val WIN_TITLE = px(0, 122, 204)
+    val WIN_CLOSE = px(231, 76, 60)
+    val WIN_BODY = px(255, 255, 255)
+    val WIN_STATUS = px(200, 200, 200)
+    val RED = px(255, 68, 68)
+    val GREEN = px(68, 204, 68)
+    val BLUE = px(68, 136, 255)
+    val DOCK1 = px(52, 152, 219)
+    val DOCK2 = px(39, 174, 96)
+    val DOCK3 = px(231, 76, 60)
+    val DOCK4 = px(243, 156, 18)
+    val DOCK5 = px(155, 89, 182)
+    val TERM_BG = px(30, 30, 50)
+    val TERM_TITLE = px(80, 80, 80)
+    val TERM_GREEN = px(68, 255, 68)
+    val TERM_GRAY = px(170, 170, 170)
+
+    # Taskbar (bottom 14px)
+    if y >= H - 14:
+        # Dock icons (10x10 starting at y = H-12)
+        val iy = H - 12
+        if y >= iy and y < iy + 10:
+            if x >= 4 and x < 14: return DOCK1
+            if x >= 16 and x < 26: return DOCK2
+            if x >= 28 and x < 38: return DOCK3
+            if x >= 40 and x < 50: return DOCK4
+            if x >= 52 and x < 62: return DOCK5
+        return TITLEBAR
+
+    # System title bar (top 10px)
+    if y < 10:
+        return TITLEBAR
+
+    # Terminal window (behind, at x=70..150, y=30..90)
+    if x >= 70 and x < 150:
+        if y >= 30 and y < 40: return TERM_TITLE
+        if y >= 40 and y < 90:
+            # Terminal text lines
+            if y == 44 and x >= 74 and x < 114: return TERM_GREEN
+            if y == 48 and x >= 74 and x < 134: return TERM_GRAY
+            if y == 52 and x >= 74 and x < 124: return TERM_GRAY
+            if y == 56 and x >= 74 and x < 104: return px(85, 136, 204)
+            if y == 60 and x >= 74 and x < 79: return TERM_GREEN
+            return TERM_BG
+
+    # Hello World window (on top, at x=10..100, y=14..84)
+    if x >= 10 and x < 100:
+        # Title bar
+        if y >= 14 and y < 24:
+            if x >= 92 and x < 98: return WIN_CLOSE
+            return WIN_TITLE
+        # Window body
+        if y >= 24 and y < 84:
+            # RGB color blocks
+            if y >= 42 and y < 56:
+                if x >= 15 and x < 39: return RED
+                if x >= 43 and x < 67: return GREEN
+                if x >= 71 and x < 95: return BLUE
+            # Status bar
+            if y >= 74 and y < 84: return WIN_STATUS
+            return WIN_BODY
+
+    return BG
+
+fn main() -> i64:
+    print "SimpleOS Desktop ({WIN_W}x{WIN_H} window, {W}x{H} render)"
+    print "Press Escape to quit"
+
+    val el = rt_winit_event_loop_new()
+    val win = rt_winit_window_new(el, WIN_W, WIN_H, "SimpleOS Desktop")
+    if win == 0:
+        print "ERROR: Window creation failed (set SIMPLE_GUI=1)"
+        return 1
+
+    # Build pixel buffer — each pixel computed functionally (no array mutation)
+    print "Rendering desktop..."
+    var pixels = [for i in 0..(W * H): pixel_color(i % W, i / W)]
+    print "Desktop rendered ({pixels.len()} pixels)"
+
+    # Present
+    rt_winit_window_present_rgba(win, W, H, pixels)
+    print "Frame presented!"
+
+    # Event loop
+    var running = true
+    var frame: i64 = 0
+
+    while running:
+        var ev = rt_winit_event_loop_poll_events(el, 100)
+        while ev != 0:
+            val etype = rt_winit_event_get_type(ev)
+            if etype == EVT_CLOSE:
+                running = false
+            else if etype == EVT_KEYBOARD:
+                val (scancode, keycode, pressed) = rt_winit_event_keyboard_input(ev)
+                if pressed and (keycode == 27 or keycode == 9):
+                    running = false
+            rt_winit_event_free(ev)
+            ev = rt_winit_event_loop_poll_events(el, 100)
+
+        frame = frame + 1
+        rt_thread_sleep(100)
+
+    print "Exited after {frame} frames"
+    rt_winit_window_free(win)
+    rt_winit_event_loop_free(el)
+    return 0

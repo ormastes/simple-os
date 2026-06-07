@@ -1,0 +1,204 @@
+# x86_32 FAT32 initrd filesystem-backed app execution probe.
+#
+# The live QEMU lane supplies a FAT32 app image as a Multiboot module. The
+# freestanding boot stub captures the module and exposes narrow payload probes.
+
+extern fn rt_x86_32_initrd_present() -> u32
+extern fn rt_x86_32_initrd_contains_hello_smf() -> u32
+extern fn rt_x86_32_initrd_contains_browser_smf() -> u32
+extern fn rt_x86_32_initrd_contains_x86_32_marker() -> u32
+extern fn rt_x86_32_install_int80_probe()
+extern fn rt_x86_32_trigger_int80(id: u32, arg0: u32, arg1: u32, arg2: u32, arg3: u32, arg4: u32, arg5: u32) -> i32
+extern fn rt_port_outb(port: u16, value: u8)
+
+val DEBUG_EXIT: u16 = 0xF4
+
+fn serial_put(ch: u8):
+    rt_port_outb(0x3F8 as u16, ch)
+
+fn serial_newline():
+    serial_put(13u8)
+    serial_put(10u8)
+
+fn write_prefix():
+    serial_put(91u8)
+    serial_put(120u8)
+    serial_put(56u8)
+    serial_put(54u8)
+    serial_put(95u8)
+    serial_put(51u8)
+    serial_put(50u8)
+    serial_put(32u8)
+    serial_put(102u8)
+    serial_put(115u8)
+    serial_put(93u8)
+    serial_put(32u8)
+
+fn write_ok():
+    serial_put(111u8)
+    serial_put(107u8)
+    serial_newline()
+
+fn write_fail_marker():
+    write_prefix()
+    serial_put(102u8)
+    serial_put(97u8)
+    serial_put(105u8)
+    serial_put(108u8)
+    serial_newline()
+
+fn write_initrd_marker():
+    write_prefix()
+    serial_put(105u8)
+    serial_put(110u8)
+    serial_put(105u8)
+    serial_put(116u8)
+    serial_put(114u8)
+    serial_put(100u8)
+    serial_put(32u8)
+    serial_put(102u8)
+    serial_put(97u8)
+    serial_put(116u8)
+    serial_put(51u8)
+    serial_put(50u8)
+    serial_put(32u8)
+    write_ok()
+
+fn write_hello_marker():
+    write_prefix()
+    serial_put(104u8)
+    serial_put(101u8)
+    serial_put(108u8)
+    serial_put(108u8)
+    serial_put(111u8)
+    serial_put(95u8)
+    serial_put(119u8)
+    serial_put(111u8)
+    serial_put(114u8)
+    serial_put(108u8)
+    serial_put(100u8)
+    serial_put(32u8)
+    serial_put(115u8)
+    serial_put(109u8)
+    serial_put(102u8)
+    serial_put(32u8)
+    write_ok()
+
+fn write_browser_marker():
+    write_prefix()
+    serial_put(98u8)
+    serial_put(114u8)
+    serial_put(111u8)
+    serial_put(119u8)
+    serial_put(115u8)
+    serial_put(101u8)
+    serial_put(114u8)
+    serial_put(32u8)
+    serial_put(115u8)
+    serial_put(109u8)
+    serial_put(102u8)
+    serial_put(32u8)
+    write_ok()
+
+fn write_arch_marker():
+    write_prefix()
+    serial_put(120u8)
+    serial_put(56u8)
+    serial_put(54u8)
+    serial_put(95u8)
+    serial_put(51u8)
+    serial_put(50u8)
+    serial_put(32u8)
+    serial_put(112u8)
+    serial_put(97u8)
+    serial_put(121u8)
+    serial_put(108u8)
+    serial_put(111u8)
+    serial_put(97u8)
+    serial_put(100u8)
+    serial_put(32u8)
+    write_ok()
+
+fn write_exec_marker():
+    write_prefix()
+    serial_put(97u8)
+    serial_put(112u8)
+    serial_put(112u8)
+    serial_put(32u8)
+    serial_put(101u8)
+    serial_put(120u8)
+    serial_put(101u8)
+    serial_put(99u8)
+    serial_put(117u8)
+    serial_put(116u8)
+    serial_put(105u8)
+    serial_put(111u8)
+    serial_put(110u8)
+    serial_put(32u8)
+    write_ok()
+
+fn write_test_passed_marker():
+    serial_put(84u8)
+    serial_put(69u8)
+    serial_put(83u8)
+    serial_put(84u8)
+    serial_put(32u8)
+    serial_put(80u8)
+    serial_put(65u8)
+    serial_put(83u8)
+    serial_put(83u8)
+    serial_put(69u8)
+    serial_put(68u8)
+    serial_newline()
+
+fn x86_32_dispatch_installed_syscall_abi(id: u32, arg0: u32, arg1: u32, arg2: u32, arg3: u32, arg4: u32, arg5: u32) -> i32:
+    _ = arg1
+    _ = arg2
+    _ = arg3
+    _ = arg4
+    _ = arg5
+    if id == 13u32 and arg0 == 3u32:
+        if rt_x86_32_initrd_contains_hello_smf() != 0u32 and rt_x86_32_initrd_contains_x86_32_marker() != 0u32:
+            return 2001
+        return -2
+    if id == 13u32 and arg0 == 1u32:
+        if rt_x86_32_initrd_contains_browser_smf() != 0u32 and rt_x86_32_initrd_contains_x86_32_marker() != 0u32:
+            return 2002
+        return -2
+    -38
+
+fn spl_start():
+    if rt_x86_32_initrd_present() == 0u32:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    write_initrd_marker()
+
+    if rt_x86_32_initrd_contains_hello_smf() == 0u32:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    write_hello_marker()
+
+    if rt_x86_32_initrd_contains_browser_smf() == 0u32:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    write_browser_marker()
+
+    if rt_x86_32_initrd_contains_x86_32_marker() == 0u32:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    write_arch_marker()
+
+    rt_x86_32_install_int80_probe()
+    val hello_pid = rt_x86_32_trigger_int80(13u32, 3u32, 0u32, 0u32, 0u32, 0u32, 0u32)
+    val browser_pid = rt_x86_32_trigger_int80(13u32, 1u32, 0u32, 0u32, 0u32, 0u32, 0u32)
+    if hello_pid <= 0 or browser_pid <= 0:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    write_exec_marker()
+    write_test_passed_marker()
+    rt_port_outb(DEBUG_EXIT, 0u8)

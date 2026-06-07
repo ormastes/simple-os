@@ -1,0 +1,75 @@
+# null_block — SimpleOS compatibility wrapper.
+#
+# The reference implementation lives in std.driver.null_block_driver so tests
+# and SimpleOS examples depend on the stdlib driver contract, not the reverse.
+
+use std.driver.error.{DriverError}
+use std.driver.registry.{DriverOps}
+use std.driver.types.{DriverClass, DriverHandle, DriverContext, DeviceId,
+                      IoctlCmd, PowerState, ProbeResult}
+use std.driver.null_block_driver.{
+    null_block_abi_rev as std_null_block_abi_rev,
+    null_block_status_ready as std_null_block_status_ready,
+    null_block_init as std_null_block_init,
+    null_block_probe as std_null_block_probe,
+    null_block_attach as std_null_block_attach,
+    null_block_detach as std_null_block_detach,
+    null_block_suspend as std_null_block_suspend,
+    null_block_resume as std_null_block_resume,
+    null_block_ioctl as std_null_block_ioctl,
+    null_block_make_ops as std_null_block_make_ops,
+    register_null_block_driver as std_register_null_block_driver,
+    register_null_block_driver_auto as std_register_null_block_driver_auto,
+    null_block_smoke as std_null_block_smoke,
+    null_block_register as std_null_block_register
+}
+
+fn null_block_abi_rev() -> i32:
+    std_null_block_abi_rev()
+
+@packed
+struct NullBlockStatusRegister:
+    ready: u32:1
+    readonly: u32:1
+    reserved: u32:30
+
+fn null_block_status_ready() -> i32:
+    std_null_block_status_ready()
+
+fn null_block_init(ctx: DriverContext) -> Result<(), DriverError>:
+    std_null_block_init(ctx)
+
+fn null_block_probe(dev: DeviceId) -> Result<ProbeResult, DriverError>:
+    std_null_block_probe(dev)
+
+fn null_block_attach(dev: DeviceId) -> Result<DriverHandle, DriverError>:
+    std_null_block_attach(dev)
+
+fn null_block_detach(h: DriverHandle) -> Result<(), DriverError>:
+    std_null_block_detach(h)
+
+fn null_block_suspend(h: DriverHandle, s: PowerState) -> Result<(), DriverError>:
+    std_null_block_suspend(h, s)
+
+fn null_block_resume(h: DriverHandle) -> Result<(), DriverError>:
+    std_null_block_resume(h)
+
+fn null_block_ioctl(h: DriverHandle, cmd: IoctlCmd) -> Result<i64, DriverError>:
+    std_null_block_ioctl(h, cmd)
+
+fn null_block_make_ops() -> DriverOps:
+    std_null_block_make_ops()
+
+@driver(0, 0, [0], "0.1")
+fn register_null_block_driver() -> Result<i32, DriverError>:
+    std_register_null_block_driver()
+
+@driver(class=DriverClass.Block, vendor=0, device=[0], version="0.1", ops=null_block_make_ops())
+fn register_null_block_driver_auto() -> Result<i32, DriverError>:
+    std_register_null_block_driver_auto()
+
+fn null_block_smoke() -> i32:
+    std_null_block_smoke()
+
+fn null_block_register() -> i32:
+    std_null_block_register()

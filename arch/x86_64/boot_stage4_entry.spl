@@ -1,0 +1,59 @@
+# x86_64 Boot Stage 4 — Full stack (POSIX + Shell)
+#
+# Extends stage 3 with POSIX layer and shell.
+# This is the full OS boot sequence matching os_entry.spl.
+# Target: ~91 files in closure.
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+
+# POSIX layer (direct imports to avoid weak-stub cascade)
+use os.posix.fd_table.{fd_table_init}
+use os.posix.async_io.{async_io_init}
+use os.posix.signal_compat.{signal_init}
+
+# Services
+use os.kernel.boot.init_services.{init_all_services, services_storage_ready, services_network_ready}
+
+# Shell
+use os.apps.shell.shell_app.{ShellApp}
+
+fn _start():
+    serial_println("")
+    serial_println("=== SimpleOS Boot Stage 4 ===")
+    serial_println("[stage4] Full stack: POSIX + Services + Shell")
+    serial_println("")
+
+    # POSIX layer init
+    serial_println("[stage4] Initializing POSIX layer...")
+    fd_table_init()
+    async_io_init()
+    signal_init()
+    serial_println("[stage4] POSIX layer initialized")
+
+    # Services (PCI + storage + network + display)
+    serial_println("[stage4] Initializing all services...")
+    init_all_services()
+
+    if services_storage_ready():
+        serial_println("[stage4] Storage: OK")
+    else:
+        serial_println("[stage4] Storage: UNAVAILABLE")
+
+    if services_network_ready():
+        serial_println("[stage4] Network: OK")
+    else:
+        serial_println("[stage4] Network: UNAVAILABLE")
+
+    # Shell
+    serial_println("[stage4] Creating shell...")
+    var shell = ShellApp.new()
+    serial_println("[stage4] Shell ready")
+
+    serial_println("")
+    serial_println("[stage4] PASS: Full stack boot")
+    serial_println("=== SimpleOS ready ===")
+    serial_println("TEST PASSED")
+
+    # Exit QEMU via ISA debug exit
+    rt_port_outb(0xf4, 0)

@@ -1,0 +1,589 @@
+#![allow(unnamed_duplicate_typed_args)]
+# SimpleOS Glass Window Manager — ARM64 (AArch64) QEMU virt
+#
+# Entry point and stateful window management for ARM64:
+# 1. Framebuffer via QEMU ramfb device (fw_cfg at 0x09020000)
+# 2. PL011 UART serial input for keyboard control
+# 3. Window position state + animation state
+# 4. Main loop: input dispatch, animation tick, desktop redraw
+#
+# Architecture differences from x86_64:
+#   - No port I/O (no BGA, no PS/2) -- ARM64 uses MMIO exclusively
+#   - Framebuffer via ramfb (fw_cfg) instead of BGA + PCI BAR scan
+#   - Keyboard via PL011 UART (0x09000000) instead of PS/2 scancodes
+#   - No mouse support (UART is character-based, not PS/2 packets)
+#
+# Extracted modules:
+#   wm_entry_io.spl    — externs, UART, ramfb, render primitives, theme, constants
+#   wm_entry_glass.spl — stateless glass draw fns (window, bar, dock, content)
+
+# === Extern FFI declarations (only what spl_start uses directly) ===
+extern fn serial_println(msg: text)
+extern fn rt_gui_set_fb(addr: u64, width: u64)
+extern fn rt_gui_begin_frame(width: u64, height: u64, unused1: u64, unused2: u64)
+extern fn rt_gui_present(unused1: u64, unused2: u64, unused3: u64, unused4: u64)
+extern fn rt_gui_draw_wallpaper(wh: u64, style: u64, unused1: u64, unused2: u64)
+extern fn rt_alloc(size: u64) -> u64
+
+use examples.simple_os.arch.arm64.wm_entry_io.{
+    pack, pack8, fill, blend, blur, rrect_aa, grad_h,
+    circle, ring,
+    draw_label, draw_label_shadow, draw_label_vector,
+    bounce_offset, ease_in_cubic, ease_out_cubic, lerp,
+    accent, accent2,
+    surface, surface_a, elevated, elevated_a, border_c, border_a,
+    shadow_a, text_c, text_sec,
+    line,
+    ICON_TERM, ICON_FILES, ICON_CALC, ICON_CLOCK, ICON_SETTINGS,
+    ICON_BROWSER, ICON_EDITOR,
+    setup_ramfb,
+    uart_data_ready, uart_read_char, uart_char_to_action
+}
+
+use examples.simple_os.arch.arm64.wm_entry_glass.{
+    draw_glass_window,
+    draw_glass_system_bar,
+    draw_glass_dock,
+    draw_hello_content,
+    draw_terminal_content,
+    draw_files_content
+}
+
+use examples.simple_os.arch.arm64.wm_shared_mdi_contract.{arm64_wm_shared_mdi_evidence}
+
+# ===========================================================================
+# Window positions
+# ===========================================================================
+fn win0_x() -> u64: 60
+fn win0_y() -> u64: 60
+fn win1_x() -> u64: 300
+fn win1_y() -> u64: 160
+fn win2_x() -> u64: 540
+fn win2_y() -> u64: 300
+
+# ===========================================================================
+# Window Title Drawing
+# ===========================================================================
+
+fn draw_window_title(x: u64, y: u64, w: u64, title_chars: u64, title_len: u64, theme: u64):
+    val title_pixel_w = title_len * 10
+    val text_x = x + (w - title_pixel_w) / 2
+    val text_y = y + 14
+    draw_label_vector(text_x + 1, text_y + 2, 0x00000000, 12, title_chars, title_len, 18)
+    draw_label_vector(text_x + 1, text_y + 1, 0x00000000, 45, title_chars, title_len, 18)
+    draw_label_vector(text_x, text_y, text_c(theme), 240, title_chars, title_len, 18)
+
+# ===========================================================================
+# Animation Helpers
+# ===========================================================================
+
+fn dock_icon_x(win_idx: u64) -> u64:
+    val num_icons: u64 = 7
+    val pill_w = 48
+    val icon_gap = 16
+    val dock_pad = 20
+    val separator_w: u64 = 2
+    val separator_gap: u64 = 10
+    val num_util_icons: u64 = 2
+    val dock_w = num_icons * (pill_w + icon_gap) + separator_w + separator_gap * 2 + num_util_icons * (pill_w + icon_gap) - icon_gap + dock_pad * 2
+    val dock_x = (1024 - dock_w) / 2
+    if win_idx == 0:
+        dock_x + dock_pad + pill_w / 2
+    else:
+        if win_idx == 1:
+            dock_x + dock_pad + 6 * (pill_w + icon_gap) + pill_w / 2
+        else:
+            dock_x + dock_pad + 1 * (pill_w + icon_gap) + pill_w / 2
+
+fn dock_icon_y() -> u64:
+    768 - 58 - 10 + 8
+
+fn draw_animated_window(
+    src_x: u64, src_y: u64, src_w: u64, src_h: u64,
+    dst_x: u64, dst_y: u64, dst_w: u64, dst_h: u64,
+    progress: u64, theme: u64):
+    val eased = ease_out_cubic(progress)
+    val ax = lerp(src_x, dst_x, eased)
+    val ay = lerp(src_y, dst_y, eased)
+    val aw = lerp(src_w, dst_w, eased)
+    val ah = lerp(src_h, dst_h, eased)
+    if aw > 20 and ah > 20:
+        draw_glass_window(ax, ay, aw, ah, 1, theme)
+
+# ===========================================================================
+# Full Desktop Rendering
+# ===========================================================================
+
+fn draw_win0_normal(boff: u64, is_active: u64, theme: u64):
+    val x = win0_x()
+    val by = win0_y() - boff
+    draw_glass_window(x, by, 420, 260, is_active, theme)
+    draw_terminal_content(x, by, 420, 260, theme)
+    draw_window_title(x, by, 420, pack8(84, 101, 114, 109, 105, 110, 97, 108), 8, theme)
+
+fn draw_win1_normal(boff: u64, is_active: u64, theme: u64):
+    val x = win1_x()
+    val by = win1_y() - boff
+    draw_glass_window(x, by, 480, 300, is_active, theme)
+    draw_hello_content(x, by, 480, 300, theme)
+    draw_window_title(x, by, 480, pack8(69, 100, 105, 116, 111, 114, 0, 0), 6, theme)
+
+fn draw_win2_normal(boff: u64, is_active: u64, theme: u64):
+    val x = win2_x()
+    val by = win2_y() - boff
+    draw_glass_window(x, by, 360, 240, is_active, theme)
+    draw_files_content(x, by, 360, 240, theme)
+    draw_window_title(x, by, 360, pack8(70, 105, 110, 100, 101, 114, 0, 0), 6, theme)
+
+fn draw_close_animated(wx: u64, wy: u64, ww: u64, wh: u64, close_progress: u64, theme: u64):
+    val eased = ease_in_cubic(close_progress)
+    val shrink = eased * 15 / 100
+    val cx = wx + shrink * ww / 200
+    val cy = wy + shrink * wh / 200
+    val cw = ww - shrink * ww / 100
+    val ch = wh - shrink * wh / 100
+    if cw > 30 and ch > 30:
+        draw_glass_window(cx, cy, cw, ch, 1, theme)
+
+fn draw_single_window(
+    win: u64, boff: u64, is_active: u64, theme: u64,
+    minimize_active: u64, minimize_progress: u64, minimize_win: u64,
+    minimize_states: u64, close_active: u64, close_progress: u64,
+    close_win: u64):
+    val minimized_bit = (minimize_states >> win) & 1
+    if minimize_active == 1 and minimize_win == win:
+        if win == 0:
+            draw_animated_window(win0_x(), win0_y(), 420, 260, dock_icon_x(0), dock_icon_y(), 48, 48, minimize_progress, theme)
+        else:
+            if win == 1:
+                draw_animated_window(win1_x(), win1_y(), 480, 300, dock_icon_x(1), dock_icon_y(), 48, 48, minimize_progress, theme)
+            else:
+                draw_animated_window(win2_x(), win2_y(), 360, 240, dock_icon_x(2), dock_icon_y(), 48, 48, minimize_progress, theme)
+    else:
+        if close_active == 1 and close_win == win:
+            if win == 0:
+                draw_close_animated(win0_x(), win0_y(), 420, 260, close_progress, theme)
+            else:
+                if win == 1:
+                    draw_close_animated(win1_x(), win1_y(), 480, 300, close_progress, theme)
+                else:
+                    draw_close_animated(win2_x(), win2_y(), 360, 240, close_progress, theme)
+        else:
+            if minimized_bit == 0:
+                if win == 0:
+                    draw_win0_normal(boff, is_active, theme)
+                else:
+                    if win == 1:
+                        draw_win1_normal(boff, is_active, theme)
+                    else:
+                        draw_win2_normal(boff, is_active, theme)
+
+fn arm64_dock_icon_color(icon_i: u64) -> u64:
+    if icon_i == 0:
+        return ICON_TERM
+    if icon_i == 1:
+        return ICON_FILES
+    if icon_i == 2:
+        return ICON_CALC
+    if icon_i == 3:
+        return ICON_CLOCK
+    if icon_i == 4:
+        return ICON_SETTINGS
+    if icon_i == 5:
+        return ICON_BROWSER
+    ICON_EDITOR
+
+fn draw_arm64_icon_shell(icon_x: u64, dock_y: u64, color: u64):
+    val icon_y = dock_y + 8
+    rrect_aa(icon_x, icon_y, 40, 40, 0x001E1E23, 10, 72)
+    rrect_aa(icon_x, icon_y, 40, 40, color, 10, 255)
+    rrect_aa(icon_x, icon_y, 40, 40, 0x00FFFFFF, 10, 24)
+    blend(icon_x + 3, icon_y + 1, 34, 1, 0x00FFFFFF, 40)
+    blend(icon_x + 5, icon_y + 3, 30, 12, 0x00FFFFFF, 22)
+    blend(icon_x + 4, icon_y + 28, 32, 8, 0x00000000, 26)
+    blend(icon_x + 5, icon_y + 40, 30, 3, color, 24)
+
+fn draw_arm64_dock_icon(icon_x: u64, dock_y: u64, icon_i: u64):
+    val icon_y = dock_y + 8
+    val bg = arm64_dock_icon_color(icon_i)
+    draw_arm64_icon_shell(icon_x, dock_y, bg)
+    if icon_i == 0:
+        rrect_aa(icon_x + 7, icon_y + 9, 26, 20, 0x001A1A2E, 5, 230)
+        blend(icon_x + 8, icon_y + 10, 24, 3, 0x00333355, 180)
+        line(icon_x + 12, icon_y + 18, icon_x + 18, icon_y + 21, 0x0044FF44, 2, 255)
+        line(icon_x + 18, icon_y + 21, icon_x + 12, icon_y + 24, 0x0044FF44, 2, 255)
+        fill(icon_x + 21, icon_y + 24, 9, 2, 0x00888888)
+    if icon_i == 1:
+        rrect_aa(icon_x + 9, icon_y + 14, 22, 17, 0x00F4C542, 4, 245)
+        rrect_aa(icon_x + 12, icon_y + 10, 12, 7, 0x00FFD66B, 3, 245)
+        blend(icon_x + 12, icon_y + 20, 16, 2, 0x00FFFFFF, 180)
+        blend(icon_x + 12, icon_y + 25, 11, 2, 0x00FFFFFF, 150)
+    if icon_i == 2:
+        rrect_aa(icon_x + 10, icon_y + 8, 20, 25, 0x002C2C32, 4, 220)
+        rrect_aa(icon_x + 13, icon_y + 11, 14, 6, 0x00FFFFFF, 2, 150)
+        fill(icon_x + 13, icon_y + 20, 4, 4, 0x00FFFFFF)
+        fill(icon_x + 19, icon_y + 20, 4, 4, 0x00FFFFFF)
+        fill(icon_x + 25, icon_y + 20, 4, 4, 0x00FF9500)
+        fill(icon_x + 13, icon_y + 26, 16, 3, 0x00FFFFFF)
+    if icon_i == 3:
+        ring(icon_x + 8, icon_y + 8, 24, 2, 0x00FFFFFF, 210)
+        line(icon_x + 20, icon_y + 20, icon_x + 20, icon_y + 12, 0x00FFFFFF, 2, 230)
+        line(icon_x + 20, icon_y + 20, icon_x + 27, icon_y + 22, 0x00FFFFFF, 2, 230)
+        fill(icon_x + 19, icon_y + 9, 2, 3, 0x00FFFFFF)
+        fill(icon_x + 29, icon_y + 19, 3, 2, 0x00FFFFFF)
+        fill(icon_x + 19, icon_y + 29, 2, 3, 0x00FFFFFF)
+        fill(icon_x + 8, icon_y + 19, 3, 2, 0x00FFFFFF)
+    if icon_i == 4:
+        ring(icon_x + 10, icon_y + 10, 20, 3, 0x00FFFFFF, 175)
+        circle(icon_x + 16, icon_y + 16, 8, 0x001E1E23, 190)
+        fill(icon_x + 19, icon_y + 6, 2, 5, 0x00FFFFFF)
+        fill(icon_x + 19, icon_y + 29, 2, 5, 0x00FFFFFF)
+        fill(icon_x + 7, icon_y + 19, 5, 2, 0x00FFFFFF)
+        fill(icon_x + 29, icon_y + 19, 5, 2, 0x00FFFFFF)
+        fill(icon_x + 11, icon_y + 11, 4, 4, 0x00FFFFFF)
+        fill(icon_x + 26, icon_y + 26, 4, 4, 0x00FFFFFF)
+    if icon_i == 5:
+        ring(icon_x + 8, icon_y + 8, 24, 2, 0x00FFFFFF, 190)
+        line(icon_x + 14, icon_y + 9, icon_x + 14, icon_y + 31, 0x00FFFFFF, 1, 135)
+        line(icon_x + 26, icon_y + 9, icon_x + 26, icon_y + 31, 0x00FFFFFF, 1, 135)
+        line(icon_x + 8, icon_y + 15, icon_x + 32, icon_y + 15, 0x00FFFFFF, 1, 135)
+        line(icon_x + 8, icon_y + 25, icon_x + 32, icon_y + 25, 0x00FFFFFF, 1, 135)
+        line(icon_x + 16, icon_y + 25, icon_x + 25, icon_y + 15, 0x00FF4444, 2, 220)
+    if icon_i == 6:
+        rrect_aa(icon_x + 11, icon_y + 7, 19, 26, 0x00FFFFFF, 3, 165)
+        fill(icon_x + 14, icon_y + 13, 12, 2, 0x00148F77)
+        fill(icon_x + 14, icon_y + 18, 10, 2, 0x00148F77)
+        fill(icon_x + 14, icon_y + 23, 13, 2, 0x00148F77)
+        line(icon_x + 25, icon_y + 27, icon_x + 31, icon_y + 33, 0x00FFD0A0, 2, 230)
+
+fn draw_desktop(
+    active: u64, theme: u64, anim_progress: u64,
+    minimize_active: u64, minimize_progress: u64, minimize_win: u64,
+    minimize_states: u64, close_active: u64, close_progress: u64,
+    close_win: u64):
+    rt_gui_begin_frame(1024, 768, 0, 0)
+
+    # Procedural wallpaper
+    rt_gui_draw_wallpaper(pack(1024, 768), theme, 0, 0)
+
+    # Vignette
+    blend(0, 0, 100, 80, 0x00000000, 20)
+    blend(1024 - 100, 0, 100, 80, 0x00000000, 20)
+    blend(0, 768 - 80, 100, 80, 0x00000000, 20)
+    blend(1024 - 100, 768 - 80, 100, 80, 0x00000000, 20)
+
+    grad_h(0, 0, 1024, 1, accent(theme), accent2(theme))
+
+    # Tech grid (dark theme only)
+    if theme == 0:
+        var gy: u64 = 100
+        while gy < 768 - 100:
+            blend(0, gy, 1024, 1, 0x00FFFFFF, 2)
+            gy = gy + 80
+        var gx: u64 = 100
+        while gx < 1024 - 100:
+            blend(gx, 100, 1, 768 - 200, 0x00FFFFFF, 2)
+            gx = gx + 80
+
+    # Shooting stars
+    if theme == 0:
+        line(180, 80, 220, 95, 0x00FFFFFF, 2, 200)
+        line(220, 95, 230, 98, 0x00FFFFFF, 2, 110)
+        blend(178, 79, 5, 5, 0x00FFFFFF, 140)
+        line(700, 120, 760, 150, 0x00FFFFFF, 2, 170)
+
+    if theme == 0:
+        blend(150, 120, 4, 4, 0x00FFFFFF, 160)
+        blend(700, 200, 4, 4, 0x00FFFFFF, 140)
+        blend(850, 350, 4, 4, 0x00FFFFFF, 120)
+        blend(400, 500, 4, 4, 0x00FFFFFF, 100)
+        blend(950, 100, 4, 4, 0x00FFFFFF, 150)
+
+    if theme == 1:
+        blend(0, 768 / 2, 1024, 768 / 2, 0x00E8D0F0, 6)
+
+    blend(0, 768 * 2 / 3, 1024, 768 / 3, 0x00201008, 6)
+
+    val boff = bounce_offset(anim_progress)
+
+    # Windows in z-order
+    if active == 0:
+        draw_single_window(2, 0, 0, theme, minimize_active, minimize_progress, minimize_win, minimize_states, close_active, close_progress, close_win)
+        draw_single_window(1, 0, 0, theme, minimize_active, minimize_progress, minimize_win, minimize_states, close_active, close_progress, close_win)
+        draw_single_window(0, boff, 1, theme, minimize_active, minimize_progress, minimize_win, minimize_states, close_active, close_progress, close_win)
+    else:
+        if active == 1:
+            draw_single_window(2, 0, 0, theme, minimize_active, minimize_progress, minimize_win, minimize_states, close_active, close_progress, close_win)
+            draw_single_window(0, 0, 0, theme, minimize_active, minimize_progress, minimize_win, minimize_states, close_active, close_progress, close_win)
+            draw_single_window(1, boff, 1, theme, minimize_active, minimize_progress, minimize_win, minimize_states, close_active, close_progress, close_win)
+        else:
+            draw_single_window(0, 0, 0, theme, minimize_active, minimize_progress, minimize_win, minimize_states, close_active, close_progress, close_win)
+            draw_single_window(1, 0, 0, theme, minimize_active, minimize_progress, minimize_win, minimize_states, close_active, close_progress, close_win)
+            draw_single_window(2, boff, 1, theme, minimize_active, minimize_progress, minimize_win, minimize_states, close_active, close_progress, close_win)
+
+    # ARM64 verification path: direct bar/dock primitives avoid the layout
+    # engine while still exercising the framebuffer-backed window manager.
+    blend(0, 0, 1024, 28, 0x001E1E23, 160)
+    blend(0, 27, 1024, 1, 0x00FFFFFF, 80)
+    draw_label_shadow(16, 8, 0x00F5F5F7, 220, pack8(83, 105, 109, 112, 108, 101, 79, 83), 8, 40)
+    draw_label_shadow(890, 8, 0x00EBEBF5, 180, pack8(65, 82, 77, 54, 52, 32, 87, 77), 8, 40)
+
+    val dock_x: u64 = 292
+    val dock_y: u64 = 700
+    val dock_w: u64 = 440
+    val dock_h: u64 = 56
+    rrect_aa(dock_x, dock_y, dock_w, dock_h, 0x001E1E23, 24, 180)
+    rrect_aa(dock_x, dock_y, dock_w, dock_h, 0x00FFFFFF, 24, 55)
+    var icon_x: u64 = dock_x + 20
+    var icon_i: u64 = 0
+    while icon_i < 7:
+        draw_arm64_dock_icon(icon_x, dock_y, icon_i)
+        icon_x = icon_x + 58
+        icon_i = icon_i + 1
+
+    blend(0, 768 - 2, 1024, 2, 0x00000000, 20)
+    blend(1024 / 2 - 200, 0, 400, 20, 0x00FFFFFF, 3)
+    blend(0, 0, 1024, 768, 0x000A84FF, 2)
+
+    rt_gui_present(0, 0, 0, 0)
+
+# ===========================================================================
+# Entry Point — ARM64 QEMU virt
+# ===========================================================================
+
+fn spl_start():
+    serial_println("[WM] SimpleOS Glass Window Manager (ARM64) starting...")
+
+    # 1. Allocate framebuffer in RAM
+    serial_println("[WM] Allocating framebuffer (1024x768x32 = 3MB)...")
+    val fb_addr = rt_alloc(3145728)
+    if fb_addr == 0:
+        serial_println("[WM] FATAL: Failed to allocate framebuffer")
+        return
+
+    # Tell glass_render.c where the framebuffer is
+    rt_gui_set_fb(fb_addr, 1024)
+    serial_println("[WM] Framebuffer allocated and registered")
+
+    # 2. Configure QEMU ramfb to display from our buffer
+    val ramfb_ok = setup_ramfb(fb_addr)
+    if ramfb_ok == 0:
+        serial_println("[WM] NOTE: No ramfb device -- rendering to shadow buffer only")
+        serial_println("[WM] Add '-device ramfb' to QEMU command line for display")
+
+    val mdi_evidence = arm64_wm_shared_mdi_evidence(320, 240)
+    serial_println("[mdi-demo] shared-mdi-ready surfaces={mdi_evidence.surface_count}")
+    serial_println("[mdi-demo] first-window={mdi_evidence.first_title}")
+    serial_println("[mdi-demo] focused-window={mdi_evidence.focused_title}")
+    serial_println("[mdi-demo] simple-web-surfaces={mdi_evidence.simple_web_surface_count}")
+    serial_println("[mdi-demo] renderer-path={mdi_evidence.renderer_path}")
+    serial_println("[backend-evidence] selected={mdi_evidence.backend_kind} fallback={mdi_evidence.fallback_reason} frame_time_ms=unmeasured readback={mdi_evidence.readback_status}")
+
+    # 3. Boot splash screen
+    serial_println("[WM] Showing boot splash...")
+    rt_gui_begin_frame(1024, 768, 0, 0)
+
+    rt_gui_draw_wallpaper(pack(1024, 768), 0, 0, 0)
+
+    val splash_w: u64 = 300
+    val splash_h: u64 = 140
+    val splash_x = (1024 - splash_w) / 2
+    val splash_y = (768 - splash_h) / 2 - 40
+
+    blur(splash_x, splash_y, splash_w, splash_h, 24)
+    rrect_aa(splash_x, splash_y, splash_w, splash_h, 0x001E1E23, 28, 140)
+    blend(splash_x + 4, splash_y + 1, splash_w - 8, 1, 0x00FFFFFF, 40)
+    blend(splash_x + 6, splash_y + 2, splash_w - 12, 1, 0x00FFFFFF, 20)
+    rrect_aa(splash_x, splash_y, splash_w, splash_h, 0x00FFFFFF, 28, 25)
+
+    # "SimpleOS" in vector font at 40px
+    draw_label_vector(splash_x + 70, splash_y + 16, 0x00F5F5F7, 240, pack8(83, 105, 109, 112, 108, 101, 79, 83), 8, 40)
+
+    # "v1.0"
+    draw_label_shadow(splash_x + 130, splash_y + 60, 0x00EBEBF5, 160, pack8(118, 49, 46, 48, 0, 0, 0, 0), 4, 40)
+
+    # Loading bar
+    val bar_y = splash_y + 90
+    rrect_aa(splash_x + 40, bar_y, splash_w - 80, 8, 0x00FFFFFF, 4, 30)
+    grad_h(splash_x + 40, bar_y + 1, (splash_w - 80) * 2 / 3, 6, 0x000A84FF, 0x00BB86FC)
+    rrect_aa(splash_x + 40, bar_y, (splash_w - 80) * 2 / 3, 8, 0x00FFFFFF, 4, 20)
+
+    # "Starting..." + "ARM64" platform tag
+    draw_label_shadow((1024 - 72) / 2, splash_y + splash_h + 20, 0x00EBEBF5, 120, pack8(83, 116, 97, 114, 116, 105, 110, 103), 8, 40)
+    draw_label(splash_x + 56, splash_y + splash_h + 40, 0x00EBEBF5, 60, pack8(65, 82, 77, 54, 52, 32, 32, 32), 5)
+
+    rt_gui_present(0, 0, 0, 0)
+
+    # Brief pause for splash
+    var splash_wait: u64 = 0
+    while splash_wait < 2000000:
+        splash_wait = splash_wait + 1
+
+    # 4. Initial render
+    var theme: u64 = 0
+    var active_win: u64 = 1
+    var anim_progress: u64 = 100
+    var minimize_active: u64 = 0
+    var minimize_progress: u64 = 0
+    var minimize_win: u64 = 0
+    var minimize_states: u64 = 0
+    var close_active: u64 = 0
+    var close_progress: u64 = 0
+    var close_win: u64 = 0
+
+    var anim_frame: u64 = 0
+    var anim_start: u64 = 0
+    var anim_duration: u64 = 12
+    var animating: u64 = 0
+    var needs_redraw: u64 = 1
+    var idle_count: u64 = 0
+
+    serial_println("[WM] Rendering glass desktop (dark theme)...")
+    draw_desktop(active_win, theme, anim_progress, minimize_active, minimize_progress, minimize_win, minimize_states, close_active, close_progress, close_win)
+
+    serial_println("[WM] Glass desktop rendered!")
+    serial_println("[WM] Controls (UART): Tab=cycle, 1/2/3=focus, t=theme, m=minimize, r=restore, q=quit")
+
+    # 5. Main loop -- UART input
+    var running: u64 = 1
+    while running == 1:
+        # Poll PL011 UART for keyboard input
+        if uart_data_ready() == 1:
+            val ch = uart_read_char()
+            val action = uart_char_to_action(ch)
+
+            # CycleFocus (action 1)
+            if action == 1:
+                active_win = (active_win + 1) % 3
+                animating = 1
+                anim_start = anim_frame
+                anim_progress = 0
+                needs_redraw = 1
+                serial_println("[WM] Focus cycled")
+
+            # FocusWindow(0) (action 10)
+            if action == 10:
+                active_win = 0
+                animating = 1
+                anim_start = anim_frame
+                anim_progress = 0
+                needs_redraw = 1
+                serial_println("[WM] Focus: Terminal")
+
+            # FocusWindow(1) (action 11)
+            if action == 11:
+                active_win = 1
+                animating = 1
+                anim_start = anim_frame
+                anim_progress = 0
+                needs_redraw = 1
+                serial_println("[WM] Focus: Editor")
+
+            # FocusWindow(2) (action 12)
+            if action == 12:
+                active_win = 2
+                animating = 1
+                anim_start = anim_frame
+                anim_progress = 0
+                needs_redraw = 1
+                serial_println("[WM] Focus: Finder")
+
+            # ToggleTheme (action 2)
+            if action == 2:
+                theme = (theme + 1) % 2
+                animating = 1
+                anim_start = anim_frame
+                anim_progress = 0
+                needs_redraw = 1
+                if theme == 0:
+                    serial_println("[WM] Theme: Dark Glass")
+                else:
+                    serial_println("[WM] Theme: White Glass")
+
+            # Quit (action 3)
+            if action == 3:
+                running = 0
+                serial_println("[WM] Quit requested")
+
+            # Minimize (action 4)
+            if action == 4:
+                val already_minimized = (minimize_states >> active_win) & 1
+                if minimize_active == 0 and already_minimized == 0:
+                    minimize_active = 1
+                    minimize_progress = 0
+                    minimize_win = active_win
+                    needs_redraw = 1
+                    serial_println("[WM] Minimizing window")
+
+            # Close (action 5)
+            if action == 5:
+                if close_active == 0:
+                    close_active = 1
+                    close_progress = 0
+                    close_win = active_win
+                    needs_redraw = 1
+                    serial_println("[WM] Closing window")
+
+            # Restore (action 6)
+            if action == 6:
+                if minimize_states != 0:
+                    minimize_states = 0
+                    needs_redraw = 1
+                    serial_println("[WM] Restored all windows")
+
+        # Update focus animation
+        if animating == 1:
+            val elapsed = anim_frame - anim_start
+            if elapsed >= anim_duration:
+                animating = 0
+                anim_progress = 100
+            else:
+                anim_progress = (elapsed * 100) / anim_duration
+            needs_redraw = 1
+
+        # Minimize animation tick
+        if minimize_active == 1:
+            minimize_progress = minimize_progress + 12
+            if minimize_progress >= 100:
+                minimize_progress = 100
+                minimize_active = 0
+                minimize_states = minimize_states | (1 << minimize_win)
+                var next_win: u64 = (active_win + 1) % 3
+                var search: u64 = 0
+                while search < 3:
+                    val next_min = (minimize_states >> next_win) & 1
+                    if next_min == 0:
+                        search = 3
+                    else:
+                        next_win = (next_win + 1) % 3
+                    search = search + 1
+                active_win = next_win
+                serial_println("[WM] Window minimized to dock")
+            needs_redraw = 1
+
+        # Close animation tick
+        if close_active == 1:
+            close_progress = close_progress + 16
+            if close_progress >= 100:
+                close_progress = 100
+                close_active = 0
+                minimize_states = minimize_states | (1 << close_win)
+                active_win = (active_win + 1) % 3
+            needs_redraw = 1
+
+        # Redraw if needed
+        if needs_redraw == 1:
+            draw_desktop(active_win, theme, anim_progress, minimize_active, minimize_progress, minimize_win, minimize_states, close_active, close_progress, close_win)
+            needs_redraw = 0
+            idle_count = 0
+
+        anim_frame = anim_frame + 1
+
+        # Throttle when idle
+        if animating == 0 and minimize_active == 0 and close_active == 0:
+            idle_count = idle_count + 1
+            var spin: u64 = 0
+            while spin < 50000:
+                spin = spin + 1
+
+    serial_println("[WM] Window Manager shutting down")

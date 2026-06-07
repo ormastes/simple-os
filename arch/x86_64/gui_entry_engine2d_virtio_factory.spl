@@ -1,0 +1,117 @@
+# x86_64 GUI Entry — VirtIO-GPU shared Engine2D factory probe
+#
+# This entry is separate from gui_entry_engine2d_virtio.spl on purpose.
+# It exercises the shared create_virtio_gpu_engine(...) path directly so
+# factory failures can be debugged without regressing the green wrapper
+# proof lane.
+
+use os.kernel.arch.x86_64.console.{serial_init, serial_writeln}
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_early_init}
+use os.drivers.pci.pci.{PciDevice, pci_read_bar}
+use os.drivers.virtio.virtio_gpu.{VirtioGpuDriver}
+use os.kernel.types.device_mem_types.{DeviceGrant}
+use os.kernel.abi.syscall_shim.{shim_init}
+use os.kernel.scheduler.scheduler.{Scheduler}
+use os.kernel.ipc.ipc.{IpcManager}
+use os.kernel.log.klog.{KernelLog}
+use os.compositor.engine2d_display.{create_virtio_gpu_engine}
+use std.gc_async_mut.gpu.engine2d.engine.{Engine2D}
+
+extern fn serial_println(msg: text)
+extern fn rt_pci_device_count() -> i64
+extern fn rt_pci_get_field(index: i64, field: i64) -> i64
+
+fn grant_from_pci(dev: PciDevice) -> DeviceGrant:
+    var bar0_phys: u64 = dev.bar0.to_u64()
+    if bar0_phys == 0:
+        bar0_phys = (dev.bar1 & 0xFFFFFFF0).to_u64()
+    DeviceGrant(
+        pci_vendor: dev.vendor_id,
+        pci_device: dev.device_id,
+        pci_bus: dev.bus,
+        pci_dev: dev.device,
+        pci_func: dev.func,
+        pci_class: dev.class_code,
+        pci_subclass: dev.subclass,
+        bar0_phys: bar0_phys,
+        bar0_size: 4096,
+        bar0_cap: 0,
+        irq_vector: dev.irq_line.to_u32(),
+        irq_notification_id: 0,
+        irq_notification_bit: 0,
+        irq_cap: 0,
+        dma_device_addr: 0,
+        dma_host_addr: 0,
+        dma_size: 0,
+        dma_cap: 0,
+        iommu_domain_id: 0,
+        iommu_cap: 0
+    )
+
+fn halt_forever():
+    while true:
+        pass_dn
+
+fn find_virtio_gpu_from_c_pci_cache() -> PciDevice?:
+    val count = rt_pci_device_count()
+    var i: i64 = 0
+    while i < count:
+        val vendor_id = rt_pci_get_field(i, 5)
+        val device_id = rt_pci_get_field(i, 6)
+        val class_code = rt_pci_get_field(i, 3)
+        val subclass = rt_pci_get_field(i, 4)
+        val is_display = class_code == 0x03 and (subclass == 0x80 or subclass == 0x00)
+        val is_virtio_gpu = vendor_id == 0x1AF4 and (device_id == 0x1050 or device_id == 0x1040)
+        if is_display and is_virtio_gpu:
+            val bus = rt_pci_get_field(i, 0).to_u8()
+            val dev = rt_pci_get_field(i, 1).to_u8()
+            val func = rt_pci_get_field(i, 2).to_u8()
+            return Some(PciDevice(
+                bus: bus,
+                device: dev,
+                func: func,
+                vendor_id: vendor_id.to_u16(),
+                device_id: device_id.to_u16(),
+                class_code: class_code.to_u8(),
+                subclass: subclass.to_u8(),
+                prog_if: 0,
+                header_type: 0,
+                bar0: pci_read_bar(bus, dev, func, 0),
+                bar1: pci_read_bar(bus, dev, func, 1),
+                irq_line: rt_pci_get_field(i, 7).to_u8()
+            ))
+        i = i + 1
+    nil
+
+fn spl_start():
+    serial_init()
+    serial_writeln("SimpleOS x86_64 GUI boot (VirtIO-GPU factory probe)")
+    arch_x86_64_early_init()
+    shim_init(Scheduler.new(), IpcManager.new(), KernelLog.new(256))
+
+    serial_println("[FACTORY] Scanning PCI for VirtIO-GPU...")
+    if val Some(found_dev) = find_virtio_gpu_from_c_pci_cache():
+        serial_println("[FACTORY] Found GPU")
+        val grant = grant_from_pci(found_dev)
+        var gpu = VirtioGpuDriver.new()
+        if val Ok(_ok) = gpu.init_from_grant(grant):
+            serial_println("[FACTORY] VirtIO-GPU initialized")
+            serial_println("[FACTORY] Calling create_virtio_gpu_engine...")
+            var engine: Engine2D = create_virtio_gpu_engine(gpu)
+            serial_println("[FACTORY] Engine object returned")
+            serial_println("[FACTORY] dims {engine.width()}x{engine.height()}")
+            serial_println("[FACTORY] clear next")
+            engine.clear(0xFF102030)
+            serial_println("[FACTORY] draw next")
+            engine.draw_rect_filled(40, 40, 120, 80, 0xFFAA5533)
+            serial_println("[FACTORY] present next")
+            engine.present()
+            serial_println("[FACTORY] backend_name last")
+            serial_println("[FACTORY] backend={engine.backend_name()}")
+            serial_println("[gui-e2d-virtio-factory] render-ready")
+        else:
+            serial_println("[FACTORY] VirtIO-GPU init failed")
+    else:
+        serial_println("[FACTORY] NO VIRTIO-GPU FOUND")
+
+    halt_forever()

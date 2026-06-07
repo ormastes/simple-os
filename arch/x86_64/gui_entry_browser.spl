@@ -1,0 +1,220 @@
+# x86_64 GUI Entry -- Browser Engine variant
+#
+# Boots the same BGA framebuffer path as gui_entry_engine2d.spl, but
+# instead of hand-drawing rectangles through Engine2D, routes a real
+# HTML page through the browser_engine pipeline:
+#
+#   HTML -> simple_browser_page adapter
+#        -> canonical browser_engine scene
+#        -> software rasterizer
+#        -> layout -> paint -> scene -> software rasterizer
+#        -> framebuffer blit
+#        -> BGA framebuffer
+#
+# This is the first in-guest demonstration of actual HTML rendering
+# on SimpleOS. The rendered frame stays on screen via a halt loop so
+# QMP capture can read it back.
+#
+# Boot sequence:
+#   1. Serial init
+#   2. Install bootstrap trap + syscall shim exports
+#   3. BGA framebuffer init (1024x768x32)
+#   4. Create FramebufferDriver from boot info
+#   5. Build shared Simple browser page state
+#   6. Rasterize the page scene to pixels
+#   8. Blit pixels to FramebufferDriver
+#   9. Halt loop (no Compositor, no DesktopShell)
+
+use os.kernel.arch.x86_64.console.{serial_init, serial_writeln}
+use os.kernel.arch.x86_64.interrupt.{X86Interrupt}
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_early_init}
+use os.kernel.abi.syscall_shim.{shim_init}
+use os.kernel.scheduler.scheduler.{Scheduler}
+use os.kernel.ipc.ipc.{IpcManager}
+use os.kernel.log.klog.{KernelLog}
+use os.drivers.framebuffer.bga_init.{bga_init_framebuffer}
+use os.drivers.framebuffer.fb_driver.{FramebufferDriver}
+use examples.simple_os.assets.browser_guest_session.{
+    browser_guest_boot_url,
+    browser_guest_expected_title,
+    browser_guest_final_url,
+    browser_guest_live_probe_url,
+    browser_guest_live_transport_error,
+    resolve_browser_guest_request}
+use std.common.web.browser_session.{BrowserRequest, BrowserResponse, BrowserSession}
+use std.common.web.simple_browser_page.{SimpleBrowserPageState, simple_browser_render_remote_page}
+use common.render_scene.executor.{execute_scene_to_buffer}
+
+extern fn serial_println(msg: text)
+extern fn rt_gui_set_fb(addr: u64, width: u64)
+extern fn rt_hlt()
+extern fn rt_array_new(cap: i64) -> [u32]
+extern fn rt_fb_blit_array32(dst_addr: u64, dst_stride_pixels: u64,
+    src_pixels: [u32], src_stride_pixels: u64, copy_w: u64, copy_h: u64)
+extern fn rt_http_request(method: text, url: text, headers: text, body: text) -> (i64, text, text)
+
+val RENDER_W: i32 = 320
+val RENDER_H: i32 = 240
+
+fn _fallback_guest_html() -> text:
+    "<html><head><title>SimpleOS Browser Session</title></head><body><div style='background: rgb(240, 248, 255); color: rgb(16, 24, 32);'>final guest frame</div></body></html>"
+
+fn _page_from_session(session: BrowserSession) -> SimpleBrowserPageState:
+    if session.current_url != browser_guest_final_url() or session.current_title != browser_guest_expected_title():
+        return simple_browser_render_remote_page(
+            browser_guest_final_url(),
+            _fallback_guest_html(),
+            RENDER_W,
+            RENDER_H
+        )
+    simple_browser_render_remote_page(
+        session.current_url,
+        session.render_html_document(),
+        RENDER_W,
+        RENDER_H
+    )
+
+fn _resolve_guest_transport(request: BrowserRequest) -> BrowserResponse:
+    if request.url.starts_with("https://guest.simple/"):
+        return resolve_browser_guest_request(request)
+    val live = rt_http_request(request.method, request.url, request.headers, request.body)
+    BrowserResponse.create(
+        request_id: request.id,
+        kind: request.kind,
+        url: request.url,
+        status: live.0.to_i32() ?? 0,
+        headers: "",
+        body: live.1,
+        error: live.2
+    )
+
+fn _make_request(id: text, kind: text, url: text) -> BrowserRequest:
+    BrowserRequest.create(
+        id: id,
+        kind: kind,
+        url: url,
+        method: "GET",
+        headers: "",
+        body: "",
+        content_type: ""
+    )
+
+fn _probe_live_transport():
+    serial_println("[BE] Probing live browser transport...")
+    serial_println("[BE] Live transport unavailable: {browser_guest_live_transport_error()}: {browser_guest_live_probe_url()}")
+
+fn _drain_guest_requests(session: BrowserSession) -> Result<bool, text>:
+    while session.has_pending_requests():
+        match session.take_pending_request():
+            Some(request) =>
+                serial_println("[BE] Session request {request.id}: {request.kind} {request.method} {request.url}")
+                val response = _resolve_guest_transport(request)
+                serial_println("[BE] Session response {request.id}: status={response.status} headers_len={response.headers.len()} body_len={response.body.len()}")
+                val _ = session.commit_network_response(response)
+                serial_println("[BE] Session commit call returned")
+                serial_println("[BE] Session commit complete: url={session.current_url} title={session.current_title}")
+            nil =>
+                return Err("pending request reported but request dequeue returned nil")
+    Ok(true)
+
+fn _pump_guest_session(session: BrowserSession) -> Result<bool, text>:
+    _probe_live_transport()
+
+    match session.begin_network_navigation(browser_guest_boot_url(), "GET", "", "", ""):
+        Ok(_) =>
+            serial_println("[BE] Applying deterministic request 1...")
+        Err(e) =>
+            return Err(e)
+    val _ = _drain_guest_requests(session)?
+
+    serial_println("[BE] Starting deterministic follow-up navigation...")
+    match session.begin_network_navigation(browser_guest_final_url(), "GET", "", "", ""):
+        Ok(_) =>
+            serial_println("[BE] Applying deterministic request 2...")
+        Err(e) =>
+            return Err(e)
+    val _ = _drain_guest_requests(session)?
+
+    if session.current_url != browser_guest_final_url():
+        return Err("unexpected final url: {session.current_url}")
+    if session.current_title != browser_guest_expected_title():
+        return Err("unexpected final title: {session.current_title}")
+    serial_println("[BE] Session settled url={session.current_url} title={session.current_title}")
+    Ok(true)
+
+fn spl_start():
+    """x86_64 GUI entry -- browser_engine + software rasterizer + framebuffer.
+
+    Initializes the BGA framebuffer, parses the SimpleOS welcome HTML
+    into a DOM, renders it through the in-repo browser_engine pipeline to
+    a software pixel buffer, and blits that buffer to the real framebuffer.
+    The rendered frame is preserved via a halt loop for QMP capture.
+    """
+    serial_init()
+    serial_writeln("SimpleOS x86_64 GUI boot (BGA mode, browser_engine variant)")
+    serial_writeln("[BOOT] COM1 serial initialized at 0x3F8")
+
+    # Mirror the desktop wrapper boot path enough to install the strong
+    # syscall shim exports required by the freestanding linker aliases.
+    arch_x86_64_early_init()
+    shim_init(Scheduler.new(), IpcManager.new(), KernelLog.new(256))
+    if not X86Interrupt.runtime_installed():
+        X86Interrupt.install_bootstrap_runtime(64)
+
+    # BGA framebuffer
+    serial_writeln("[BOOT] Initializing BGA framebuffer (1024x768x32)...")
+    val fb_info = bga_init_framebuffer(1024, 768, 32)
+    serial_writeln("[BOOT] BGA framebuffer ready")
+
+    # C runtime hook for rt_gui_* glass rendering
+    serial_println("[GUI] Setting up C runtime framebuffer...")
+    rt_gui_set_fb(fb_info.addr.addr, fb_info.width.to_u64())
+    serial_println("[GUI] rt_gui_set_fb done")
+
+    # FramebufferDriver
+    serial_println("[GUI] Creating FramebufferDriver...")
+    var fb = FramebufferDriver.from_boot_info(fb_info)
+    serial_println("[GUI] FramebufferDriver created")
+
+    # ---- Deterministic BrowserSession pump ----
+    serial_println("[BE] Building browser session...")
+    var session = BrowserSession.new_without_runtime()
+    serial_println("[BE] Starting deterministic session pump...")
+    match _pump_guest_session(session):
+        Ok(_) =>
+            serial_println("[BE] Deterministic session pump completed")
+        Err(e) =>
+            serial_println("[BE] Browser session pump failed: {e}")
+    val page = _page_from_session(session)
+    serial_println("[BE] Building shared browser page...")
+    serial_println("[BE] Browser page built")
+
+    serial_println("[BE] Rendering page scene to pixels...")
+    val scene = page.to_scene()
+    val pixel_count = RENDER_W * RENDER_H
+    var pixels: [u32] = rt_array_new(pixel_count as i64)
+    var idx = 0
+    while idx < pixel_count:
+        pixels.push(0xFFFFFFFF)
+        idx = idx + 1
+    pixels = execute_scene_to_buffer(scene, pixels, RENDER_W, RENDER_H)
+    serial_println("[BE] Pixel buffer generated")
+
+    serial_println("[BE] Blitting pixels to framebuffer...")
+    val render_w_u = RENDER_W.to_u32()
+    val render_h_u = RENDER_H.to_u32()
+    val copy_w = if fb.width < render_w_u: fb.width else: render_w_u
+    val copy_h = if fb.height < render_h_u: fb.height else: render_h_u
+    rt_fb_blit_array32(
+        fb.front_addr,
+        fb.width.to_u64(),
+        pixels,
+        render_w_u.to_u64(),
+        copy_w.to_u64(),
+        copy_h.to_u64()
+    )
+    serial_println("[BE] Frame painted: HTML -> DOM -> layout -> paint -> scene -> software rasterizer -> framebuffer")
+
+    serial_println("[GUI] Entering halt loop (rendered frame held for QMP capture)")
+    while true:
+        rt_hlt()

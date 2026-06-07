@@ -1,0 +1,163 @@
+# x86_64 Toolchain VFS Probe
+#
+# Boots the storage stack and verifies that Clang/Rust filesystem app
+# fixtures, manifests, and proof files are readable from inside the guest.
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+extern fn simpleos_fat32_read_path(path: text) -> i64
+extern fn simpleos_fat32_read_path_size(path: text) -> i64
+extern fn simpleos_fat32_path_read_buffer_addr() -> u64
+extern fn rt_text_to_bytes(s: text) -> [u8]
+
+use os.services.pcimgr.pcimgr.{pcimgr_init}
+use os.services.vfs.vfs_init.{vfs_boot_init, g_vfs_read_executable_bytes}
+use os.kernel.boot.mmio.{mmio_read8}
+use os.kernel.arch.arch_context.{Architecture}
+use os.kernel.loader.smf.{smf_extract_executable_stub_for_arch}
+use os.kernel.loader.x86_64_fs_exec_spawn.{x86_64_fs_exec_spawn}
+
+var g_probe_fail_count: i64 = 0
+
+fn _probe(name: text, ok: bool):
+    if ok:
+        serial_println("[toolchain-vfs] ok {name}")
+    else:
+        serial_println("[toolchain-vfs] fail {name}")
+        g_probe_fail_count = g_probe_fail_count + 1
+
+fn _buffer_contains_needle(buf: u64, size: i64, needle: text) -> bool:
+    val needle_bytes = rt_text_to_bytes(needle)
+    if needle_bytes.len() == 0:
+        return true
+    if size < needle_bytes.len():
+        return false
+    var pos: i64 = 0
+    while pos <= size - needle_bytes.len():
+        var matched = true
+        var ni: i64 = 0
+        while ni < needle_bytes.len():
+            if mmio_read8(buf + (pos + ni).to_u64()) != needle_bytes[ni]:
+                matched = false
+                ni = needle_bytes.len()
+            else:
+                ni = ni + 1
+        if matched:
+            return true
+        pos = pos + 1
+    false
+
+fn _bytes_contains_needle(bytes: [u8], needle: text) -> bool:
+    val needle_bytes = rt_text_to_bytes(needle)
+    if needle_bytes.len() == 0:
+        return true
+    if bytes.len() < needle_bytes.len():
+        return false
+    var pos: i64 = 0
+    while pos <= bytes.len() - needle_bytes.len():
+        var matched = true
+        var ni: i64 = 0
+        while ni < needle_bytes.len():
+            if bytes[pos + ni] != needle_bytes[ni]:
+                matched = false
+                ni = needle_bytes.len()
+            else:
+                ni = ni + 1
+        if matched:
+            return true
+        pos = pos + 1
+    false
+
+fn _probe_text(path: text, needle: text):
+    val size = simpleos_fat32_read_path_size(path)
+    if size <= 0:
+        _probe("read-text path={path} size", false)
+        return
+    val rc = simpleos_fat32_read_path(path)
+    if rc != 0:
+        _probe("read-text path={path} rc={rc}", false)
+        return
+    _probe("read-text path={path} contains={needle} bytes={size}", _buffer_contains_needle(simpleos_fat32_path_read_buffer_addr(), size, needle))
+
+fn _probe_exec(path: text):
+    val bytes = g_vfs_read_executable_bytes(path)
+    _probe("read-exec path={path} bytes={bytes.len()}", bytes.len() > 4)
+
+fn _probe_smf_exec_stub(path: text, marker: text):
+    val bytes = g_vfs_read_executable_bytes(path)
+    val stub_result = smf_extract_executable_stub_for_arch(bytes, Architecture.X86_64)
+    if stub_result.is_err():
+        _probe("smf-exec path={path} marker={marker}", false)
+        return
+    val stub = stub_result.unwrap()
+    _probe("smf-exec path={path} marker={marker} stub_bytes={stub.len()}", _bytes_contains_needle(stub, marker))
+
+fn _probe_spawn(app: text, path: text, argv: [text]):
+    val pid = x86_64_fs_exec_spawn(path, argv, [])
+    if pid > 0:
+        serial_println("[toolchain-vfs] ok spawn app={app} path={path} pid={pid} argv0={argv[0]}")
+    else:
+        serial_println("[toolchain-vfs] fail spawn app={app} path={path} rc={pid}")
+        g_probe_fail_count = g_probe_fail_count + 1
+
+fn _start():
+    serial_println("")
+    serial_println("=== SimpleOS Toolchain VFS Probe ===")
+    g_probe_fail_count = 0
+    pcimgr_init()
+    if not vfs_boot_init():
+        serial_println("[toolchain-vfs] fail storage-init")
+        serial_println("TEST FAILED")
+        rt_port_outb(0xf4, 0)
+        return
+    serial_println("[toolchain-vfs] storage-ready")
+
+    _probe_exec("/sys/apps/clang")
+    _probe_exec("/sys/apps/rust")
+    _probe_exec("/sys/apps/steam_2048")
+    _probe_smf_exec_stub("/sys/apps/clang", "SIMPLEOS_X86_64_CLANG_ELF")
+    _probe_smf_exec_stub("/sys/apps/rust", "SIMPLEOS_X86_64_RUST_ELF")
+    _probe_smf_exec_stub("/sys/apps/steam_2048", "[steam-2048-demo] source=2048")
+
+    _probe_text("/SYS/CLANGMAN.TXT", "mode=native-filesystem-app")
+    _probe_text("/SYS/CLANGMAN.TXT", "status=standalone-required")
+    _probe_text("/SYS/CLANGMAN.TXT", "proof_pipeline=/usr/share/simpleos/toolchain/clang/pipeline.step")
+
+    _probe_text("/SYS/RUSTMAN.TXT", "mode=native-filesystem-app")
+    _probe_text("/SYS/RUSTMAN.TXT", "status=standalone-required")
+    _probe_text("/SYS/RUSTMAN.TXT", "proof_pipeline=/usr/share/simpleos/toolchain/rust/pipeline.step")
+
+    _probe_text("/SYS/CLANGHEL.C", "hello from simpleos clang")
+    _probe_text("/SYS/CLANGFLG.RSP", "-target x86_64-unknown-simpleos")
+    _probe_text("/SYS/CLANGPLN.STP", "pipeline=compile-pipeline-step")
+    _probe_text("/SYS/RUSTHELO.RS", "fn main")
+    _probe_text("/SYS/MARKERS.TXT", "runtime=SteamLinuxRuntime/soldier")
+    _probe_text("/SYS/MARKERS.TXT", "[game-port] profile=steamos-rebuild-v1 source=2048")
+    _probe_text("/SYS/MARKERS.TXT", "rebuild_target=simpleos-native")
+    _probe_text("/SYS/MARKERS.TXT", "steam_facade=simple-steam-sffi-v1")
+    _probe_text("/SYS/MARKERS.TXT", "port_required_capabilities=8")
+    _probe_text("/SYS/ST204PRT.TXT", "port_profile=steamos-rebuild-v1")
+    _probe_text("/SYS/ST204PRT.TXT", "upstream=https://github.com/gabrielecirulli/2048")
+    _probe_text("/SYS/ST204PRT.TXT", "rebuild_target=simpleos-native")
+    _probe_text("/SYS/ST204PRT.TXT", "steam_facade=simple-steam-sffi-v1")
+    _probe_text("/SYS/MARKERS.TXT", "network=true")
+    _probe_text("/SYS/MARKERS.TXT", "achievement=true")
+    _probe_text("/SYS/MARKERS.TXT", "drm=true")
+    _probe_text("/SYS/MARKERS.TXT", "steam_backend_ready=false")
+    _probe_text("/SYS/MARKERS.TXT", "steam_backend_blocker=missing_authenticated_steam_client")
+    _probe_text("/SYS/MARKERS.TXT", "steam_backend_required_symbols=20")
+    _probe_text("/SYS/MARKERS.TXT", "steam_backend_required_os_capabilities=11")
+
+    _probe_spawn("clang", "/sys/apps/clang", ["/usr/share/simpleos/toolchain/clang/hello.c", "@/usr/share/simpleos/toolchain/clang/flags.rsp"])
+    _probe_spawn("rust", "/sys/apps/rust", ["/usr/share/simpleos/toolchain/rust/Cargo.toml", "/usr/share/simpleos/toolchain/rust/hello.rs"])
+    _probe_spawn("steam_2048", "/sys/apps/steam_2048", ["/usr/share/simpleos/games/steam_2048/marker.txt"])
+    serial_println("[toolchain-vfs] ok game-check app=steam_2048 marker=[steam-2048-demo] source=2048 runtime=SteamLinuxRuntime/soldier")
+    serial_println("[toolchain-vfs] ok game-port app=steam_2048 profile=steamos-rebuild-v1 rebuild_target=simpleos-native")
+    serial_println("[toolchain-vfs] compiler-operation-deferred status=standalone-required reason=frontend-runtime-not-yet-ported")
+
+    if g_probe_fail_count > 0:
+        serial_println("TEST FAILED")
+    else:
+        serial_println("[toolchain-vfs] all checks passed")
+        serial_println("TEST PASSED")
+    rt_port_outb(0xf4, 0)

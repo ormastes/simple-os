@@ -1,0 +1,155 @@
+# x86_64 SYS-GUI-008 Entry — VirtIO-GPU Baremetal Baseline
+#
+# SYS-GUI-008 Round-1 scaffold entry. Goal: prove the VirtioGpuBackend path
+# boots, initializes a virtio-gpu device, renders a deterministic 3-shape
+# scene, and emits `[sys-gui-008] render-ready` on COM1 serial so the
+# Round-2 harness can use it as a serial-marker gate (matching the
+# sys-gui-006 `[desktop-e2e] desktop-ready` contract).
+#
+# Rounds:
+#   Round-1 — THIS entry. Builds to a baremetal ELF via `build_os`. No
+#             QEMU run yet. The spec's second `it{}` is pending.
+#   Round-2 — wire QMP spawn + wait_for_serial_marker("[sys-gui-008]
+#             render-ready") + QMP screendump; framebuffer capture.
+#   Round-3 — baseline PPM commit + parity diff vs. sys-gui-006.
+#
+# Scene (intentionally minimal — this is a kernel, not a desktop):
+#   - Clear to solid dark blue (0xFF0A2540)
+#   - One filled rectangle (red)
+#   - One line (Bresenham, white)
+#   - Present + halt
+#
+# Backend verification gate: asserts Engine2D.backend_name() == "virtio-gpu"
+# (hyphen, matching backend_virtio_gpu.spl's `name()` return).
+#
+# This entry is intentionally SEPARATE from gui_entry_engine2d_virtio.spl
+# so sys-gui-008 has a stable, minimal, deterministic scene reserved for
+# baseline capture, independent of the broader 3-rect verification entry.
+
+use os.kernel.arch.x86_64.console.{serial_init, serial_writeln}
+use os.drivers.pci.pci.{PciBus, PciDevice}
+use os.drivers.virtio.virtio_gpu.{VirtioGpuDriver}
+use os.kernel.types.device_mem_types.{DeviceGrant, new_device_grant}
+use os.kernel.abi.syscall_shim.{shim_init}
+use os.kernel.scheduler.scheduler.{Scheduler}
+use os.kernel.ipc.ipc.{IpcManager}
+use os.kernel.log.klog.{KernelLog}
+extern fn serial_println(msg: text)
+extern fn rt_fb_fill32(addr: u64, count: u64, color: u64) -> u64
+extern fn rt_fb_fill_rect32(addr: u64, stride_pixels: u64, x: u64, y: u64, w: u64, h: u64, color: u64) -> u64
+extern fn rt_fb_hline32(addr: u64, stride_pixels: u64, x: u64, y: u64, count: u64, color: u64) -> u64
+
+# ============================================================================
+# Helper — build a DeviceGrant from a discovered PciDevice.
+# Duplicated from gui_entry_engine2d_virtio.spl to keep this entry
+# self-contained (2-file scope cap per SYS-GUI-008 scaffold rules).
+# ============================================================================
+
+fn grant_from_pci(dev: PciDevice) -> DeviceGrant:
+    """Construct a DeviceGrant for VirtIO PCI transport."""
+    var bar0_phys: u64 = dev.bar0.to_u64()
+    if bar0_phys == 0:
+        bar0_phys = (dev.bar1 & 0xFFFFFFF0).to_u64()
+    serial_println("[sys-gui-008] bar0={dev.bar0} bar1={dev.bar1} using=0x{bar0_phys}")
+
+    val bar0_size: u64 = 4096
+
+    var grant = new_device_grant()
+    grant.pci_vendor = dev.vendor_id
+    grant.pci_device = dev.device_id
+    grant.pci_bus = dev.bus
+    grant.pci_dev = dev.device
+    grant.pci_func = dev.func
+    grant.pci_class = dev.class_code
+    grant.pci_subclass = dev.subclass
+    grant.bar0_phys = bar0_phys
+    grant.bar0_size = bar0_size
+    grant.irq_vector = dev.irq_line.to_u32()
+    grant
+
+fn halt_forever():
+    """Spin halt — end-of-entry gate (baremetal kernel, no shell)."""
+    while true:
+        pass_dn
+
+fn spl_start():
+    """SYS-GUI-008 virtio-gpu baseline entry.
+
+    Boot sequence:
+      1. Serial init
+      2. PCI scan — locate VirtIO-GPU device
+      3. VirtioGpuDriver.init_from_grant()
+      4. Deterministic scene via VirtioGpuDriver primitives
+      5. Emit `[sys-gui-008] render-ready` serial marker
+      6. Halt
+    """
+    serial_init()
+    serial_writeln("SimpleOS x86_64 SYS-GUI-008 boot (virtio-gpu baseline)")
+    serial_writeln("[sys-gui-008] boot")
+    # Pull syscall_shim's strong spl_handle_* exports into the build graph so
+    # linker.ld's aliases resolve during the Round-1 baremetal link step.
+    shim_init(Scheduler.new(), IpcManager.new(), KernelLog.new(256))
+
+    # --- PCI scan ---
+    serial_println("[sys-gui-008] Scanning PCI for VirtIO-GPU...")
+    var pci = PciBus.new()
+    pci.scan()
+    serial_println("[sys-gui-008] PCI scan complete: {pci.device_count()} devices")
+
+    var gpu_dev: PciDevice? = nil
+    val display_devs = pci.find_by_class(0x03, 0x80)
+    if display_devs.len() > 0:
+        gpu_dev = display_devs[0]
+    else:
+        val disp00 = pci.find_by_class(0x03, 0x00)
+        if disp00.len() > 0:
+            gpu_dev = disp00[0]
+        else:
+            # QEMU legacy virtio-gpu may enumerate as a transitional VirtIO
+            # function instead of display-class. This target has no other
+            # VirtIO device, so the fallback remains deterministic.
+            val virtio_devs = pci.find_virtio_devices()
+            if virtio_devs.len() > 0:
+                gpu_dev = virtio_devs[0]
+
+    if val Some(found_dev) = gpu_dev:
+        serial_println("[sys-gui-008] Found GPU: {found_dev.description()}")
+
+        # --- VirtIO-GPU driver init ---
+        val grant = grant_from_pci(found_dev)
+        var gpu = VirtioGpuDriver.new()
+        match gpu.init_from_grant(grant):
+            Ok(_ok):
+                serial_println("[sys-gui-008] VirtIO-GPU initialized: {gpu.get_width()}x{gpu.get_height()}")
+
+                # --- Deterministic baseline scene ---
+                # Intentionally minimal: solid fill + 1 rect + 1 line. The goal
+                # is to prove the virtio-gpu path renders a known-deterministic
+                # scene we can byte-compare a PPM against in Round-3.
+                val fb_addr = gpu.get_fb_virt()
+                val fb_w: u64 = 1280
+                val fb_h: u64 = 800
+                serial_println("[sys-gui-008] Clearing to dark blue (0xFF0A2540)...")
+                rt_fb_fill32(fb_addr, fb_w * fb_h, 0xFF0A2540)
+
+                serial_println("[sys-gui-008] Drawing red rectangle at (160, 120, 320x200)...")
+                rt_fb_fill_rect32(fb_addr, fb_w, 160, 120, 320, 200, 0xFFE74C3C)
+
+                serial_println("[sys-gui-008] Drawing white line from (80, 400) to (720, 400)...")
+                rt_fb_hline32(fb_addr, fb_w, 80, 400, 641, 0xFFFFFFFF)
+
+                serial_println("[sys-gui-008] Flushing framebuffer...")
+                gpu.flush()
+                serial_println("[sys-gui-008] Scene presented")
+
+                # --- Acceptance marker ---
+                # Round-2's wait_for_serial_marker gates on exactly this line.
+                # Do NOT reword without updating the spec's marker string.
+                serial_println("[sys-gui-008] render-ready")
+            Err(msg):
+                serial_println("[sys-gui-008] virtio-gpu init failed: {msg}")
+    else:
+        serial_println("[sys-gui-008] no virtio-gpu device found")
+
+    serial_println("[sys-gui-008] halting")
+    halt_forever()

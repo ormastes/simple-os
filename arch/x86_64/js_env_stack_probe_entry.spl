@@ -1,0 +1,69 @@
+#![allow(unnamed_duplicate_typed_args)]
+
+use os.kernel.arch.x86_64.console.{serial_init, serial_writeln}
+use os.kernel.arch.x86_64.interrupt.{X86Interrupt}
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_early_init}
+use os.kernel.abi.syscall_shim.{shim_init}
+use os.kernel.scheduler.scheduler.{Scheduler}
+use os.kernel.ipc.ipc.{IpcManager}
+use os.kernel.log.klog.{KernelLog}
+use std.js.engine.interpreter_types.{EnvironmentStack}
+use std.js.types.js_types.{JsValue}
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+
+fn _probe() -> Result<bool, text>:
+    var envs = EnvironmentStack.new()
+    val global_env = envs.create_env(-1)
+    val child_env = envs.create_env(global_env)
+
+    envs.define_var(global_env, "root", JsValue.Number(v: 7.0))
+    envs.define_var(child_env, "leaf", JsValue.String(v: "ok"))
+
+    if val Some(root_value) = envs.get_var(child_env, "root"):
+        if val JsValue.Number(v) = root_value:
+            if v != 7.0:
+                return Err("root value mismatch after define_var")
+        else:
+            return Err("root value wrong type")
+    else:
+        return Err("root value missing from child scope chain")
+
+    envs.set_var(child_env, "root", JsValue.Number(v: 9.0))
+    if val Some(updated_root) = envs.get_var(global_env, "root"):
+        if val JsValue.Number(v) = updated_root:
+            if v != 9.0:
+                return Err("set_var did not update parent scope")
+        else:
+            return Err("updated root wrong type")
+    else:
+        return Err("updated root missing")
+
+    if val Some(leaf_value) = envs.get_var(child_env, "leaf"):
+        if val JsValue.String(v) = leaf_value:
+            if v != "ok":
+                return Err("leaf value mismatch")
+        else:
+            return Err("leaf value wrong type")
+    else:
+        return Err("leaf value missing")
+
+    Ok(true)
+
+fn _start():
+    serial_init()
+    serial_writeln("SimpleOS x86_64 JS EnvironmentStack probe")
+
+    arch_x86_64_early_init()
+    shim_init(Scheduler.new(), IpcManager.new(), KernelLog.new(128))
+    if not X86Interrupt.runtime_installed():
+        X86Interrupt.install_bootstrap_runtime(64)
+
+    match _probe():
+        Ok(_) =>
+            serial_println("[JSE] EnvStack probe passed")
+        Err(e) =>
+            serial_println("[JSE] EnvStack probe failed: {e}")
+
+    rt_port_outb(0xf4, 0u8)

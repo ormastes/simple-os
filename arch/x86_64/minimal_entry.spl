@@ -1,0 +1,7 @@
+# Minimal x86_64 GUI entry — delegates to minimal_gui.spl
+# Lives next to boot/ directory so crt0.s and baremetal_stubs.c are linked.
+
+use simple_os.src.minimal_gui.{_start as gui_start}
+
+fn _start():
+    gui_start()

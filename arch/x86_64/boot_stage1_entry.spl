@@ -1,0 +1,63 @@
+# x86_64 Boot Stage 1 — Kernel boot only (serial, heap, PCI scan)
+#
+# Minimal entry that verifies the kernel can boot and PCI devices are visible.
+# No POSIX, no shell, no VFS, no network. Target: ~20 files in closure.
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+extern fn rt_harden_text_write_trap_probe() -> i64
+extern fn simpleos_nvme_init() -> i64
+extern fn simpleos_nvme_rw_selftest() -> i64
+extern fn simpleos_virtio_net_selftest() -> i64
+
+use os.kernel.arch_adapt.x86_64_hardening_probe.{x86_64_hardening_boot_canary_marker}
+use os.services.pcimgr.pcimgr.{pcimgr_init, pcimgr_dump_devices, pcimgr_device_count, pcimgr_find_by_class_i64}
+
+fn _start():
+    serial_println("")
+    serial_println("=== SimpleOS Boot Stage 1 ===")
+    serial_println("[stage1] Kernel boot only (serial + PCI)")
+    serial_println(x86_64_hardening_boot_canary_marker())
+    if rt_harden_text_write_trap_probe() == 1:
+        serial_println("[harden] text_write_trap=pass")
+    else:
+        serial_println("[harden] text_write_trap=fail")
+    serial_println("")
+
+    # PCI enumeration
+    serial_println("[stage1] Initializing PCI manager...")
+    pcimgr_init()
+    serial_println("[stage1] PCI manager initialized")
+
+    pcimgr_dump_devices()
+    serial_println("[stage1] pci_count=" + pcimgr_device_count().to_text())
+    if pcimgr_find_by_class_i64(1, 8) >= 0:
+        serial_println("[stage1] nvme_pci=present")
+        val nvme_init = simpleos_nvme_init()
+        if nvme_init == 0:
+            serial_println("[stage1] nvme_identify_read=pass")
+        else:
+            serial_println("[stage1] nvme_identify_read=fail rc=" + nvme_init.to_text())
+        val nvme_rw = simpleos_nvme_rw_selftest()
+        if nvme_rw == 0:
+            serial_println("[stage1] nvme_rw_restore=pass")
+        else:
+            serial_println("[stage1] nvme_rw_restore=fail rc=" + nvme_rw.to_text())
+    else:
+        serial_println("[stage1] nvme_pci=missing")
+    if pcimgr_find_by_class_i64(2, 0) >= 0:
+        serial_println("[stage1] net_pci=present")
+        val net_rw = simpleos_virtio_net_selftest()
+        if net_rw == 0:
+            serial_println("[stage1] virtio_net_tx_rx=pass")
+        else:
+            serial_println("[stage1] virtio_net_tx_rx=fail rc=" + net_rw.to_text())
+    else:
+        serial_println("[stage1] net_pci=missing")
+
+    serial_println("")
+    serial_println("[stage1] PASS: Kernel boot + PCI scan")
+    serial_println("TEST PASSED")
+
+    # Exit QEMU via ISA debug exit
+    rt_port_outb(0xf4, 0)

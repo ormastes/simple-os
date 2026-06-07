@@ -1,0 +1,1 @@
+../../arch/x86_64/boot/baremetal_stubs.c

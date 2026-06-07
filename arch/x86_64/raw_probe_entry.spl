@@ -1,0 +1,9 @@
+#![allow(unnamed_duplicate_typed_args)]
+# Minimal raw x86_64 probe entry for frame-size diagnostics.
+
+extern fn rt_debug_naked_show_return_hang()
+
+fn spl_start():
+    rt_debug_naked_show_return_hang()
+    while true:
+        pass

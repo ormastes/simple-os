@@ -1,0 +1,44 @@
+# x86_64 SSH Live Entry — production SimpleOS SSH daemon
+#
+# QEMU forwards host port 2222 to guest port 22 for host-side OpenSSH smokes.
+
+use build.os.generated.ssh_live_build_marker.{ssh_live_build_marker}
+use os.apps.sshd.sshd.{SshDaemon}
+
+extern fn serial_println(msg: text)
+extern fn rt_net_init() -> i64
+extern fn rt_net_stats() -> i64
+extern fn rt_embedded_host_rsa_pkcs8() -> [u8]
+extern fn rt_embedded_host_rsa_public_blob() -> [u8]
+
+fn _start():
+    serial_println("")
+    serial_println("=== SimpleOS SSH Live Boot ===")
+    serial_println("[boot] Build marker:")
+    serial_println(ssh_live_build_marker())
+    serial_println("")
+
+    serial_println("[boot] Initializing C-backed network runtime")
+    val net_init = rt_net_init()
+    serial_println("[boot] rt_net_init rc={net_init}")
+    if net_init < 0:
+        serial_println("[FATAL] SSH network init failed")
+        return
+    val _net_stats = rt_net_stats()
+
+    var daemon = SshDaemon.new(22)
+
+    val rsa_pkcs8 = rt_embedded_host_rsa_pkcs8()
+    val rsa_public_blob = rt_embedded_host_rsa_public_blob()
+    if rsa_pkcs8.len() > 0 and rsa_public_blob.len() > 0:
+        serial_println("[boot] Live host key policy: Ed25519 enabled; RSA staged but disabled pending baremetal signer heap fix")
+    else:
+        serial_println("[boot] Live host key policy: Ed25519 only (embedded RSA unavailable)")
+
+    serial_println("[boot] Starting production SSH daemon on port 22")
+    serial_println("[ssh-live] production-daemon-starting port=22 hostfwd=2222")
+    match daemon.start():
+        Ok(_):
+            serial_println("[ssh-live] production-daemon-stopped")
+        Err(err):
+            serial_println("[FATAL] SSH daemon failed: {err}")

@@ -1,0 +1,43 @@
+# x86_64 Boot Stage 2 — Storage stack (PCI + NVMe + FAT32 + VFS)
+#
+# Extends stage 1 with full storage initialization.
+# Tests: PCI scan -> NVMe driver -> FAT32 mount -> VFS read.
+# No network, no POSIX layer, no shell. Target: ~40 files in closure.
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+
+use os.services.pcimgr.pcimgr.{pcimgr_init, pcimgr_dump_devices}
+use os.services.vfs.vfs_init.{vfs_boot_init, vfs_is_ready}
+
+fn _start():
+    serial_println("")
+    serial_println("=== SimpleOS Boot Stage 2 ===")
+    serial_println("[stage2] Storage stack (PCI + NVMe + FAT32 + VFS)")
+    serial_println("")
+
+    # PCI enumeration
+    serial_println("[stage2] Initializing PCI manager...")
+    pcimgr_init()
+    serial_println("[stage2] PCI manager initialized")
+    pcimgr_dump_devices()
+
+    # Storage stack
+    serial_println("[stage2] Initializing storage stack...")
+    val storage_ok = vfs_boot_init()
+    if storage_ok:
+        serial_println("[stage2] Storage stack: OK")
+    else:
+        serial_println("[stage2] Storage stack: UNAVAILABLE (no NVMe or no FAT32)")
+
+    if vfs_is_ready():
+        serial_println("[stage2] VFS: ready")
+    else:
+        serial_println("[stage2] VFS: not ready")
+
+    serial_println("")
+    serial_println("[stage2] PASS: Storage stack initialization")
+    serial_println("TEST PASSED")
+
+    # Exit QEMU via ISA debug exit
+    rt_port_outb(0xf4, 0)

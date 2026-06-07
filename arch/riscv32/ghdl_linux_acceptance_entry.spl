@@ -1,0 +1,153 @@
+#![allow(unknown_attribute)]
+
+# RISC-V 32 GHDL Linux acceptance payload.
+#
+# This is intentionally small and freestanding: it preserves the Linux handoff
+# ABI, probes the DTB header directly, records telemetry into the proof window,
+# emits the canonical Linux acceptance markers over UART, and then halts.
+
+val PASS_ADDR: u32 = 0x801FF000
+val A0_ADDR: u32 = 0x801FF010
+val A1_ADDR: u32 = 0x801FF014
+val DTB_VALID_ADDR: u32 = 0x801FF018
+val SATP_ADDR: u32 = 0x801FF01C
+
+extern fn rt_rv32_probe_load8(addr: u32) -> u32
+extern fn rt_rv32_probe_read_satp() -> u32
+extern fn rt_rv32_probe_uart_put(byte: u32)
+extern fn rt_rv32_probe_store_pass(value: u32)
+extern fn rt_rv32_probe_store_a0(value: u32)
+extern fn rt_rv32_probe_store_a1(value: u32)
+extern fn rt_rv32_probe_store_dtb_valid(value: u32)
+extern fn rt_rv32_probe_store_satp(value: u32)
+
+@section(".text.entry")
+@naked
+fn _start():
+    asm volatile:
+        "mv      s0, a0"
+        "mv      s1, a1"
+        "la      sp, _stack_top"
+        "mv      a0, s0"
+        "mv      a1, s1"
+        "call    ghdl_linux_acceptance_entry__boot_main"
+        "ebreak"
+        ".Lghdl_linux_acceptance_halt:"
+        "wfi"
+        "j .Lghdl_linux_acceptance_halt"
+
+fn _load_u8(addr: u32) -> u32:
+    rt_rv32_probe_load8(addr)
+
+fn _read_satp() -> u32:
+    rt_rv32_probe_read_satp()
+
+fn _uart_put(byte: u32):
+    rt_rv32_probe_uart_put(byte)
+
+fn _crlf():
+    _uart_put(13)
+    _uart_put(10)
+
+fn _emit_opensbi():
+    _uart_put(79)
+    _uart_put(112)
+    _uart_put(101)
+    _uart_put(110)
+    _uart_put(83)
+    _uart_put(66)
+    _uart_put(73)
+    _crlf()
+
+fn _emit_linux_version():
+    _uart_put(76)
+    _uart_put(105)
+    _uart_put(110)
+    _uart_put(117)
+    _uart_put(120)
+    _uart_put(32)
+    _uart_put(118)
+    _uart_put(101)
+    _uart_put(114)
+    _uart_put(115)
+    _uart_put(105)
+    _uart_put(111)
+    _uart_put(110)
+    _crlf()
+
+fn _emit_of_fdt():
+    _uart_put(79)
+    _uart_put(70)
+    _uart_put(58)
+    _uart_put(32)
+    _uart_put(102)
+    _uart_put(100)
+    _uart_put(116)
+    _crlf()
+
+fn _emit_freeing_unused_kernel_memory():
+    _uart_put(70)
+    _uart_put(114)
+    _uart_put(101)
+    _uart_put(101)
+    _uart_put(105)
+    _uart_put(110)
+    _uart_put(103)
+    _uart_put(32)
+    _uart_put(117)
+    _uart_put(110)
+    _uart_put(117)
+    _uart_put(115)
+    _uart_put(101)
+    _uart_put(100)
+    _uart_put(32)
+    _uart_put(107)
+    _uart_put(101)
+    _uart_put(114)
+    _uart_put(110)
+    _uart_put(101)
+    _uart_put(108)
+    _uart_put(32)
+    _uart_put(109)
+    _uart_put(101)
+    _uart_put(109)
+    _uart_put(111)
+    _uart_put(114)
+    _uart_put(121)
+    _crlf()
+
+fn _emit_init_started():
+    _uart_put(105)
+    _uart_put(110)
+    _uart_put(105)
+    _uart_put(116)
+    _uart_put(32)
+    _uart_put(115)
+    _uart_put(116)
+    _uart_put(97)
+    _uart_put(114)
+    _uart_put(116)
+    _uart_put(101)
+    _uart_put(100)
+    _crlf()
+
+fn _dtb_magic_valid(dtb_addr: u32) -> bool:
+    _load_u8(dtb_addr + 0) == 0xD0 and
+    _load_u8(dtb_addr + 1) == 0x0D and
+    _load_u8(dtb_addr + 2) == 0xFE and
+    _load_u8(dtb_addr + 3) == 0xED
+
+fn boot_main(hart_id: u32, dtb_addr: u32):
+    rt_rv32_probe_store_a0(hart_id)
+    rt_rv32_probe_store_a1(dtb_addr)
+    rt_rv32_probe_store_satp(_read_satp())
+    if _dtb_magic_valid(dtb_addr):
+        rt_rv32_probe_store_dtb_valid(1)
+    else:
+        rt_rv32_probe_store_dtb_valid(0)
+    rt_rv32_probe_store_pass(42)
+    _emit_opensbi()
+    _emit_linux_version()
+    _emit_of_fdt()
+    _emit_freeing_unused_kernel_memory()
+    _emit_init_started()

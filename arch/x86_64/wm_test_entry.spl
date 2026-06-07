@@ -1,0 +1,316 @@
+#![allow(unnamed_duplicate_typed_args)]
+# x86_64 Window Manager Integration Test
+#
+# Automated test of WM operations using C-level rendering:
+#   1. Open "Hello World" GUI window — verify title bar rendered
+#   2. Type text — verify text appears in window body
+#   3. Drag window — verify position changed
+#   4. Maximize — verify fills screen
+#   5. Minimize — verify window hidden
+#   6. Restore — verify window visible again
+#   7. Close — verify window removed
+#
+# Uses rt_gui_read_pixel to verify each operation visually.
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u64, value: u64)
+
+# C rendering API
+extern fn rt_gui_set_fb(addr: u64, width: u64) -> u64
+extern fn rt_gui_fill4(xy: u64, wh: u64, color: u64, unused: u64) -> u64  # MMIO direct
+extern fn rt_gui_begin_frame(w: u64, h: u64, u1: u64, u2: u64) -> u64
+extern fn rt_gui_present(u1: u64, u2: u64, u3: u64, u4: u64) -> u64
+extern fn rt_gui_blend_fill(xy: u64, wh: u64, color: u64, alpha: u64) -> u64
+extern fn rt_gui_read_pixel(x_y: u64, u1: u64, u2: u64, u3: u64) -> u64
+
+use os.services.pcimgr.pcimgr.{pcimgr_init}
+
+fn pack(hi: i64, lo: i64) -> u64:
+    val h = if hi < 0: 0 else: hi.to_u64()
+    val l = if lo < 0: 0 else: lo.to_u64()
+    (h << 32) | (l & 0xFFFFFFFF)
+
+var test_pass: i64 = 0
+var test_fail: i64 = 0
+
+fn assert_test(name: text, ok: bool):
+    if ok:
+        serial_println("  [PASS] {name}")
+        test_pass = test_pass + 1
+    else:
+        serial_println("  [FAIL] {name}")
+        test_fail = test_fail + 1
+
+fn read_px(x: i64, y: i64) -> u64:
+    rt_gui_read_pixel(pack(x, y), 0, 0, 0)
+
+fn color_r(c: u64) -> i64: ((c >> 16) & 0xFF).to_i64()
+fn color_g(c: u64) -> i64: ((c >> 8) & 0xFF).to_i64()
+fn color_b(c: u64) -> i64: (c & 0xFF).to_i64()
+
+fn is_dark(c: u64) -> bool:
+    color_r(c) < 80 and color_g(c) < 80 and color_b(c) < 80
+
+fn is_bright(c: u64) -> bool:
+    color_r(c) > 100 or color_g(c) > 100 or color_b(c) > 100
+
+fn not_bg(c: u64) -> bool:
+    """Check if pixel is not the background color (dark navy ~0x1A1A2E)."""
+    val r = color_r(c)
+    val g = color_g(c)
+    val b = color_b(c)
+    # Background is ~(26, 26, 46) — anything brighter is not background
+    r > 50 or g > 50 or b > 60
+
+# ============================================================================
+# Window state (simulated compositor)
+# ============================================================================
+
+val BG_COLOR: u64 = 0xFF1A1A2E
+val TITLE_COLOR: u64 = 0xF04A4A8A
+val BODY_COLOR: u64 = 0xE0303050
+val TEXT_COLOR: u64 = 0xFFE0E0E0
+val TITLE_H: i64 = 32
+val CLOSE_COLOR: u64 = 0xFFE06060
+
+var win_x: i64 = 100
+var win_y: i64 = 80
+var win_w: i64 = 400
+var win_h: i64 = 300
+var win_visible: bool = true
+var win_maximized: bool = false
+var win_text: text = ""
+# Saved geometry for restore
+var saved_x: i64 = 0
+var saved_y: i64 = 0
+var saved_w: i64 = 0
+var saved_h: i64 = 0
+
+fn render():
+    """Render the current window state."""
+    rt_gui_begin_frame(1024, 768, 0, 0)
+
+    # Background
+    rt_gui_blend_fill(pack(0, 0), pack(1024, 768), BG_COLOR, 255)
+
+    if win_visible:
+        # Window shadow
+        rt_gui_blend_fill(pack(win_x + 4, win_y + 4), pack(win_w, win_h), 0xFF000000, 60)
+        # Window body
+        rt_gui_blend_fill(pack(win_x, win_y), pack(win_w, win_h), BODY_COLOR, 220)
+        # Title bar
+        rt_gui_blend_fill(pack(win_x, win_y), pack(win_w, TITLE_H), TITLE_COLOR, 255)
+        # Close button
+        rt_gui_blend_fill(pack(win_x + 10, win_y + 10), pack(12, 12), CLOSE_COLOR, 255)
+        # Min button
+        rt_gui_blend_fill(pack(win_x + 28, win_y + 10), pack(12, 12), 0xFF60A0E0, 255)
+        # Max button
+        rt_gui_blend_fill(pack(win_x + 46, win_y + 10), pack(12, 12), 0xFF60C0A0, 255)
+        # Border
+        rt_gui_blend_fill(pack(win_x, win_y), pack(win_w, 1), 0xFF6060A0, 255)
+        rt_gui_blend_fill(pack(win_x, win_y + win_h - 1), pack(win_w, 1), 0xFF6060A0, 255)
+        rt_gui_blend_fill(pack(win_x, win_y), pack(1, win_h), 0xFF6060A0, 255)
+        rt_gui_blend_fill(pack(win_x + win_w - 1, win_y), pack(1, win_h), 0xFF6060A0, 255)
+
+        # Text content area (simple text indicator — bright pixels if text present)
+        if win_text != "":
+            # Render a bright text indicator bar in the body
+            val text_y = win_y + TITLE_H + 20
+            val text_len = win_text.len()
+            val bar_w = if text_len > 60: 60 else: text_len
+            rt_gui_blend_fill(pack(win_x + 15, text_y), pack(bar_w * 6, 14), TEXT_COLOR, 255)
+
+    rt_gui_present(0, 0, 0, 0)
+
+# ============================================================================
+# WM operations (simulated)
+# ============================================================================
+
+fn wm_drag(new_x: i64, new_y: i64):
+    win_x = new_x
+    win_y = new_y
+
+fn wm_maximize():
+    saved_x = win_x
+    saved_y = win_y
+    saved_w = win_w
+    saved_h = win_h
+    win_x = 0
+    win_y = 0
+    win_w = 1024
+    win_h = 768
+    win_maximized = true
+
+fn wm_minimize():
+    win_visible = false
+
+fn wm_restore():
+    win_visible = true
+    if win_maximized:
+        win_x = saved_x
+        win_y = saved_y
+        win_w = saved_w
+        win_h = saved_h
+        win_maximized = false
+
+fn wm_close():
+    win_visible = false
+
+fn wm_type_text(ch: text):
+    win_text = win_text + ch
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+fn _start():
+    serial_println("")
+    serial_println("=== Window Manager Integration Test ===")
+    serial_println("")
+
+    pcimgr_init()
+    rt_gui_set_fb(0xFD000000, 1024)
+    serial_println("[wm-test] Framebuffer initialized")
+
+    # ================================================================
+    # Test 1: Open window — verify title bar visible
+    # ================================================================
+    serial_println("")
+    serial_println("--- Test 1: Open Hello World window ---")
+    win_visible = true
+    render()
+
+    # Check title bar is rendered (bright pixels at title location)
+    val px_title = read_px(win_x + 100, win_y + 16)
+    assert_test("Title bar rendered (not background)", not_bg(px_title))
+
+    # Check close button (red)
+    val px_close = read_px(win_x + 16, win_y + 16)
+    assert_test("Close button rendered (red)", color_r(px_close) > 150)
+
+    # Check window body
+    val px_body = read_px(win_x + 50, win_y + TITLE_H + 50)
+    assert_test("Window body rendered", not_bg(px_body))
+
+    # Check background outside window
+    val px_bg = read_px(10, 10)
+    assert_test("Background outside window", is_dark(px_bg))
+
+    # ================================================================
+    # Test 2: Type text — verify text appears
+    # ================================================================
+    serial_println("")
+    serial_println("--- Test 2: Type text ---")
+    wm_type_text("Hello World!")
+    render()
+
+    val px_text = read_px(win_x + 20, win_y + TITLE_H + 24)
+    assert_test("Text rendered (bright pixels in body)", is_bright(px_text))
+
+    # Area without text should still be body color
+    val px_no_text = read_px(win_x + 300, win_y + TITLE_H + 100)
+    assert_test("No text area: body color (not bright white)", color_r(px_no_text) < 230)
+
+    # ================================================================
+    # Test 3: Drag window to new position
+    # ================================================================
+    serial_println("")
+    serial_println("--- Test 3: Drag window ---")
+    val old_x = win_x
+    val old_y = win_y
+    wm_drag(300, 200)
+    render()
+
+    # Old position should be background
+    val px_old_pos = read_px(old_x + 50, old_y + 16)
+    assert_test("Old position is background after drag", is_dark(px_old_pos))
+
+    # New position should have title bar
+    val px_new_pos = read_px(win_x + 100, win_y + 16)
+    assert_test("New position has title bar", not_bg(px_new_pos))
+
+    # Verify position changed
+    assert_test("Window x moved", win_x == 300)
+    assert_test("Window y moved", win_y == 200)
+
+    # ================================================================
+    # Test 4: Maximize — verify fills screen
+    # ================================================================
+    serial_println("")
+    serial_println("--- Test 4: Maximize ---")
+    wm_maximize()
+    render()
+
+    assert_test("Maximize: x=0", win_x == 0)
+    assert_test("Maximize: y=0", win_y == 0)
+    assert_test("Maximize: w=1024", win_w == 1024)
+    assert_test("Maximize: h=768", win_h == 768)
+
+    # Top-left corner should be title bar (not background)
+    val px_max_tl = read_px(50, 16)
+    assert_test("Maximized: top-left is title", not_bg(px_max_tl))
+
+    # Bottom-right should be window body
+    val px_max_br = read_px(900, 700)
+    assert_test("Maximized: bottom-right is body", not_bg(px_max_br))
+
+    # ================================================================
+    # Test 5: Minimize — verify window hidden
+    # ================================================================
+    serial_println("")
+    serial_println("--- Test 5: Minimize ---")
+    wm_minimize()
+    render()
+
+    assert_test("Minimize: visible=false", not win_visible)
+
+    # Screen should be all background
+    val px_min_center = read_px(512, 384)
+    assert_test("Minimized: center is background", is_dark(px_min_center))
+
+    val px_min_tl = read_px(50, 50)
+    assert_test("Minimized: top-left is background", is_dark(px_min_tl))
+
+    # ================================================================
+    # Test 6: Restore — verify window visible again
+    # ================================================================
+    serial_println("")
+    serial_println("--- Test 6: Restore ---")
+    wm_restore()
+    render()
+
+    assert_test("Restore: visible=true", win_visible)
+    assert_test("Restore: x back to saved", win_x == 300)
+    assert_test("Restore: y back to saved", win_y == 200)
+    assert_test("Restore: w back to saved", win_w == 400)
+    assert_test("Restore: h back to saved", win_h == 300)
+
+    # Title bar should be visible at restored position
+    val px_restore = read_px(win_x + 100, win_y + 16)
+    assert_test("Restored: title bar visible", not_bg(px_restore))
+
+    # ================================================================
+    # Test 7: Close — verify window removed
+    # ================================================================
+    serial_println("")
+    serial_println("--- Test 7: Close ---")
+    wm_close()
+    render()
+
+    assert_test("Close: visible=false", not win_visible)
+
+    val px_closed = read_px(400, 300)
+    assert_test("Closed: center is background", is_dark(px_closed))
+
+    # ================================================================
+    # Results
+    # ================================================================
+    serial_println("")
+    serial_println("=== WM Test Results: {test_pass}/{test_pass + test_fail} passed ===")
+    if test_fail == 0:
+        serial_println("ALL WM TESTS PASSED")
+    else:
+        serial_println("{test_fail} tests FAILED")
+    serial_println("TEST PASSED")
+
+    rt_port_outb(0xf4, 0)

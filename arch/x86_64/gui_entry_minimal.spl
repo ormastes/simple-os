@@ -1,0 +1,74 @@
+# Minimal GUI Entry — full PCI scan + BGA + GUI desktop
+#
+# Uses extern fn declarations + while loop + >> (right shift) for PCI scan.
+# Tests the complete boot flow: PCI enumeration → BGA init → desktop render.
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outl(port: u64, value: u64)
+extern fn rt_port_inl(port: u64) -> u64
+extern fn rt_port_outw(port: u64, value: u64)
+extern fn rt_gui_set_fb(addr: u64, width: u64)
+extern fn rt_gui_render_desktop(unused1: u64, unused2: u64)
+
+fn spl_start():
+    serial_println("[GUI-MIN] Starting full PCI + BGA + GUI test")
+
+    # PCI scan with while loop + >> (right shift)
+    var dev: u64 = 0
+    var count: u64 = 0
+    var vga_dev: u64 = 0
+    while dev < 32:
+        val addr = 0x80000000 | (dev << 11)
+        rt_port_outl(0xCF8, addr)
+        val raw = rt_port_inl(0xCFC)
+        val v = raw & 0xFFFF
+        if v != 0xFFFF and v != 0:
+            count = count + 1
+            val did = (raw >> 16) & 0xFFFF
+            # Read class code using >> (right shift)
+            val class_addr = 0x80000000 | (dev << 11) | 0x08
+            rt_port_outl(0xCF8, class_addr)
+            val class_raw = rt_port_inl(0xCFC)
+            val class_code = (class_raw >> 24) & 0xFF
+            if class_code == 3:
+                serial_println("[GUI-MIN] VGA device found via PCI scan loop!")
+                vga_dev = dev
+        dev = dev + 1
+
+    serial_println("[GUI-MIN] PCI scan complete")
+
+    # Enable PCI memory space for VGA device
+    if vga_dev != 0:
+        val cmd_addr = 0x80000000 | (vga_dev << 11) | 0x04
+        rt_port_outl(0xCF8, cmd_addr)
+        val cmd = rt_port_inl(0xCFC)
+        rt_port_outl(0xCF8, cmd_addr)
+        rt_port_outl(0xCFC, cmd | 0x06)
+
+        # Read BAR0
+        val bar_addr = 0x80000000 | (vga_dev << 11) | 0x10
+        rt_port_outl(0xCF8, bar_addr)
+        val bar0 = rt_port_inl(0xCFC)
+        val fb_addr = bar0 & 0xFFFFFFF0
+
+        # Program BGA framebuffer: 1024x768x32
+        rt_port_outw(0x01CE, 4)
+        rt_port_outw(0x01CF, 0)
+        rt_port_outw(0x01CE, 1)
+        rt_port_outw(0x01CF, 1024)
+        rt_port_outw(0x01CE, 2)
+        rt_port_outw(0x01CF, 768)
+        rt_port_outw(0x01CE, 3)
+        rt_port_outw(0x01CF, 32)
+        rt_port_outw(0x01CE, 4)
+        rt_port_outw(0x01CF, 0x41)
+        serial_println("[GUI-MIN] BGA framebuffer programmed 1024x768x32")
+
+        # Set framebuffer and render desktop
+        rt_gui_set_fb(fb_addr, 1024)
+        rt_gui_render_desktop(0, 0)
+        serial_println("[GUI-MIN] Desktop rendered!")
+    else:
+        serial_println("[GUI-MIN] No VGA device found")
+
+    serial_println("[GUI-MIN] Test complete")

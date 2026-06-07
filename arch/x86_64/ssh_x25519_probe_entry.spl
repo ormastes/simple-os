@@ -1,0 +1,116 @@
+# x86_64 SSH X25519 Probe Entry
+#
+# Boots the same wrapper/runtime lane used by the live SSH guest and exercises
+# the minimum byte-array surfaces needed for server ephemeral key derivation.
+
+extern fn rt_port_outb(port: u64, value: u64)
+extern fn rt_tls13_x25519_public_key(scalar: [u8]) -> [u8]
+extern fn rt_tls13_x25519_shared_secret(scalar: [u8], point: [u8]) -> [u8]
+use os.crypto.random.{random_bytes}
+use os.kernel.arch.x86_64.console.{serial_writeln}
+use os.kernel.boot.init_services.{init_all_services, services_network_ready, services_storage_ready}
+use os.posix.async_io.{async_io_init}
+use os.posix.fd_table.{fd_table_init}
+use os.posix.signal_compat.{signal_init}
+
+var test_pass: i64 = 0
+var test_fail: i64 = 0
+
+fn serial_println(msg: text):
+    serial_writeln(msg)
+
+fn assert_test(name: text, ok: bool):
+    if ok:
+        serial_println("  [PASS] {name}")
+        test_pass = test_pass + 1
+    else:
+        serial_println("  [FAIL] {name}")
+        test_fail = test_fail + 1
+
+fn _basepoint() -> [u8]:
+    var out: [u8] = [9]
+    var i: u64 = 1
+    while i < 32:
+        out.push(0)
+        i = i + 1
+    out
+
+fn _bytes_equal(a: [u8], b: [u8]) -> bool:
+    if a.len() != b.len():
+        return false
+    var i: u64 = 0
+    while i < a.len():
+        if a[i] != b[i]:
+            return false
+        i = i + 1
+    true
+
+fn _start():
+    serial_println("")
+    serial_println("=== SSH X25519 Probe ===")
+    serial_println("")
+
+    fd_table_init()
+    async_io_init()
+    signal_init()
+    serial_println("[boot] POSIX layer initialized")
+
+    init_all_services()
+    if services_network_ready():
+        serial_println("[boot] Network ready")
+    if services_storage_ready():
+        serial_println("[boot] Storage ready")
+
+    val fixed: [u8] = [
+        1, 2, 3, 4, 5, 6, 7, 8,
+        9, 10, 11, 12, 13, 14, 15, 16,
+        17, 18, 19, 20, 21, 22, 23, 24,
+        25, 26, 27, 28, 29, 30, 31, 32
+    ]
+    val basepoint = _basepoint()
+
+    serial_println("[x25519-probe] step=fixed")
+    serial_println("[x25519-probe] fixed len={fixed.len()}")
+
+    serial_println("[x25519-probe] step=random:start")
+    val rnd = random_bytes(32)
+    serial_println("[x25519-probe] step=random:done len={rnd.len()}")
+
+    serial_println("[x25519-probe] step=runtime-shared-fixed:start")
+    val runtime_shared_fixed = rt_tls13_x25519_shared_secret(fixed, basepoint)
+    serial_println("[x25519-probe] step=runtime-shared-fixed:done len={runtime_shared_fixed.len()}")
+
+    serial_println("[x25519-probe] step=runtime-public-fixed:start")
+    val runtime_public_fixed = rt_tls13_x25519_public_key(fixed)
+    serial_println("[x25519-probe] step=runtime-public-fixed:done len={runtime_public_fixed.len()}")
+
+    serial_println("[x25519-probe] step=runtime-shared-random:start")
+    val runtime_shared_random = rt_tls13_x25519_shared_secret(rnd, basepoint)
+    serial_println("[x25519-probe] step=runtime-shared-random:done len={runtime_shared_random.len()}")
+
+    serial_println("[x25519-probe] step=runtime-public-random:start")
+    val runtime_public_random = rt_tls13_x25519_public_key(rnd)
+    serial_println("[x25519-probe] step=runtime-public-random:done len={runtime_public_random.len()}")
+
+    assert_test("fixed scalar len=32", fixed.len() == 32)
+    assert_test("random_bytes(32) len=32", rnd.len() == 32)
+    assert_test("rt_tls13_x25519_shared_secret fixed len=32", runtime_shared_fixed.len() == 32)
+    assert_test("rt_tls13_x25519_public_key fixed len=32", runtime_public_fixed.len() == 32)
+    assert_test("rt_tls13_x25519_shared_secret random len=32", runtime_shared_random.len() == 32)
+    assert_test("rt_tls13_x25519_public_key random len=32", runtime_public_random.len() == 32)
+
+    if runtime_shared_fixed.len() == 32 and runtime_public_fixed.len() == 32:
+        assert_test("runtime fixed shared(basepoint) == fixed public", _bytes_equal(runtime_shared_fixed, runtime_public_fixed))
+    if runtime_shared_random.len() == 32 and runtime_public_random.len() == 32:
+        assert_test("runtime random shared(basepoint) == random public", _bytes_equal(runtime_shared_random, runtime_public_random))
+
+    serial_println("")
+    serial_println("=== SSH X25519 Probe Results: {test_pass}/{test_pass + test_fail} passed ===")
+    if test_fail == 0:
+        serial_println("SSH X25519 PROBE PASSED")
+        serial_println("TEST PASSED")
+    else:
+        serial_println("{test_fail} probe checks FAILED")
+        serial_println("TEST FAILED")
+
+    rt_port_outb(0xf4, 0)

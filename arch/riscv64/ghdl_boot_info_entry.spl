@@ -1,0 +1,43 @@
+#![allow(unknown_attribute)]
+#![allow(unnamed_duplicate_typed_args)]
+
+use os.kernel.arch.riscv64.boot_info.{
+    rv64_boot_parse_boot_info, rv64_boot_save_boot_args
+}
+use examples.simple_os.arch.riscv64.ghdl_boot_info_proof_layout.{
+    proof_emit_marker, proof_store_bool, proof_store_u64
+}
+
+extern fn proof_emit_boot_snapshot_defaults(hart_id: u64, dtb_addr: u64)
+
+@section(".text.entry")
+@naked
+fn _start():
+    asm volatile:
+        "mv      s0, a0"
+        "mv      s1, a1"
+        "la      sp, _stack_top"
+        "mv      a0, s0"
+        "mv      a1, s1"
+        "call    ghdl_boot_info_entry__boot_main"
+        "j       ghdl_boot_info_entry___halt"
+
+fn _halt():
+    asm volatile:
+        "ebreak"
+        ".Lghdl_boot_info_halt:"
+        "wfi"
+        "j .Lghdl_boot_info_halt"
+
+fn boot_main(hart_id: u64, dtb_addr: u64):
+    val proof_magic: u64 = 0x42494F50524F4F46
+    val done_clear: u64 = 0
+    val done_set: u64 = 1
+    proof_store_u64(0, proof_magic)
+    proof_store_u64(1, done_clear)
+    rv64_boot_save_boot_args(hart_id, dtb_addr)
+    val _boot_info = rv64_boot_parse_boot_info()
+    proof_emit_boot_snapshot_defaults(hart_id, dtb_addr)
+    proof_emit_marker()
+    proof_store_u64(1, done_set)
+    _halt()

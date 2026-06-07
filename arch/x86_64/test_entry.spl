@@ -1,0 +1,8 @@
+# Minimal test entry -- just print via extern fn and halt
+
+extern fn serial_println(msg: text)
+extern fn rt_println_value(msg: text)
+
+fn _start():
+    rt_println_value("Hello from SimpleOS!")
+    serial_println("Multiboot boot OK")

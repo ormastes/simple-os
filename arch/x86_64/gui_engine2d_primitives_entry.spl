@@ -1,0 +1,45 @@
+# x86_64 GUI Entry — Engine2D primitive verification
+#
+# Baremetal-safe primitive fixture for test/03_system/engine2d_primitives_spec.spl.
+# It initializes the BGA framebuffer, constructs Engine2D, and paints
+# deterministic primitive pixels through Engine2D so the QEMU screendump
+# lane can assert exact colors.
+
+use os.drivers.framebuffer.bga_init.{bga_init_framebuffer}
+use os.drivers.framebuffer.fb_driver.{FramebufferDriver}
+use os.compositor.engine2d_baremetal_core.{create_fb_engine_core}
+
+extern fn serial_println(msg: text)
+extern fn rt_gui_set_fb(addr: u64, width: u64)
+
+fn spl_start():
+    serial_println("SimpleOS x86_64 Engine2D primitive verification")
+    serial_println("[BOOT] COM1 serial ready")
+
+    val fb_info = bga_init_framebuffer(640, 512, 32)
+    rt_gui_set_fb(fb_info.addr.addr, fb_info.width.to_u64())
+
+    var fb = FramebufferDriver.from_boot_info(fb_info)
+    var engine = create_fb_engine_core(0xFD000000, fb_info.width.to_i32(), fb_info.height.to_i32())
+    serial_println("[E2D-PRIM] Engine2D created")
+
+    engine.clear(0xFF000000)
+
+    engine.draw_line(10, 20, 100, 20, 0xFFFF0000, 1)
+    engine.draw_line(10, 30, 110, 130, 0xFF00FF00, 1)
+    engine.draw_rect_filled(10, 140, 50, 50, 0xFF0000FF)
+
+    engine.draw_rect_stroked(70, 140, 50, 50, 0xFFFFFF00)
+
+    engine.draw_circle_filled(160, 60, 20, 0xFFFF00FF)
+    engine.draw_circle_stroked(160, 160, 29, 0xFF00FFFF)
+
+    engine.present()
+
+    serial_println("[E2D-PRIM] Engine2D primitive frame painted")
+    var tick: u64 = 0
+    while true:
+        tick = tick + 1
+        if tick == 100000000:
+            serial_println("[E2D-PRIM] idle")
+            tick = 0

@@ -1,0 +1,28 @@
+# x86_64 q35 pure NVMe perf entry — minimal SimpleOS storage proof.
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+
+use os.kernel.memory.pmm.{pmm_init_identity_range}
+use os.services.vfs.q35_pure_nvme_perf_boot.{q35_pure_nvme_perf_serial_lines}
+
+fn _start():
+    serial_println("")
+    serial_println("=== SimpleOS q35 pure NVMe perf ===")
+    serial_println("")
+
+    val memory_ready = pmm_init_identity_range(
+        536870912u64,
+        0x100000u64,
+        33554432u64
+    )
+    if memory_ready:
+        serial_println("[boot] memory init OK")
+    else:
+        serial_println("[boot] memory init FAILED")
+
+    for line in q35_pure_nvme_perf_serial_lines():
+        serial_println(line)
+
+    serial_println("TEST PASSED")
+    rt_port_outb(0xf4, 0)

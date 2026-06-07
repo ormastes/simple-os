@@ -1,0 +1,6 @@
+use test.system.os_crypto_spec.{os_crypto_test}
+extern fn rt_port_outb(port: u16, value: u8)
+
+fn _start():
+    os_crypto_test()
+    rt_port_outb(0xf4u16, 0x03u8)

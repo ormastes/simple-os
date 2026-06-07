@@ -1,0 +1,279 @@
+# x86_64 Tools Test Entry — Full tool testing
+#
+# The C boot stub (_start in baremetal_stubs.c) already does:
+#   - Serial init, PCI scan, NVMe init, FAT32 init
+# So we can test tools directly without calling init_all_services.
+#
+# NOTE: We use extern fn with mangled symbol names to bypass the
+# closure-pointer resolution issue in baremetal entry files.
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+
+# Filesystem test functions (C FFI wrappers accepting RuntimeValue)
+extern fn fat32_list_dir() -> i32
+extern fn spl_spl_fat32_find_file(name: text, out_cluster: u64, out_size: u64) -> i32
+extern fn spl_spl_fat32_read_file(name: text, buf: u64, max_size: u32, bytes_read: u64) -> i32
+extern fn rt_alloc(size: u64) -> u64
+
+# === Device tools ===
+extern fn tools__dev__lspci_tool__run_lspci(args: [text]) -> i32
+extern fn tools__dev__lsblk_tool__run_lsblk(args: [text]) -> i32
+extern fn tools__dev__lsusb_tool__run_lsusb(args: [text]) -> i32
+extern fn tools__dev__devinfo_tool__run_devinfo(args: [text]) -> i32
+
+# === Process tools ===
+extern fn tools__proc__ps_tool__run_ps(args: [text]) -> i32
+extern fn tools__proc__kill_tool__run_kill(args: [text]) -> i32
+extern fn tools__proc__top_tool__run_top(args: [text]) -> i32
+extern fn tools__proc__nice_tool__run_nice(args: [text]) -> i32
+
+# === Network tools ===
+extern fn tools__net__ifconfig_tool__run_ifconfig(args: [text]) -> i32
+extern fn tools__net__netstat_tool__run_netstat(args: [text]) -> i32
+extern fn tools__net__ping_tool__run_ping(args: [text]) -> i32
+extern fn tools__net__wget_tool__run_wget(args: [text]) -> i32
+extern fn tools__net__dhcp_client__run_dhcp(args: [text]) -> i32
+extern fn tools__net__dns_tool__run_dns(args: [text]) -> i32
+
+# === Archive tools ===
+extern fn tools__archive__tar_tool__run_tar(args: [text]) -> i32
+extern fn tools__archive__gzip_tool__run_gzip(args: [text]) -> i32
+extern fn tools__archive__zip_tool__run_zip(args: [text]) -> i32
+
+# === Boot tools ===
+extern fn tools__boot__boot_manager__run_bootctl(args: [text]) -> i32
+extern fn tools__boot__boot_recovery__run_boot_recovery(args: [text]) -> i32
+
+# === Log tools ===
+extern fn tools__log__log_viewer__run_log(args: [text]) -> i32
+
+# === Package tools ===
+extern fn tools__pkg__pkg_manager__run_pkg(args: [text]) -> i32
+extern fn tools__pkg__pkg_cli__run_pkg_cli(args: [text]) -> i32
+extern fn tools__pkg__pkg_builder__run_pkg_build(args: [text]) -> i32
+extern fn installer__image_builder__run_image_builder(args: [text]) -> i32
+extern fn installer__usb_installer__run_usb_installer(args: [text]) -> i32
+extern fn installer__release_pipeline__run_release(args: [text]) -> i32
+extern fn apps__registry__registry_server__run_registry(args: [text]) -> i32
+
+var g_pass: i32 = 0
+var g_fail: i32 = 0
+
+fn test_ok(name: text):
+    serial_println("[PASS] {name}")
+    g_pass = g_pass + 1
+
+fn test_run(code: i32, name: text):
+    if code == 0:
+        test_ok(name)
+    else:
+        serial_println("[FAIL] {name}")
+        g_fail = g_fail + 1
+
+fn _start():
+    serial_println("")
+    serial_println("========================================")
+    serial_println("  SimpleOS Tools Test — All 33 Tools")
+    serial_println("========================================")
+    serial_println("")
+
+    # === Filesystem Tests ===
+    serial_println("=== Filesystem Tests ===")
+
+    serial_println("[test] list root directory")
+    val fs1 = fat32_list_dir()
+    if fs1 == 0:
+        test_ok("list root directory")
+    else:
+        serial_println("[FAIL] list root directory")
+        g_fail = g_fail + 1
+
+    serial_println("[test] find hello.txt")
+    val cluster_buf1 = rt_alloc(8)
+    val size_buf1 = rt_alloc(8)
+    val fs2 = spl_fat32_find_file("HELLO.TXT", cluster_buf1, size_buf1)
+    if fs2 == 0:
+        test_ok("find hello.txt")
+    else:
+        serial_println("[FAIL] find hello.txt")
+        g_fail = g_fail + 1
+
+    serial_println("[test] read hello.txt")
+    val read_buf = rt_alloc(256)
+    val bytes_read_buf = rt_alloc(8)
+    val fs3 = spl_fat32_read_file("HELLO.TXT", read_buf, 256, bytes_read_buf)
+    if fs3 == 0:
+        test_ok("read hello.txt")
+    else:
+        serial_println("[FAIL] read hello.txt")
+        g_fail = g_fail + 1
+
+    serial_println("[test] find numbers.txt")
+    val cluster_buf2 = rt_alloc(8)
+    val size_buf2 = rt_alloc(8)
+    val fs4 = spl_fat32_find_file("NUMBERS.TXT", cluster_buf2, size_buf2)
+    if fs4 == 0:
+        test_ok("find numbers.txt")
+    else:
+        serial_println("[FAIL] find numbers.txt")
+        g_fail = g_fail + 1
+
+    serial_println("[test] find config.sdn")
+    val cluster_buf3 = rt_alloc(8)
+    val size_buf3 = rt_alloc(8)
+    val fs5 = spl_fat32_find_file("CONFIG.SDN", cluster_buf3, size_buf3)
+    if fs5 == 0:
+        test_ok("find config.sdn")
+    else:
+        serial_println("[FAIL] find config.sdn")
+        g_fail = g_fail + 1
+
+    # === Device Tools ===
+    serial_println("")
+    serial_println("=== Device Tools ===")
+
+    serial_println("[test] lspci")
+    val r1 = tools__dev__lspci_tool__run_lspci([])
+    test_run(r1, "lspci")
+
+    serial_println("[test] lsblk")
+    val r2 = tools__dev__lsblk_tool__run_lsblk([])
+    test_run(r2, "lsblk")
+
+    serial_println("[test] lsusb")
+    val r3 = tools__dev__lsusb_tool__run_lsusb([])
+    test_run(r3, "lsusb")
+
+    serial_println("[test] devinfo")
+    val r4 = tools__dev__devinfo_tool__run_devinfo([])
+    test_run(r4, "devinfo")
+
+    # === Process Tools ===
+    serial_println("")
+    serial_println("=== Process Tools ===")
+
+    serial_println("[test] ps")
+    val r5 = tools__proc__ps_tool__run_ps([])
+    test_run(r5, "ps")
+
+    serial_println("[test] kill -h")
+    val r6 = tools__proc__kill_tool__run_kill(["-h"])
+    test_run(r6, "kill")
+
+    serial_println("[test] top -h")
+    val r7 = tools__proc__top_tool__run_top(["-h"])
+    test_run(r7, "top")
+
+    serial_println("[test] nice -h")
+    val r8 = tools__proc__nice_tool__run_nice(["-h"])
+    test_run(r8, "nice")
+
+    # === Network Tools ===
+    serial_println("")
+    serial_println("=== Network Tools ===")
+
+    serial_println("[test] ifconfig")
+    val r9 = tools__net__ifconfig_tool__run_ifconfig([])
+    test_run(r9, "ifconfig")
+
+    serial_println("[test] netstat")
+    val r10 = tools__net__netstat_tool__run_netstat([])
+    test_run(r10, "netstat")
+
+    serial_println("[test] ping -h")
+    val r11 = tools__net__ping_tool__run_ping(["-h"])
+    test_run(r11, "ping")
+
+    serial_println("[test] wget -h")
+    val r12 = tools__net__wget_tool__run_wget(["-h"])
+    test_run(r12, "wget")
+
+    serial_println("[test] dhcp -h")
+    val r13 = tools__net__dhcp_client__run_dhcp(["-h"])
+    test_run(r13, "dhcp")
+
+    serial_println("[test] dns -h")
+    val r14 = tools__net__dns_tool__run_dns(["-h"])
+    test_run(r14, "dns")
+
+    # === Archive Tools ===
+    serial_println("")
+    serial_println("=== Archive Tools ===")
+
+    serial_println("[test] tar -h")
+    val r15 = tools__archive__tar_tool__run_tar(["-h"])
+    test_run(r15, "tar")
+
+    serial_println("[test] gzip -h")
+    val r16 = tools__archive__gzip_tool__run_gzip(["-h"])
+    test_run(r16, "gzip")
+
+    serial_println("[test] zip -h")
+    val r17 = tools__archive__zip_tool__run_zip(["-h"])
+    test_run(r17, "zip")
+
+    # === Boot Tools ===
+    serial_println("")
+    serial_println("=== Boot Tools ===")
+
+    serial_println("[test] bootctl -h")
+    val r18 = tools__boot__boot_manager__run_bootctl(["-h"])
+    test_run(r18, "bootctl")
+
+    serial_println("[test] boot-recovery -h")
+    val r19 = tools__boot__boot_recovery__run_boot_recovery(["-h"])
+    test_run(r19, "boot-recovery")
+
+    # === Log Tools ===
+    serial_println("")
+    serial_println("=== Log Tools ===")
+
+    serial_println("[test] log -h")
+    val r20 = tools__log__log_viewer__run_log(["-h"])
+    test_run(r20, "log")
+
+    # === Package Tools ===
+    serial_println("")
+    serial_println("=== Package Tools ===")
+
+    serial_println("[test] pkg list")
+    val r21 = tools__pkg__pkg_manager__run_pkg(["list"])
+    test_run(r21, "pkg")
+
+    serial_println("[test] pkg cli -h")
+    val r22 = tools__pkg__pkg_cli__run_pkg_cli(["-h"])
+    test_run(r22, "pkg-cli")
+
+    serial_println("[test] pkg build -h")
+    val r23 = tools__pkg__pkg_builder__run_pkg_build(["-h"])
+    test_run(r23, "pkg-build")
+
+    serial_println("[test] image-builder -h")
+    val r24 = installer__image_builder__run_image_builder(["-h"])
+    test_run(r24, "image-builder")
+
+    serial_println("[test] installer -h")
+    val r25 = installer__usb_installer__run_usb_installer(["-h"])
+    test_run(r25, "installer")
+
+    serial_println("[test] release -h")
+    val r26 = installer__release_pipeline__run_release(["-h"])
+    test_run(r26, "release")
+
+    serial_println("[test] registry -h")
+    val r27 = apps__registry__registry_server__run_registry(["-h"])
+    test_run(r27, "registry")
+
+    # Summary
+    serial_println("")
+    serial_println("========================================")
+    serial_println("  Results: {g_pass} passed, {g_fail} failed")
+    serial_println("========================================")
+    if g_fail == 0:
+        serial_println("ALL TESTS PASSED")
+    else:
+        serial_println("SOME TESTS FAILED")
+    serial_println("TEST COMPLETE")
+
+    rt_port_outb(0xf4, 0)

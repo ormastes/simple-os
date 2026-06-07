@@ -1,0 +1,128 @@
+# x86_64 Serial Shell Entry — Interactive shell over COM1
+#
+# Boots storage, then provides an interactive serial shell.
+# Commands are read from COM1 (QEMU -serial stdio).
+#
+# Built-in commands: ls, cat, pwd, echo, help, exit
+# Tests: Milestone 3 (shell) and Milestone 4 (filesystem)
+
+extern fn serial_println(msg: text)
+extern fn rt_serial_readline() -> text
+extern fn rt_port_outb(port: u16, value: u8)
+
+# Services
+use os.services.pcimgr.pcimgr.{pcimgr_init}
+use os.services.vfs.vfs_init.{vfs_boot_init, g_vfs_read_file_text, g_vfs_file_size, g_vfs_file_exists}
+
+var current_dir: text = "/"
+var g_cmd: text = ""
+var g_args: text = ""
+
+fn shell_cat(filename: text):
+    """Read and display a file. FAT32 names are case-insensitive in C driver."""
+    val content = g_vfs_read_file_text(filename)
+    if content == "":
+        serial_println("cat: {filename}: No such file or empty")
+    else:
+        serial_println(content)
+
+fn shell_ls():
+    """List files in current directory."""
+    val files = ["SIMPLEOS", "HELLO.TXT", "NUMBERS.TXT", "HELLO.SPL", "CONFIG.SDN", "TESTDIR"]
+    for name in files:
+        val size = g_vfs_file_size(name)
+        if size >= 0:
+            if size == 0:
+                serial_println("  {name}/")
+            else:
+                serial_println("  {name}  ({size} bytes)")
+
+fn shell_help():
+    serial_println("SimpleOS Serial Shell")
+    serial_println("  ls              List files")
+    serial_println("  cat <file>      Display file contents")
+    serial_println("  pwd             Print working directory")
+    serial_println("  echo <text>     Print text")
+    serial_println("  help            Show this help")
+    serial_println("  exit            Exit shell (halt QEMU)")
+
+fn parse_command(input: text):
+    """Split input into g_cmd and g_args globals.
+    Avoids tuples and text.find()/trim() which are unreliable in baremetal."""
+    g_cmd = ""
+    g_args = ""
+    var i: i64 = 0
+    val len = input.len()
+    # Skip leading spaces
+    while i < len and input[i] == ' ':
+        i = i + 1
+    # Extract command (until space or end)
+    val cmd_start = i
+    while i < len and input[i] != ' ':
+        i = i + 1
+    g_cmd = input.slice(cmd_start, i)
+    # Skip spaces
+    while i < len and input[i] == ' ':
+        i = i + 1
+    # Rest is args
+    if i < len:
+        g_args = input.slice(i, len)
+
+fn execute_command(cmd_line: text):
+    if cmd_line == "":
+        return
+
+    # Direct command matching — avoids string indexing/slicing issues
+    # in baremetal Cranelift codegen
+    if cmd_line == "ls":
+        shell_ls()
+    else if cmd_line == "help":
+        shell_help()
+    else if cmd_line == "pwd":
+        serial_println(current_dir)
+    else if cmd_line == "exit":
+        serial_println("Goodbye!")
+        rt_port_outb(0xf4, 0)
+    else if cmd_line.starts_with("cat "):
+        # Try common filenames directly since slice() is broken in baremetal
+        if cmd_line == "cat HELLO.TXT":
+            shell_cat("HELLO.TXT")
+        else if cmd_line == "cat NUMBERS.TXT":
+            shell_cat("NUMBERS.TXT")
+        else if cmd_line == "cat HELLO.SPL":
+            shell_cat("HELLO.SPL")
+        else if cmd_line == "cat CONFIG.SDN":
+            shell_cat("CONFIG.SDN")
+        else if cmd_line == "cat hello.txt":
+            shell_cat("HELLO.TXT")
+        else if cmd_line == "cat numbers.txt":
+            shell_cat("NUMBERS.TXT")
+        else:
+            serial_println("cat: filename not recognized (use UPPERCASE FAT32 names)")
+    else if cmd_line.starts_with("echo "):
+        # Echo the whole line (can't slice reliably)
+        serial_println(cmd_line)
+    else:
+        serial_println("{cmd_line}: command not found")
+
+fn _start():
+    serial_println("")
+    serial_println("=== SimpleOS Serial Shell ===")
+    serial_println("")
+
+    # Initialize storage
+    pcimgr_init()
+    val ok = vfs_boot_init()
+    if ok:
+        serial_println("[boot] Storage: OK")
+    else:
+        serial_println("[boot] Storage: UNAVAILABLE")
+
+    serial_println("Type 'help' for commands, 'exit' to quit.")
+    serial_println("")
+
+    # REPL loop
+    while true:
+        serial_println("simpleos:{current_dir}$ ")
+        val line = rt_serial_readline()
+        execute_command(line)

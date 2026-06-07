@@ -1,0 +1,33 @@
+# FR-SOS-017 x86_64 SMP AP live proof entry.
+#
+# Diagnostic QEMU lane: register the expected two-CPU qemu64 APIC topology,
+# then run the real x86 interrupt/APIC init path that sends INIT/SIPI.
+
+use os.kernel.smp.smp.{smp_ap_startup_sent, smp_init, smp_register_firmware_apic_ids, smp_num_cpus}
+use os.kernel.smp.percpu.{percpu_apic_id, percpu_is_online, percpu_is_present}
+use os.kernel.arch.x86_64.cpu.{x86_ap_trampoline_vector, x86_registered_ap_boot_started_count, x86_send_startup_to_cpu}
+use os.kernel.arch.x86_64.interrupt.{X86Interrupt}
+
+extern fn serial_println(msg: text)
+
+fn _spin_for_ap_marker():
+    var i: u64 = 0
+    while i < 200000000u64:
+        i = i + 1
+
+fn _start():
+    serial_println("[smp-probe] boot")
+    smp_init()
+    val registered = smp_register_firmware_apic_ids([0u32, 1u32])
+    serial_println("[smp-probe] registered cpus={registered}")
+    val ap1 = percpu_apic_id(1u32)
+    serial_println("[smp-probe] cpu1 present={percpu_is_present(1u32)} online={percpu_is_online(1u32)} apic={if ap1 == nil: 999u32 else: ap1.unwrap()} count={smp_num_cpus()}")
+    X86Interrupt.init()
+    val vec = x86_ap_trampoline_vector()
+    serial_println("[smp-probe] pre-manual online={percpu_is_online(1u32)} sent={smp_ap_startup_sent(1u32)} vector={vec}")
+    val manual_sent = x86_send_startup_to_cpu(1u32, vec)
+    serial_println("[smp-probe] manual startup={manual_sent}")
+    val started = x86_registered_ap_boot_started_count()
+    serial_println("[smp-probe] startup sent count={started}")
+    _spin_for_ap_marker()
+    serial_println("[smp-probe] done")

@@ -1,0 +1,17 @@
+# GPU Test Entry — boots x86_64 and runs VirtIO-GPU test pattern
+#
+# Uses the same boot infrastructure as gui_entry.spl but calls
+# gpu_test_main() instead of gui_kernel_main().
+
+use os.kernel.arch.x86_64.console.{serial_init, serial_writeln}
+use os.drivers.gpu.virtio_gpu_entry.{gpu_test_main}
+
+extern fn serial_println(msg: text)
+
+fn spl_start():
+    serial_init()
+    serial_println("[GPU-TEST] Starting VirtIO-GPU 2D test...")
+    gpu_test_main()
+    serial_println("[GPU-TEST] Test complete, halting.")
+    # Halt
+    pass_dn

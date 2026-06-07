@@ -1,0 +1,47 @@
+# x86_64 Boot Stage 3 — Network stack (PCI + NVMe + FAT32 + VFS + VirtIO-net + TCP/IP)
+#
+# Extends stage 2 with full network initialization.
+# Tests: All of stage 2 + VirtIO-net driver + TCP/IP netstack.
+# No POSIX layer, no shell. Target: ~60 files in closure.
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+
+use os.services.pcimgr.pcimgr.{pcimgr_init, pcimgr_dump_devices}
+use os.services.vfs.vfs_init.{vfs_boot_init, vfs_is_ready}
+use os.services.netstack.netstack_init.{net_boot_init, net_is_ready}
+
+fn _start():
+    serial_println("")
+    serial_println("=== SimpleOS Boot Stage 3 ===")
+    serial_println("[stage3] Storage + Network stack")
+    serial_println("")
+
+    # PCI enumeration
+    serial_println("[stage3] Initializing PCI manager...")
+    pcimgr_init()
+    serial_println("[stage3] PCI manager initialized")
+    pcimgr_dump_devices()
+
+    # Storage stack
+    serial_println("[stage3] Initializing storage stack...")
+    val storage_ok = vfs_boot_init()
+    if storage_ok:
+        serial_println("[stage3] Storage stack: OK")
+    else:
+        serial_println("[stage3] Storage stack: UNAVAILABLE")
+
+    # Network stack
+    serial_println("[stage3] Initializing network stack...")
+    val net_ok = net_boot_init()
+    if net_ok:
+        serial_println("[stage3] Network stack: OK")
+    else:
+        serial_println("[stage3] Network stack: UNAVAILABLE (no VirtIO-net)")
+
+    serial_println("")
+    serial_println("[stage3] PASS: Storage + Network initialization")
+    serial_println("TEST PASSED")
+
+    # Exit QEMU via ISA debug exit
+    rt_port_outb(0xf4, 0)

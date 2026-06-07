@@ -1,0 +1,68 @@
+# x86_64 Reboot Probe Entry
+#
+# Opt-in QEMU probe for the x86 reset-control path used by reboot.
+
+extern fn rt_port_inb(port: u16) -> u8
+extern fn rt_port_outb(port: u16, value: u8)
+
+val SERIAL_DATA: u16 = 0x3F8
+val SERIAL_LSR: u16 = 0x3FD
+val RESET_CTRL: u16 = 0xCF9
+val DEBUG_EXIT: u16 = 0xF4
+
+fn serial_wait_ready():
+    var guard: i64 = 100000
+    while guard > 0:
+        if (rt_port_inb(SERIAL_LSR) & 0x20) != 0:
+            return
+        guard = guard - 1
+
+fn serial_put(ch: u8):
+    serial_wait_ready()
+    rt_port_outb(SERIAL_DATA, ch)
+
+fn serial_newline():
+    serial_put(13)
+    serial_put(10)
+
+fn write_probe_marker():
+    serial_put(91)   # [
+    serial_put(114)  # r
+    serial_put(101)  # e
+    serial_put(98)   # b
+    serial_put(111)  # o
+    serial_put(111)  # o
+    serial_put(116)  # t
+    serial_put(45)   # -
+    serial_put(112)  # p
+    serial_put(114)  # r
+    serial_put(111)  # o
+    serial_put(98)   # b
+    serial_put(101)  # e
+    serial_put(93)   # ]
+    serial_put(32)   # ' '
+    serial_put(98)   # b
+    serial_put(101)  # e
+    serial_put(102)  # f
+    serial_put(111)  # o
+    serial_put(114)  # r
+    serial_put(101)  # e
+    serial_put(32)   # ' '
+    serial_put(114)  # r
+    serial_put(101)  # e
+    serial_put(115)  # s
+    serial_put(101)  # e
+    serial_put(116)  # t
+    serial_newline()
+
+fn delay_before_reset():
+    var spins = 0
+    while spins < 10000000:
+        spins = spins + 1
+
+fn spl_start():
+    write_probe_marker()
+    delay_before_reset()
+    rt_port_outb(RESET_CTRL, 0x02)
+    rt_port_outb(RESET_CTRL, 0x06)
+    rt_port_outb(DEBUG_EXIT, 3)

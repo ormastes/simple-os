@@ -1,0 +1,23 @@
+# x86_64 OS Test Entry — Storage chain test
+#
+# Tests: PCI → NVMe → FAT32 → VFS mount → file read
+# Does NOT import POSIX layer or shell (reduces dependencies)
+
+use os.kernel.boot.init_services.{init_all_services, services_storage_ready}
+
+extern fn serial_println(msg: text)
+
+fn main():
+    serial_println("")
+    serial_println("=== SimpleOS Storage Test ===")
+    serial_println("")
+
+    serial_println("[test] Calling init_all_services()...")
+    init_all_services()
+
+    if services_storage_ready():
+        serial_println("[test] Storage: OK")
+    else:
+        serial_println("[test] Storage: FAILED")
+
+    serial_println("[test] TEST COMPLETE")
