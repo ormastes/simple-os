@@ -726,6 +726,16 @@ RuntimeValue rt_string_char_at(RuntimeValue str, RuntimeValue idx)
     return rt_string_new((RuntimeValue)(uintptr_t)(s->data + i), 1);
 }
 
+RuntimeValue rt_string_char_code_at(RuntimeValue str, RuntimeValue idx)
+{
+    if (!IS_HEAP(str)) return 0;
+    RuntimeString *s = (RuntimeString *)DECODE_PTR(str);
+    if (!s) return 0;
+    int64_t i = (int64_t)idx;
+    if (i < 0 || (uint32_t)i >= s->len) return 0;
+    return (RuntimeValue)(unsigned char)s->data[i];
+}
+
 RuntimeValue char_code_at(RuntimeValue str, RuntimeValue idx)
 {
     if (!IS_HEAP(str)) return 0;
