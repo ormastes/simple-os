@@ -20,10 +20,9 @@
  * top (`rsp` points at argc).
  *
  * Caveats (MVP):
- *   - Does NOT touch TSS.RSP0. Syscalls from CPL 3 go through the LSTAR
- *     trampoline which swaps to `_kernel_syscall_stack_top` directly.
- *     TSS.RSP0 is only needed for hardware interrupts / page faults from
- *     CPL 3, which this MVP does not exercise.
+ *   - Requires boot code to load a valid TSS with RSP0 before this helper is
+ *     used. Syscalls go through the LSTAR trampoline, but faults during or
+ *     after the CPL3 transition still need a ring-0 stack.
  *   - Does NOT return. If the user calls exit (syscall 0) the baremetal
  *     dispatcher exits QEMU via isa-debug-exit.
  *   - Assumes cr3_phys maps the kernel image at its HHDM/identity range,

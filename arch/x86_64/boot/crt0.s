@@ -219,6 +219,8 @@ boot64_entry_msg:
     .asciz "[BOOT64] entry\r\n"
 boot64_idt_msg:
     .asciz "[BOOT64] idt\r\n"
+boot64_tss_msg:
+    .asciz "[BOOT64] tss\r\n"
 boot64_start_msg:
     .asciz "[BOOT64] call _start\r\n"
 
@@ -296,6 +298,29 @@ long_mode_entry:
     movq %rax, _idt_ptr+2(%rip)   /* base */
     lidt _idt_ptr(%rip)
     movq $boot64_idt_msg, %rsi
+    call boot64_serial_puts
+
+    /* Install a minimal 64-bit TSS so faults/interrupts from CPL3 have a
+     * ring-0 stack. Without TR loaded, the first user-mode fault after iretq
+     * double/triple-faults silently before the diagnostic IDT can print. */
+    movq $_stack_top, boot_tss+4(%rip)       /* rsp0 */
+    movw $104, boot_tss+102(%rip)            /* iomap_base = sizeof(TSS) */
+
+    leaq boot_tss(%rip), %rax
+    movw $0x0067, gdt64_tss(%rip)            /* limit = 103 */
+    movw %ax, gdt64_tss+2(%rip)              /* base 15:0 */
+    shrq $16, %rax
+    movb %al, gdt64_tss+4(%rip)              /* base 23:16 */
+    movb $0x89, gdt64_tss+5(%rip)            /* present, available 64-bit TSS */
+    movb $0x00, gdt64_tss+6(%rip)            /* limit 19:16 + flags */
+    shrq $8, %rax
+    movb %al, gdt64_tss+7(%rip)              /* base 31:24 */
+    shrq $8, %rax
+    movl %eax, gdt64_tss+8(%rip)             /* base 63:32 */
+    movl $0, gdt64_tss+12(%rip)
+    movw $0x30, %ax
+    ltr %ax
+    movq $boot64_tss_msg, %rsi
     call boot64_serial_puts
 
     /* Run Simple module-global initializers before the entry point.
@@ -581,11 +606,12 @@ rt_harden_text_write_trap_probe:
  *   0x18: user CS 32-bit compat — SYSRET compat loads CS=0x1B (0x18|3)
  *   0x20: user SS/DS            — SYSRET loads SS=0x23 (0x20|3)
  *   0x28: user CS 64-bit        — SYSRET 64-bit loads CS=0x2B (0x28|3)
+ *   0x30: TSS descriptor        — required for CPL3 fault/interrupt stacks
  *
  * MSR_STAR value: (USER_CS_32 | 3) << 48 | KERNEL_CS << 32
  *              = 0x001B_0008_0000_0000
  * ================================================================== */
-.section .rodata
+.section .data
 .align 16
 gdt64:
     .quad 0                    /* 0x00: null descriptor */
@@ -630,6 +656,10 @@ gdt64:
     .byte 0xAF                 /* flags: G=1, L=1, D=0 (64-bit) */
     .byte 0x00                 /* base high */
 
+gdt64_tss:
+    .quad 0                    /* 0x30: TSS low, filled at runtime */
+    .quad 0                    /* 0x38: TSS high, filled at runtime */
+
 gdt64_end:
 
 .global gdt64_ptr
@@ -648,6 +678,10 @@ _fault_count:
 .align 4096
 _idt:
     .space 4096
+
+.align 16
+boot_tss:
+    .space 104
 
 .section .data
 .align 16
