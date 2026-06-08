@@ -22,9 +22,11 @@ use os.kernel.arch.x86_64.cpu.{
     x86_send_startup_to_cpu
 }
 use os.kernel.arch.x86_64.interrupt.{X86Interrupt}
+use os.kernel.arch.x86_64.user_entry.{dispatch_enter_user_blocking}
 use os.kernel.arch.x86_64.user_entry_validation.{validate_enter_user_blocking_handoff}
 use os.kernel.abi.syscall_shim.{shim_init}
 use os.kernel.abi.syscall_shim_process.{spl_handle_debug_write}
+use os.kernel.boot.mmio.{mmio_write8, mmio_write64}
 use os.kernel.ipc.ipc.{IpcManager}
 use os.kernel.log.klog.{KernelLog}
 use os.kernel.scheduler.scheduler.{Scheduler}
@@ -37,6 +39,14 @@ use os.kernel.types.capability_types.{CapabilitySet}
 use os.kernel.types.task_types.{TaskId, TaskPriority, UserLoadSegment, UserProcessImage}
 
 extern fn serial_println(msg: text)
+
+fn _final_probe_pml4() -> u64: 0x0F000000
+fn _final_probe_pdpt() -> u64: 0x0F001000
+fn _final_probe_pd() -> u64: 0x0F002000
+fn _final_probe_entry() -> u64: 0x0F100000
+fn _final_probe_stack_top() -> u64: 0x0F130000
+fn _final_probe_table_flags() -> u64: 1 | 2 | 4
+fn _final_probe_huge_flags() -> u64: _final_probe_table_flags() | 128
 
 fn _spin_for_ap_marker():
     var i: u64 = 0
@@ -71,6 +81,129 @@ fn _make_user_handoff_image() -> UserProcessImage:
         initial_sp: 0x00007FFFFFFFEF80,
         initial_stack_bytes: [0x01.to_u8(), 0x02.to_u8(), 0x03.to_u8(), 0x04.to_u8()]
     )
+
+fn _append_debug_write_byte(buf: [u8], byte: u8) -> [u8]:
+    var out: [u8] = buf
+    out.push(0xB8.to_u8())      # mov eax, 60
+    out.push(0x3C.to_u8())
+    out.push(0x00.to_u8())
+    out.push(0x00.to_u8())
+    out.push(0x00.to_u8())
+    out.push(0xBF.to_u8())      # mov edi, byte
+    out.push(byte)
+    out.push(0x00.to_u8())
+    out.push(0x00.to_u8())
+    out.push(0x00.to_u8())
+    out.push(0x0F.to_u8())      # syscall
+    out.push(0x05.to_u8())
+    out
+
+fn _append_serial_write_byte(buf: [u8], byte: u8) -> [u8]:
+    var out: [u8] = buf
+    out.push(0x66.to_u8())      # mov dx, 0x3f8
+    out.push(0xBA.to_u8())
+    out.push(0xF8.to_u8())
+    out.push(0x03.to_u8())
+    out.push(0xB0.to_u8())      # mov al, byte
+    out.push(byte)
+    out.push(0xEE.to_u8())      # out dx, al
+    out
+
+fn _append_serial_write_bytes(buf: [u8], marker: [u8]) -> [u8]:
+    var out: [u8] = buf
+    var i: i64 = 0
+    while i < marker.len():
+        out = _append_serial_write_byte(out, marker[i])
+        i = i + 1
+    out
+
+fn _append_debug_write_bytes(buf: [u8], marker: [u8]) -> [u8]:
+    var out: [u8] = buf
+    var i: i64 = 0
+    while i < marker.len():
+        out = _append_debug_write_byte(out, marker[i])
+        i = i + 1
+    out
+
+fn _make_final_marker_payload() -> [u8]:
+    var payload: [u8] = []
+    payload = _append_serial_write_bytes(payload, [
+        0x5B.to_u8(), 0x67.to_u8(), 0x72.to_u8(), 0x65.to_u8(), 0x65.to_u8(), 0x6E.to_u8(), 0x2D.to_u8(), 0x63.to_u8(),
+        0x61.to_u8(), 0x72.to_u8(), 0x72.to_u8(), 0x69.to_u8(), 0x65.to_u8(), 0x72.to_u8(), 0x2D.to_u8(), 0x71.to_u8(),
+        0x65.to_u8(), 0x6D.to_u8(), 0x75.to_u8(), 0x5D.to_u8(), 0x20.to_u8(), 0x48.to_u8(), 0x57.to_u8(), 0x5F.to_u8(),
+        0x48.to_u8(), 0x41.to_u8(), 0x4E.to_u8(), 0x44.to_u8(), 0x4F.to_u8(), 0x46.to_u8(), 0x46.to_u8(), 0x5F.to_u8(),
+        0x50.to_u8(), 0x41.to_u8(), 0x53.to_u8(), 0x53.to_u8(), 0x3D.to_u8(), 0x74.to_u8(), 0x72.to_u8(), 0x75.to_u8(),
+        0x65.to_u8(), 0x0A.to_u8()
+    ])
+    payload = _append_serial_write_bytes(payload, [
+        0x5B.to_u8(), 0x67.to_u8(), 0x72.to_u8(), 0x65.to_u8(), 0x65.to_u8(), 0x6E.to_u8(), 0x2D.to_u8(), 0x63.to_u8(),
+        0x61.to_u8(), 0x72.to_u8(), 0x72.to_u8(), 0x69.to_u8(), 0x65.to_u8(), 0x72.to_u8(), 0x2D.to_u8(), 0x71.to_u8(),
+        0x65.to_u8(), 0x6D.to_u8(), 0x75.to_u8(), 0x5D.to_u8(), 0x20.to_u8(), 0x55.to_u8(), 0x53.to_u8(), 0x45.to_u8(),
+        0x52.to_u8(), 0x5F.to_u8(), 0x45.to_u8(), 0x4E.to_u8(), 0x54.to_u8(), 0x52.to_u8(), 0x59.to_u8(), 0x5F.to_u8(),
+        0x50.to_u8(), 0x41.to_u8(), 0x53.to_u8(), 0x53.to_u8(), 0x3D.to_u8(), 0x74.to_u8(), 0x72.to_u8(), 0x75.to_u8(),
+        0x65.to_u8(), 0x0A.to_u8()
+    ])
+    payload = _append_debug_write_bytes(payload, [
+        0x5B.to_u8(), 0x67.to_u8(), 0x72.to_u8(), 0x65.to_u8(), 0x65.to_u8(), 0x6E.to_u8(), 0x2D.to_u8(), 0x63.to_u8(),
+        0x61.to_u8(), 0x72.to_u8(), 0x72.to_u8(), 0x69.to_u8(), 0x65.to_u8(), 0x72.to_u8(), 0x2D.to_u8(), 0x71.to_u8(),
+        0x65.to_u8(), 0x6D.to_u8(), 0x75.to_u8(), 0x5D.to_u8(), 0x20.to_u8(), 0x55.to_u8(), 0x53.to_u8(), 0x45.to_u8(),
+        0x52.to_u8(), 0x5F.to_u8(), 0x53.to_u8(), 0x59.to_u8(), 0x53.to_u8(), 0x43.to_u8(), 0x41.to_u8(), 0x4C.to_u8(),
+        0x4C.to_u8(), 0x5F.to_u8(), 0x50.to_u8(), 0x41.to_u8(), 0x53.to_u8(), 0x53.to_u8(), 0x3D.to_u8(), 0x74.to_u8(),
+        0x72.to_u8(), 0x75.to_u8(), 0x65.to_u8(), 0x0A.to_u8()
+    ])
+    payload.push(0xEB.to_u8())      # spin after marker emission
+    payload.push(0xFE.to_u8())
+    payload
+
+fn _make_final_user_handoff_image(payload: [u8]) -> UserProcessImage:
+    val payload_len = payload.len().to_u64()
+    UserProcessImage(
+        binary_path: "/sys/apps/green_ring3_final_probe",
+        entry: _final_probe_entry(),
+        stack_top: _final_probe_stack_top(),
+        stack_size: 4096,
+        argv: ["/sys/apps/green_ring3_final_probe"],
+        envp: [],
+        segments: [UserLoadSegment(
+            virt_addr: _final_probe_entry(),
+            mem_size: payload_len,
+            file_size: payload_len,
+            flags: 5,
+            align: 0x1000,
+            data: payload
+        )],
+        segment_count: 1,
+        file_bytes: payload,
+        initial_sp: _final_probe_stack_top() - 16,
+        initial_stack_bytes: []
+    )
+
+fn _zero_page(addr: u64):
+    var i: u64 = 0
+    while i < 512:
+        mmio_write64(addr + (i * 8), 0)
+        i = i + 1
+
+fn _write_payload(addr: u64, payload: [u8]):
+    var i: i64 = 0
+    while i < payload.len():
+        mmio_write8(addr + i.to_u64(), payload[i])
+        i = i + 1
+
+fn _install_final_probe_identity_cr3(payload: [u8]) -> u64:
+    _zero_page(_final_probe_pml4())
+    _zero_page(_final_probe_pdpt())
+    _zero_page(_final_probe_pd())
+    _write_payload(_final_probe_entry(), payload)
+    val table_flags = _final_probe_table_flags()
+    val huge_flags = _final_probe_huge_flags()
+    mmio_write64(_final_probe_pml4(), _final_probe_pdpt() | table_flags)
+    mmio_write64(_final_probe_pdpt(), _final_probe_pd() | table_flags)
+    var i: u64 = 0
+    while i < 512:
+        mmio_write64(_final_probe_pd() + (i * 8), (i * 0x200000) | huge_flags)
+        i = i + 1
+    _final_probe_pml4()
 
 fn _run_fixed_green_carrier_probe():
     serial_println("[green-carrier-qemu] probe-step=fixed-run")
@@ -170,6 +303,33 @@ fn _run_user_syscall_bridge_ready_probe():
     serial_println("[green-carrier-qemu] syscall-debug-write-result={debug_write_result}")
     serial_println("[green-carrier-qemu] USER_SYSCALL_BRIDGE_READY={_pass(ready)}")
 
+fn _run_final_ring_user_handoff_probe():
+    serial_println("[green-carrier-qemu] probe-step=final-ring-user-handoff")
+    if not X86Interrupt.runtime_installed():
+        X86Interrupt.install_bootstrap_runtime(64)
+    install_syscall_entry()
+    val payload = _make_final_marker_payload()
+    val cr3 = _install_final_probe_identity_cr3(payload)
+    val image = _make_final_user_handoff_image(payload)
+    var scheduler = Scheduler.new_with_cpu_count(2u32)
+    val pid = scheduler.create_user_task_pid(image, TaskPriority.Normal, CapabilitySet.full())
+    val cr3_set = scheduler.set_user_task_address_space_for_probe(pid, cr3)
+    val queues = GreenCarrierRunQueueState(
+        queued_task_ids: [pid as i64],
+        queued_cpus: [1],
+        queue_depth_by_cpu: [0, 1],
+        capacity: 4,
+        dropped_count: 0
+    )
+    val step = scheduler.run_green_carrier_once(queues, 1)
+    val validation = validate_enter_user_blocking_handoff(pid, scheduler)
+    val ready = pid > 0u64 and cr3_set and step.ran and validation.ok and validation.cr3 == cr3
+    serial_println("[green-carrier-qemu] final-pid={pid} cr3={validation.cr3} cr3-set={_pass(cr3_set)} green-ran={_pass(step.ran)} validation={_pass(validation.ok)} ready={_pass(ready)}")
+    serial_println("[green-carrier-qemu] USER_CR3_READY={_pass(ready)}")
+    if ready:
+        dispatch_enter_user_blocking(pid, scheduler)
+    serial_println("[green-carrier-qemu] final-entry-returned")
+
 fn _start():
     serial_println("[green-carrier-qemu] boot")
     smp_init()
@@ -188,4 +348,4 @@ fn _start():
     _run_scheduler_user_handoff_ready_probe()
     _run_user_entry_bridge_ready_probe()
     _run_user_syscall_bridge_ready_probe()
-    serial_println("[green-carrier-qemu] done")
+    _run_final_ring_user_handoff_probe()

@@ -7,9 +7,10 @@
 #   0: Null descriptor
 #   1: Kernel code (64-bit, ring 0, execute/read)
 #   2: Kernel data (ring 0, read/write)
-#   3: User code (64-bit, ring 3, execute/read)
+#   3: User compatibility code (ring 3, execute/read)
 #   4: User data (ring 3, read/write)
-#   5: TSS descriptor (16-byte, 64-bit TSS)
+#   5: User code (64-bit, ring 3, execute/read)
+#   6: TSS descriptor (16-byte, 64-bit TSS)
 
 use std.baremetal.x86.io.{outb}
 
@@ -18,9 +19,10 @@ use std.baremetal.x86.io.{outb}
 val GDT_NULL_SEL: u16    = 0x00
 val GDT_KERNEL_CS: u16   = 0x08    # Index 1
 val GDT_KERNEL_DS: u16   = 0x10    # Index 2
-val GDT_USER_CS: u16     = 0x18    # Index 3
+val GDT_USER_COMPAT_CS: u16 = 0x18 # Index 3
 val GDT_USER_DS: u16     = 0x20    # Index 4
-val GDT_TSS_SEL: u16     = 0x28    # Index 5 (16 bytes wide)
+val GDT_USER_CS: u16     = 0x28    # Index 5
+val GDT_TSS_SEL: u16     = 0x30    # Index 6 (16 bytes wide)
 
 # --- GDT Access Byte Flags ---
 
@@ -77,9 +79,8 @@ struct GdtPtr:
 
 # --- Module State ---
 
-# GDT: 5 normal entries (8 bytes each) + 1 TSS entry (16 bytes) = 6 slots, 48 + 16 = 56 bytes
-# We store 7 GdtEntry slots (56 bytes) to accommodate the 16-byte TSS descriptor.
-var gdt_entries: [GdtEntry; 7]
+# GDT: 6 normal entries (8 bytes each) + 1 TSS entry (16 bytes) = 8 slots.
+var gdt_entries: [GdtEntry; 8]
 var tss: TssEntry
 var gdt_pointer: GdtPtr
 
@@ -96,6 +97,13 @@ fn _make_code_entry(dpl: u8) -> GdtEntry:
     val access = ACCESS_PRESENT | dpl | ACCESS_CODE_DATA | ACCESS_EXECUTABLE | ACCESS_READABLE
     GdtEntry(limit_low: 0xFFFF, base_low: 0, base_mid: 0,
              access: access, granularity: GRAN_LONG_MODE | 0x0F,
+             base_high: 0)
+
+fn _make_compat_code_entry(dpl: u8) -> GdtEntry:
+    """Create 32-bit compatibility code segment descriptor."""
+    val access = ACCESS_PRESENT | dpl | ACCESS_CODE_DATA | ACCESS_EXECUTABLE | ACCESS_READABLE
+    GdtEntry(limit_low: 0xFFFF, base_low: 0, base_mid: 0,
+             access: access, granularity: GRAN_4K_PAGES | 0x0F,
              base_high: 0)
 
 fn _make_data_entry(dpl: u8) -> GdtEntry:
@@ -135,9 +143,10 @@ fn gdt_init():
       [0] Null
       [1] Kernel Code  0x08
       [2] Kernel Data  0x10
-      [3] User Code    0x18
+      [3] User Compat  0x18
       [4] User Data    0x20
-      [5-6] TSS        0x28 (16 bytes)
+      [5] User Code64  0x28
+      [6-7] TSS        0x30 (16 bytes)
     """
     # Initialize TSS to zero state
     tss = TssEntry(
@@ -155,18 +164,19 @@ fn gdt_init():
     gdt_entries[0] = _make_null_entry()
     gdt_entries[1] = _make_code_entry(ACCESS_DPL0)    # Kernel CS
     gdt_entries[2] = _make_data_entry(ACCESS_DPL0)    # Kernel DS
-    gdt_entries[3] = _make_code_entry(ACCESS_DPL3)    # User CS
+    gdt_entries[3] = _make_compat_code_entry(ACCESS_DPL3) # User Compat CS
     gdt_entries[4] = _make_data_entry(ACCESS_DPL3)    # User DS
+    gdt_entries[5] = _make_code_entry(ACCESS_DPL3)    # User CS
 
     # TSS descriptor (16 bytes = 2 GdtEntry slots)
     val tss_addr = &tss as u64
     val tss_limit = 103 as u32    # sizeof(TssEntry) - 1
-    gdt_entries[5] = _make_tss_low(tss_addr, tss_limit)
-    gdt_entries[6] = _make_tss_high(tss_addr)
+    gdt_entries[6] = _make_tss_low(tss_addr, tss_limit)
+    gdt_entries[7] = _make_tss_high(tss_addr)
 
     # Set up GDTR pointer
     gdt_pointer = GdtPtr(
-        limit: 55,    # 7 * 8 - 1 = 55 bytes
+        limit: 63,    # 8 * 8 - 1 = 63 bytes
         base: &gdt_entries as u64
     )
 
@@ -229,6 +239,6 @@ fn _gdt_load():
 fn _tss_load():
     """Execute ltr instruction to load the TSS selector."""
     asm """
-        mov ax, 0x28
+        mov ax, 0x30
         ltr ax
     """
