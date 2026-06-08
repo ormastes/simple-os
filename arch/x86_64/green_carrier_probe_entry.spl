@@ -13,7 +13,14 @@ use os.kernel.smp.smp.{
     smp_take_ipi
 }
 use os.kernel.smp.percpu.{percpu_is_online, percpu_is_present}
-use os.kernel.arch.x86_64.cpu.{x86_ap_trampoline_vector, x86_registered_ap_boot_started_count, x86_send_startup_to_cpu}
+use os.kernel.arch.x86_64.cpu.{
+    install_syscall_entry,
+    kernel_syscall_entry_addr,
+    syscall_entry_installed,
+    x86_ap_trampoline_vector,
+    x86_registered_ap_boot_started_count,
+    x86_send_startup_to_cpu
+}
 use os.kernel.arch.x86_64.interrupt.{X86Interrupt}
 use os.kernel.arch.x86_64.user_entry_validation.{validate_enter_user_blocking_handoff}
 use os.kernel.scheduler.scheduler.{Scheduler}
@@ -141,6 +148,16 @@ fn _run_scheduler_user_handoff_ready_probe():
     serial_println("[green-carrier-qemu] user-pid={pid} task-present={task_present} validation={_pass(validation.ok)} cr3={validation.cr3}")
     serial_println("[green-carrier-qemu] USER_HANDOFF_READY={_pass(ready)}")
 
+fn _run_user_entry_bridge_ready_probe():
+    serial_println("[green-carrier-qemu] probe-step=user-entry-bridge-ready")
+    if not X86Interrupt.runtime_installed():
+        X86Interrupt.install_bootstrap_runtime(64)
+    install_syscall_entry()
+    val entry_addr = kernel_syscall_entry_addr()
+    val ready = X86Interrupt.runtime_installed() and syscall_entry_installed() and entry_addr > 0u64
+    serial_println("[green-carrier-qemu] syscall-entry={entry_addr} installed={_pass(syscall_entry_installed())} runtime={_pass(X86Interrupt.runtime_installed())}")
+    serial_println("[green-carrier-qemu] USER_ENTRY_BRIDGE_READY={_pass(ready)}")
+
 fn _start():
     serial_println("[green-carrier-qemu] boot")
     smp_init()
@@ -157,4 +174,5 @@ fn _start():
     _run_fixed_green_carrier_probe()
     _run_scheduler_green_carrier_handoff_probe()
     _run_scheduler_user_handoff_ready_probe()
+    _run_user_entry_bridge_ready_probe()
     serial_println("[green-carrier-qemu] done")
