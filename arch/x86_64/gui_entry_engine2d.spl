@@ -38,7 +38,7 @@ fn _capture_wait_iters() -> u64:
     5000000u64
 
 fn _input_wait_iters() -> u64:
-    1500000u64
+    20000000u64
 
 fn _surface_count() -> i64:
     5
@@ -407,6 +407,7 @@ fn _present_mdi_scene_with_dragged_browser_fb(fb_addr: u64, stride: i32, app_cou
 fn _poll_host_mouse_drag_evidence(fb_addr: u64, stride: i32, app_count: i64):
     _ps2_mouse_init_for_qmp()
     serial_println("[host-input] ps2-mouse-ready")
+    serial_println("[host-input] poll-window-start")
     var packet_index: i32 = 0
     var b0: i64 = 0
     var b1: i64 = 0
@@ -464,6 +465,7 @@ fn _poll_host_mouse_drag_evidence(fb_addr: u64, stride: i32, app_count: i64):
         serial_println("[host-input] drag-evidence-ready")
     else:
         serial_println("[host-input] no-host-mouse-packets")
+    serial_println("[host-input] poll-window-end")
 
 fn _read_pixel_fb(fb_addr: u64, stride: i32, x: i32, y: i32) -> u32:
     # Framebuffer readback is debug-only here. Some QEMU/BGA mappings accept
