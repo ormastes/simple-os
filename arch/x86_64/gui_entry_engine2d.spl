@@ -16,6 +16,7 @@ use os.kernel.boot.mmio.{mmio_read32, mmio_write32}
 use os.drivers.framebuffer.bga_init.{bga_init_framebuffer}
 extern fn serial_println(msg: text)
 extern fn rt_gui_set_fb(addr: u64, width: u64)
+extern fn rt_port_inb(port: u16) -> u8
 extern fn rt_port_outb(port: u16, value: u8)
 extern fn rt_u32_alloc_filled(len: u64, fill: u32) -> [u32]
 extern fn rt_fb_blit_array32(dst_addr: u64, dst_stride_pixels: u64,
@@ -36,8 +37,52 @@ fn _taskbar_h() -> i32:
 fn _capture_wait_iters() -> u64:
     5000000u64
 
+fn _input_wait_iters() -> u64:
+    1500000u64
+
 fn _surface_count() -> i64:
     5
+
+fn _ps2_wait_input_empty():
+    var timeout: i64 = 100000
+    while timeout > 0:
+        if (rt_port_inb(0x64u16).to_i64() & 0x02) == 0:
+            return
+        timeout = timeout - 1
+
+fn _ps2_wait_output_full():
+    var timeout: i64 = 100000
+    while timeout > 0:
+        if (rt_port_inb(0x64u16).to_i64() & 0x01) != 0:
+            return
+        timeout = timeout - 1
+
+fn _ps2_write_mouse(value: u8):
+    _ps2_wait_input_empty()
+    rt_port_outb(0x64u16, 0xD4u8)
+    _ps2_wait_input_empty()
+    rt_port_outb(0x60u16, value)
+
+fn _ps2_try_read_aux() -> i64:
+    val status = rt_port_inb(0x64u16).to_i64()
+    if (status & 0x01) == 0 or (status & 0x20) == 0:
+        return -1
+    rt_port_inb(0x60u16).to_i64()
+
+fn _ps2_mouse_init_for_qmp():
+    _ps2_wait_input_empty()
+    rt_port_outb(0x64u16, 0xA8u8)
+    _ps2_write_mouse(0xF6u8)
+    _ps2_wait_output_full()
+    rt_port_inb(0x60u16)
+    _ps2_write_mouse(0xF4u8)
+    _ps2_wait_output_full()
+    rt_port_inb(0x60u16)
+
+fn _signed_mouse_delta(raw: i64) -> i32:
+    if raw > 127:
+        return (raw - 256).to_i32()
+    raw.to_i32()
 
 fn _pack(hi: i32, lo: i32) -> u64:
     (hi.to_u64() << 32) | lo.to_u64()
@@ -345,6 +390,81 @@ fn _present_mdi_scene_direct_fb(fb_addr: u64, stride: i32, app_count: i64):
     _draw_window_fb(fb_addr, stride, 642, 82, 202, 138, 0xFF1E293Bu32, 0xFF243447u32)
     _draw_mouse_cursor_fb(fb_addr, stride, 794, 366)
 
+fn _present_mdi_scene_with_dragged_browser_fb(fb_addr: u64, stride: i32, app_count: i64, browser_x: i32, browser_y: i32, cursor_x: i32, cursor_y: i32):
+    _fill_rect_fb(fb_addr, stride, 0, 0, _fb_w(), _fb_h(), 0xFF0A2540u32)
+    _draw_command_lane_fb(fb_addr, stride)
+    _draw_taskbar_fb(fb_addr, stride)
+    _draw_launcher_fb(fb_addr, stride, app_count, 0xFF1E293Bu32, 0xFF3498DBu32)
+    _draw_window_fb(fb_addr, stride, 58, 76, 236, 142, 0xFF1E293Bu32, 0xFF243447u32)
+    _draw_window_fb(fb_addr, stride, browser_x, browser_y, 256, 154, 0xFF1E293Bu32, 0xFF243447u32)
+    _draw_web_demo_panel_fb(fb_addr, stride, browser_x + 4, browser_y + 32, 248, 118)
+    _draw_window_fb(fb_addr, stride, 150, 256, 278, 150, 0xFF1E293Bu32, 0xFF2050A0u32)
+    _draw_web_demo_panel_fb(fb_addr, stride, 154, 288, 270, 114)
+    _draw_window_fb(fb_addr, stride, 486, 250, 238, 142, 0xFF1E293Bu32, 0xFF243447u32)
+    _draw_window_fb(fb_addr, stride, 642, 82, 202, 138, 0xFF1E293Bu32, 0xFF243447u32)
+    _draw_mouse_cursor_fb(fb_addr, stride, cursor_x, cursor_y)
+
+fn _poll_host_mouse_drag_evidence(fb_addr: u64, stride: i32, app_count: i64):
+    _ps2_mouse_init_for_qmp()
+    serial_println("[host-input] ps2-mouse-ready")
+    var packet_index: i32 = 0
+    var b0: i64 = 0
+    var b1: i64 = 0
+    var b2: i64 = 0
+    var cursor_x: i32 = 360
+    var cursor_y: i32 = 190
+    var browser_x: i32 = 276
+    var browser_y: i32 = 120
+    var left_down = false
+    var changed = false
+    var iter: u64 = 0u64
+    while iter < _input_wait_iters():
+        val byte_val = _ps2_try_read_aux()
+        if byte_val >= 0:
+            if packet_index == 0:
+                if (byte_val & 0x08) != 0:
+                    b0 = byte_val
+                    packet_index = 1
+            elif packet_index == 1:
+                b1 = byte_val
+                packet_index = 2
+            else:
+                b2 = byte_val
+                packet_index = 0
+                val dx = _signed_mouse_delta(b1)
+                val dy = 0 - _signed_mouse_delta(b2)
+                cursor_x = cursor_x + dx
+                cursor_y = cursor_y + dy
+                if cursor_x < 0:
+                    cursor_x = 0
+                if cursor_y < 0:
+                    cursor_y = 0
+                if cursor_x > _fb_w() - 20:
+                    cursor_x = _fb_w() - 20
+                if cursor_y > _fb_h() - 24:
+                    cursor_y = _fb_h() - 24
+                left_down = (b0 & 0x01) != 0
+                if left_down and (dx != 0 or dy != 0):
+                    browser_x = browser_x + dx
+                    browser_y = browser_y + dy
+                    if browser_x < 80:
+                        browser_x = 80
+                    if browser_y < 60:
+                        browser_y = 60
+                    if browser_x > 700:
+                        browser_x = 700
+                    if browser_y > 500:
+                        browser_y = 500
+                    changed = true
+                    _present_mdi_scene_with_dragged_browser_fb(fb_addr, stride, app_count, browser_x, browser_y, cursor_x, cursor_y)
+                    serial_println("[host-input] drag-update browser={browser_x},{browser_y} cursor={cursor_x},{cursor_y}")
+        rt_port_outb(0x80u16, 0u8)
+        iter = iter + 1u64
+    if changed:
+        serial_println("[host-input] drag-evidence-ready")
+    else:
+        serial_println("[host-input] no-host-mouse-packets")
+
 fn _read_pixel_fb(fb_addr: u64, stride: i32, x: i32, y: i32) -> u32:
     # Framebuffer readback is debug-only here. Some QEMU/BGA mappings accept
     # writes but fault on direct readback in this freestanding lane, so fail
@@ -409,5 +529,6 @@ fn spl_start():
     serial_println("[integrated-demo] render-ready")
     serial_println("TEST PASSED")
     serial_println("[GUI] Holding rendered frame for capture")
+    _poll_host_mouse_drag_evidence(fb_addr, _fb_w(), app_count)
     _capture_settle_window()
     rt_port_outb(0xf4u16, 0u8)
